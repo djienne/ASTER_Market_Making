@@ -1,8 +1,8 @@
 {
     "ticker": "BNB",
-    "timestamp": "2025-11-28T13:15:52.691763",
+    "timestamp": "2025-11-28T13:16:36.796419",
     "market_data": {
-        "mid_price": 891.55,
+        "mid_price": 891.45,
         "sigma": 0.012874350624274658,
         "A": 0.22292737520477732,
         "k": 1.4749838031157367,
@@ -19,15 +19,15 @@
         "ma_window": 3
     },
     "calculated_values": {
-        "reservation_price": 891.5499965468978,
+        "reservation_price": 891.4499965468979,
         "gap": 3.4531021810835227e-06
     },
     "limit_orders": {
-        "ask_price": 892.1338211974914,
-        "bid_price": 890.9661649900997,
+        "ask_price": 892.0338211974915,
+        "bid_price": 890.8661649900998,
         "delta_a": 0.5838246505936846,
         "delta_b": 0.5838315567980468,
-        "delta_a_percent": 0.06548422977888897,
-        "delta_b_percent": 0.06548500440783431
+        "delta_a_percent": 0.06549157558962192,
+        "delta_b_percent": 0.06549235030546265
     }
 }

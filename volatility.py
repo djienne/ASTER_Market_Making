@@ -59,7 +59,7 @@ def calculate_volatility(mid_price_df: pd.DataFrame, window_minutes: int, freq_s
         return [], [], []
 
     if len(all_periods) < 10:
-        print("Fewer than 10 periods; using rolling volatility only.")
+        print(f"Found {len(all_periods)} periods (fewer than 10); using rolling volatility only.")
         rolling_sigma = calculate_rolling_volatility(mid_price_df, window_minutes, freq_str, target_periods)
         return rolling_sigma, [np.nan] * len(rolling_sigma), rolling_sigma
 
