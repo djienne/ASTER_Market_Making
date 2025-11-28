@@ -24,11 +24,14 @@ def calculate_intensity_params(periods: list, window_minutes: int, buy_orders: p
             klist.append(np.nan)
             continue
 
-        # Prioritize using the mean mid-price from the resampled data for stability
-        ref_mid = mid_price_df.loc[period_start:period_end, 'mid_price'].mean()
-        if pd.isna(ref_mid):
-            # Fallback to trade data if mid-price is unavailable
-            ref_mid = (period_buy['price'].max() + period_sell['price'].min()) / 2
+        # Use the volume-weighted bid and ask to find the reference mid-point
+        period_prices = mid_price_df.loc[period_start:period_end]
+        if period_prices.empty:
+            Alist.append(np.nan)
+            klist.append(np.nan)
+            continue
+        
+        ref_mid = (period_prices['vwap_bid'].mean() + period_prices['vwap_ask'].mean()) / 2
         
         if pd.isna(ref_mid):
             Alist.append(np.nan)

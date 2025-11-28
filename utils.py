@@ -3,6 +3,9 @@ import json
 import math
 import os
 import pandas as pd
+from pathlib import Path
+import numpy as np
+import sys
 
 PARAMS_DIR = os.getenv("PARAMS_DIR", "params")
 
@@ -58,19 +61,61 @@ def load_trades_data(csv_path: str) -> pd.DataFrame:
     df = df.set_index('datetime')
     return df
 
-def load_and_resample_mid_price(csv_path: str) -> pd.DataFrame:
-    """Load and preprocess mid-price data from a CSV file."""
-    df = pd.read_csv(csv_path)
-    df['datetime'] = pd.to_datetime(df['unix_timestamp_ms'], unit='ms')
-    
-    if df['datetime'].duplicated().any():
-        df.drop_duplicates(subset=['datetime'], keep='last', inplace=True)
+def load_and_process_orderbook_data(symbol: str, target_volume_usd: float = 1000.0) -> pd.DataFrame:
+    """
+    Loads all Parquet order book data for a symbol and calculates the VWAP bid, ask, and mid-price.
+    """
+    data_dir = os.path.join(Path(__file__).parent.absolute(), 'ASTER_data', 'orderbook_parquet', f'{symbol}USDT')
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(f"Order book data directory not found for symbol: {symbol}USDT")
 
+    parquet_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.parquet')]
+    if not parquet_files:
+        raise ValueError(f"No Parquet files found for symbol: {symbol}")
+
+    # Read all parquet files, including the staging file, into a single DataFrame
+    df = pd.concat([pd.read_parquet(f) for f in parquet_files])
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     df = df.set_index('datetime')
-    df['price_bid'] = df['bid']
-    df['price_ask'] = df['ask']
+
+    # Drop duplicates on hashable columns first
+    df.drop_duplicates(subset=['timestamp', 'lastUpdateId'], inplace=True)
+    df.sort_index(inplace=True)
+
+    # Critical Fix: Parse stringified lists back into actual lists
+    df['bids'] = df['bids'].apply(json.loads)
+    df['asks'] = df['asks'].apply(json.loads)
+
+    df['vwap_bid'] = df['bids'].apply(lambda x: calculate_vwap(x, target_volume_usd))
+    df['vwap_ask'] = df['asks'].apply(lambda x: calculate_vwap(x, target_volume_usd))
+    df['mid_price'] = (df['vwap_bid'] + df['vwap_ask']) / 2
     
-    merged = df[['price_bid', 'price_ask']].resample('s').ffill()
-    merged['mid_price'] = (merged['price_bid'] + merged['price_ask']) / 2
-    merged.dropna(inplace=True)
-    return merged
+    # Resample to 1-second frequency and forward-fill to ensure data continuity
+    df_resampled = df[['vwap_bid', 'vwap_ask', 'mid_price']].resample('s').ffill()
+    
+    # Return both the original (but cleaned) and the processed dataframes
+    return df, df_resampled
+
+def calculate_vwap(orders, target_volume):
+    """Calculates the volume-weighted average price for one side of the order book."""
+    volume_seen = 0
+    weighted_sum = 0
+    for order in orders:
+        if isinstance(order, (list, tuple)) and len(order) >= 2:
+            price, qty = order
+            volume_usd = price * qty
+
+            # If the first level alone exceeds the target, its price is the VWAP
+            if volume_seen == 0 and volume_usd >= target_volume:
+                return price
+
+            if volume_seen + volume_usd >= target_volume:
+                remaining_qty = (target_volume - volume_seen) / price
+                weighted_sum += remaining_qty * price * price # qty * price * price
+                volume_seen = target_volume
+                break
+
+            weighted_sum += qty * price * price # qty * price * price
+            volume_seen += volume_usd
+
+    return weighted_sum / (volume_seen * 1.0) if volume_seen > 0 else np.nan

@@ -8,6 +8,7 @@ import argparse
 import requests
 from datetime import datetime
 from collections import deque
+import pandas as pd
 
 LIST_MARKETS = ['ETHUSDT','BNBUSDT']
 
@@ -29,6 +30,7 @@ class WebSocketDataCollector:
         self.reconnect_interval = 5
         self.ping_timeout = 15
         self.ping_interval = 30
+        self.ORDERBOOK_BUFFER_SIZE_LIMIT = 50000
 
         # Data buffers
         self.prices_buffer = {}  # symbol -> deque of price records (bid/ask/mid)
@@ -356,16 +358,15 @@ class WebSocketDataCollector:
         ws_thread = threading.Thread(target=run_websocket, daemon=True)
         ws_thread.start()
 
-    def flush_buffers(self):
-        """Flush all buffers to CSV files."""
+    def flush_buffers(self, force=False):
+        """Flush all buffers to files. The order book will be flushed to a staging file."""
         with self.lock:
-            # Flush price data
             for symbol in self.symbols:
                 if self.prices_buffer[symbol]:
                     self.flush_prices_buffer(symbol)
 
                 if self.orderbook_buffer[symbol]:
-                    self.flush_orderbook_buffer(symbol)
+                    self.flush_orderbook_buffer_to_parquet(symbol, force_archive=force)
 
                 if self.trades_buffer[symbol]:
                     self.flush_trades_buffer(symbol)
@@ -398,54 +399,42 @@ class WebSocketDataCollector:
         except Exception as e:
             print(f"Error flushing prices for {symbol}: {e}")
 
-    def flush_orderbook_buffer(self, symbol):
-        """Flush order book buffer for a specific symbol."""
-        file_path = os.path.join('ASTER_data', f'orderbook_{symbol}.csv')
-        file_exists = os.path.isfile(file_path)
+    def flush_orderbook_buffer_to_parquet(self, symbol, force_archive=False):
+        """
+        Flushes the order book buffer to a staging Parquet file.
+        If the buffer is full or if forced, archives the staging file.
+        """
+        if not self.orderbook_buffer[symbol]:
+            return
 
+        output_dir = os.path.join('ASTER_data', 'orderbook_parquet', symbol)
+        os.makedirs(output_dir, exist_ok=True)
+        staging_file_path = os.path.join(output_dir, '_latest.parquet')
+
+        # Convert current buffer to a DataFrame for saving
+        df = pd.DataFrame(list(self.orderbook_buffer[symbol]))
+        df.sort_values(by='timestamp', inplace=True)
+        df.drop_duplicates(subset=['timestamp', 'lastUpdateId'], keep='first', inplace=True)
+        
         try:
-            with open(file_path, 'a', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                if not file_exists:
-                    # Create header with bid/ask levels
-                    header = ['unix_timestamp_ms', 'lastUpdateId']
-                    for i in range(self.order_book_levels):
-                        header.extend([f'bid_price_{i}', f'bid_qty_{i}'])
-                    for i in range(self.order_book_levels):
-                        header.extend([f'ask_price_{i}', f'ask_qty_{i}'])
-                    writer.writerow(header)
-
-                count = 0
-                while self.orderbook_buffer[symbol]:
-                    record = self.orderbook_buffer[symbol].popleft()
-
-                    # Prepare row data
-                    row = [record['timestamp'], record.get('lastUpdateId', '')]
-
-                    # Add bid data
-                    bids = record.get('bids', [])
-                    for i in range(self.order_book_levels):
-                        if i < len(bids):
-                            row.extend([f"{bids[i][0]:.6f}", f"{bids[i][1]:.6f}"])
-                        else:
-                            row.extend(['', ''])  # Empty if no data at this level
-
-                    # Add ask data
-                    asks = record.get('asks', [])
-                    for i in range(self.order_book_levels):
-                        if i < len(asks):
-                            row.extend([f"{asks[i][0]:.6f}", f"{asks[i][1]:.6f}"])
-                        else:
-                            row.extend(['', ''])  # Empty if no data at this level
-
-                    writer.writerow(row)
-                    count += 1
-
-                if count > 0:
-                    print(f"Flushed {count} order book records for {symbol}")
+            # Save to Parquet with ZSTD compression using the pyarrow engine
+            df.to_parquet(file_path, engine='pyarrow', compression='ZSTD')
+            print(f"Flushed {len(df)} order book records for {symbol} to {file_path}")
+            
+            # Check if it's time to archive the file
+            if force_archive or len(self.orderbook_buffer[symbol]) >= self.ORDERBOOK_BUFFER_SIZE_LIMIT:
+                timestamp_ms = int(time.time() * 1000)
+                archive_file_path = os.path.join(output_dir, f'{timestamp_ms}.parquet')
+                os.rename(staging_file_path, archive_file_path)
+                
+                # Clear the buffer now that it's been archived
+                self.orderbook_buffer[symbol].clear()
+                print(f"Archived {len(df)} order book records for {symbol} to {archive_file_path}")
+            else:
+                 print(f"Flushed {len(df)} records to staging file for {symbol}")
 
         except Exception as e:
-            print(f"Error flushing order book for {symbol}: {e}")
+            print(f"Error flushing order book for {symbol} to Parquet: {e}")
 
     def flush_trades_buffer(self, symbol):
         """Flush trades buffer for a specific symbol."""
@@ -550,8 +539,8 @@ class WebSocketDataCollector:
         if hasattr(self, 'combined_ws') and self.combined_ws:
             self.combined_ws.close()
 
-        # Final flush
-        self.flush_buffers()
+        # Final flush to save any remaining data
+        self.flush_buffers(force=True)
         print("Data collector stopped.")
 
 if __name__ == "__main__":

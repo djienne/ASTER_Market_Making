@@ -12,3 +12,5 @@ requests
 scipy
 arch
 numba
+pyarrow
+fastparquet
