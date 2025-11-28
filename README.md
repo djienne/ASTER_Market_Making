@@ -5,7 +5,7 @@ A Python market making bot for the Aster Finance DEX platform using websockets a
 Referral link to support this work: [https://www.asterdex.com/en/referral/164f81](https://www.asterdex.com/en/referral/164f81) .
 Earn 10% rebate on fees (I put maximum for you).
 
-**How it works**: The bot performs "ping-pong" trading by placing Open (Long or Short depending on market trend) and Close limit orders around the current market mid-price using a fraction of your available capital in the perpetual futures account. When one order fills (with a significant amount), it immediately places a new order on the opposite side to capture the spread.
+**How it works**: The bot implements a sophisticated market-making strategy based on the Avellaneda-Stoikov model. It calculates a "reservation price" based on the bot's current inventory risk and then sets optimal bid and ask quotes around it. This allows the bot to dynamically adjust its spreads and skew its orders to manage inventory in response to market activity, a significant advancement over simple "ping-pong" strategies.
 
 **Advanced Features**:
 - **Dynamic Spreads**: Avellaneda-Stoikov model for optimal spread calculation
@@ -53,8 +53,8 @@ The project requires the following Python packages (see `requirements.txt`):
 ### Data Analysis & Trading
 - **pandas & numpy**: Data manipulation and numerical computing
 - **scipy**: Scientific computing for mathematical models
-- **arch**: GARCH modeling for volatility estimation (fallback to moving std when it fails)
-- **pandas-ta**: Technical analysis indicators
+- **arch**: GARCH modeling for volatility estimation
+- **numba**: High-performance Python compiler for optimizing backtests
 
 ### User Interface
 - **colorama**: Terminal color output for better readability
@@ -110,13 +110,12 @@ DEFAULT_PRICE_CHANGE_THRESHOLD = 0.001  # Min price change to replace order (0.1
 CANCEL_SPECIFIC_ORDER = True            # Cancel specific orders vs all orders
 
 # Logging
-RELEASE_MODE = True                     # True = errors only, False = detailed logs
+RELEASE_MODE = True                     # True = errors only. Set to False for detailed logs, recommended for debugging.
 ```
 
 **Important info about Parameters**:
 - **`DEFAULT_BALANCE_FRACTION`**: Controls order sizing - with 0.2 (20%), each order uses 20% of your available balance. Lower values = smaller orders, higher values = larger orders but more risk.
 - **`POSITION_THRESHOLD_USD`**: When your net position exceeds this USD value ($15 default), the bot will only place orders to reduce the position (no new position building).
-- **`LEVERAGE`**: Leverage to use to allow position sizes larger than the account available capital (margin). BE VERY CAREFUL WITH THAT. RECOMMENDED TO ALWAYS LEAVE TO 1.
 
 **Account Recommendation**: Use a **dedicated account** for the bot to avoid conflicts with manual trading and ensure accurate balance calculations.
 

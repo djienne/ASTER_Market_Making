@@ -9,7 +9,7 @@ import requests
 from datetime import datetime
 from collections import deque
 
-LIST_MARKETS = ['ASTERUSDT', 'BTCUSDT', 'ETHUSDT', 'USD1USDT', 'BNBUSDT', 'AAPLUSDT']
+LIST_MARKETS = ['ETHUSDT','BNBUSDT']
 
 class WebSocketDataCollector:
     def __init__(self, symbols, flush_interval=5, order_book_levels=10):
@@ -62,22 +62,20 @@ class WebSocketDataCollector:
             return seen_ids
 
         try:
-            with open(file_path, 'r', newline='') as csvfile:
-                lines = csvfile.readlines()
-                last_1000_lines = lines[-1000:]
-
-                if lines and last_1000_lines[0] == lines[0] and lines[0].startswith('id,'):
-                    start_index = 1
-                else:
-                    start_index = 0
-
-                reader = csv.reader(last_1000_lines[start_index:])
-                for row in reader:
-                    if row:
-                        try:
-                            seen_ids.add(int(row[0]))
-                        except (ValueError, IndexError):
-                            pass
+            with open(file_path, 'r', newline='') as f:
+                # Use deque to efficiently get the last N lines without reading the whole file
+                q = deque(f, 1000)
+            
+            # Now process the lines from the deque
+            reader = csv.reader(q)
+            for row in reader:
+                # Skip header if it happens to be in the last 1000 lines
+                if row and row[0] != 'id':
+                    try:
+                        seen_ids.add(int(row[0]))
+                    except (ValueError, IndexError):
+                        # Ignore lines that don't have a valid ID in the first column
+                        pass
         except Exception as e:
             print(f"Warning: Error loading trade IDs for {symbol}: {e}")
 
@@ -96,7 +94,8 @@ class WebSocketDataCollector:
             bid = float(data['bidPrice'])
             ask = float(data['askPrice'])
             mid = (bid + ask) / 2
-            timestamp = time.time()
+            # Use transaction time from API response (in ms)
+            timestamp = int(data['time'])
 
             return {
                 'timestamp': timestamp,
@@ -118,7 +117,8 @@ class WebSocketDataCollector:
             response.raise_for_status()
             data = response.json()
 
-            timestamp = time.time()
+            # Use transaction time from API response (in ms)
+            timestamp = int(data['T'])
             bids = [[float(bid[0]), float(bid[1])] for bid in data.get('bids', [])[:self.order_book_levels]]
             asks = [[float(ask[0]), float(ask[1])] for ask in data.get('asks', [])[:self.order_book_levels]]
 
@@ -175,19 +175,12 @@ class WebSocketDataCollector:
                 asks = data.get('a', [])
 
                 if bids and asks:
-                    timestamp = time.time()
+                    # Use event time from WebSocket message (in ms)
+                    timestamp = data.get('E')
 
                     # Process bids and asks up to the specified levels
-                    processed_bids = []
-                    processed_asks = []
-
-                    for i, bid in enumerate(bids[:self.order_book_levels]):
-                        if len(bid) >= 2:
-                            processed_bids.append([float(bid[0]), float(bid[1])])
-
-                    for i, ask in enumerate(asks[:self.order_book_levels]):
-                        if len(ask) >= 2:
-                            processed_asks.append([float(ask[0]), float(ask[1])])
+                    processed_bids = [[float(bid[0]), float(bid[1])] for bid in bids[:self.order_book_levels] if len(bid) >= 2]
+                    processed_asks = [[float(ask[0]), float(ask[1])] for ask in asks[:self.order_book_levels] if len(ask) >= 2]
 
                     # Get best bid and ask for price record
                     if processed_bids and processed_asks:
@@ -386,7 +379,7 @@ class WebSocketDataCollector:
             with open(file_path, 'a', newline='') as csvfile:
                 writer = csv.writer(csvfile)
                 if not file_exists:
-                    writer.writerow(['unix_timestamp', 'bid', 'ask', 'mid'])
+                    writer.writerow(['unix_timestamp_ms', 'bid', 'ask', 'mid'])
 
                 count = 0
                 while self.prices_buffer[symbol]:
@@ -415,7 +408,7 @@ class WebSocketDataCollector:
                 writer = csv.writer(csvfile)
                 if not file_exists:
                     # Create header with bid/ask levels
-                    header = ['unix_timestamp', 'lastUpdateId']
+                    header = ['unix_timestamp_ms', 'lastUpdateId']
                     for i in range(self.order_book_levels):
                         header.extend([f'bid_price_{i}', f'bid_qty_{i}'])
                     for i in range(self.order_book_levels):

@@ -6,6 +6,7 @@ import websockets
 import json
 import signal
 import time
+import numpy as np
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from api_client import ApiClient
@@ -572,33 +573,11 @@ def _parameter_file_candidates(symbol):
     return candidates
 
 
-def _extract_spread(limit_orders, key, mid_price, file_path):
-    log = logging.getLogger('SpreadLoader')
-    raw_percent = _safe_float(limit_orders.get(f"{key}_percent"))
-    raw_delta = _safe_float(limit_orders.get(key))
-    spread = None
-
-    if raw_percent is not None:
-        spread = raw_percent / 100.0
-    elif raw_delta is not None and mid_price and mid_price > 0:
-        spread = raw_delta / mid_price
-
-    if spread is None:
-        log.warning(f"Could not derive {key} from {file_path}; falling back to defaults.")
-        return None
-
-    if not (SPREAD_MIN_THRESHOLD <= spread <= SPREAD_MAX_THRESHOLD):
-        log.warning(
-            f"{key} spread {spread:.6f} from {file_path} is out of bounds; expected between "
-            f"{SPREAD_MIN_THRESHOLD:.6f} and {SPREAD_MAX_THRESHOLD:.6f}."
-        )
-        return None
-
-    return spread
 
 
-def _load_spread_overrides(symbol):
-    log = logging.getLogger('SpreadLoader')
+
+def _load_avellaneda_params(symbol):
+    log = logging.getLogger('AvellanedaLoader')
     for candidate in _parameter_file_candidates(symbol):
         file_path = os.path.join(PARAMS_DIR, f"{AVELLANEDA_FILE_PREFIX}{candidate}.json")
         if not os.path.isfile(file_path):
@@ -610,89 +589,59 @@ def _load_spread_overrides(symbol):
         except Exception as exc:
             log.warning(f"Failed to load {file_path}: {exc}")
             continue
-
-        limit_orders = payload.get("limit_orders") or {}
-        mid_price = _safe_float(payload.get("market_data", {}).get("mid_price"))
-        if not mid_price or mid_price <= 0:
-            mid_price = _safe_float(payload.get("calculated_values", {}).get("reservation_price"))
-
-        buy_spread = _extract_spread(limit_orders, "delta_b", mid_price, file_path)
-        sell_spread = _extract_spread(limit_orders, "delta_a", mid_price, file_path)
-
-        if buy_spread is None and sell_spread is None:
-            log.warning(f"No usable spreads found in {file_path}; checking next candidate if available.")
+        
+        # Extract all necessary parameters
+        optimal_params = payload.get("optimal_parameters", {})
+        market_data = payload.get("market_data", {})
+        
+        params = {
+            "gamma": _safe_float(optimal_params.get("gamma")),
+            "time_horizon_days": _safe_float(optimal_params.get("time_horizon_days")),
+            "sigma": _safe_float(market_data.get("sigma")),
+            "k": _safe_float(market_data.get("k")),
+            "source_path": file_path
+        }
+        
+        # Basic validation to ensure all required params are present
+        if not all(params[key] is not None for key in ["gamma", "time_horizon_days", "sigma", "k"]):
+            log.warning(f"File {file_path} is missing one or more required Avellaneda parameters. Skipping.")
             continue
 
-        return buy_spread, sell_spread, file_path
+        return params
 
-    return None, None, None
+    return None
 
 
-def _get_spreads_for_symbol(symbol):
+def get_avellaneda_params(symbol):
+    """
+    Abstracted function to retrieve Avellaneda-Stoikov parameters.
+    Handles caching and falls back to default spreads if needed.
+    :return: A dictionary of parameters.
+    """
+    if not USE_AVELLANEDA_SPREADS:
+        return {"buy_spread": DEFAULT_BUY_SPREAD, "sell_spread": DEFAULT_SELL_SPREAD, "source": "default"}
+
     symbol_key = (symbol or "").upper() or DEFAULT_SYMBOL
     now = time.time()
     cached_entry = _SPREAD_CACHE.get(symbol_key)
     if cached_entry and cached_entry.get("expires_at", 0) > now:
-        return cached_entry["buy"], cached_entry["sell"]
+        return cached_entry["params"]
 
-    log = logging.getLogger('SpreadLoader')
-    buy_override, sell_override, source_path = _load_spread_overrides(symbol_key)
+    log = logging.getLogger('AvellanedaLoader')
+    params = _load_avellaneda_params(symbol_key)
 
-    buy_spread = buy_override if buy_override is not None else DEFAULT_BUY_SPREAD
-    sell_spread = sell_override if sell_override is not None else DEFAULT_SELL_SPREAD
-
-    previous_signature = None
-    if cached_entry:
-        previous_signature = (
-            cached_entry.get("buy"),
-            cached_entry.get("sell"),
-            cached_entry.get("source_path")
-        )
-
-    _SPREAD_CACHE[symbol_key] = {
-        "buy": buy_spread,
-        "sell": sell_spread,
-        "expires_at": now + SPREAD_CACHE_TTL_SECONDS,
-        "source_path": source_path
-    }
-
-    current_signature = (buy_spread, sell_spread, source_path)
-    if current_signature != previous_signature:
-        if source_path:
-            source_name = os.path.basename(source_path)
-            if buy_override is not None and sell_override is not None:
-                log.info(
-                    f"Loaded spreads for {symbol_key} from {source_name}: "
-                    f"buy={buy_spread:.6f}, sell={sell_spread:.6f}"
-                )
-            else:
-                log.info(
-                    f"Using spreads for {symbol_key} from {source_name} with defaults: "
-                    f"buy={buy_spread:.6f}, sell={sell_spread:.6f}"
-                )
-        else:
-            log.info(
-                f"No Avellaneda parameter file found for {symbol_key}; "
-                f"using default spreads buy={buy_spread:.6f}, sell={sell_spread:.6f}"
-            )
-
-    return buy_spread, sell_spread
-
-
-def get_spreads(state):
-    global DEFAULT_BUY_SPREAD, DEFAULT_SELL_SPREAD
-    """
-    Abstracted function to determine bid and ask spreads.
-    This can be modified to implement dynamic spread calculations.
-    
-    :param state: The current strategy state.
-    :return: A tuple of (buy_spread, sell_spread).
-    """
-    if not USE_AVELLANEDA_SPREADS:
-        return DEFAULT_BUY_SPREAD, DEFAULT_SELL_SPREAD
-
-    symbol = getattr(global_args, "symbol", DEFAULT_SYMBOL)
-    return _get_spreads_for_symbol(symbol)
+    if params:
+        # If we have full params, we don't need default spreads
+        params["source"] = os.path.basename(params["source_path"])
+        _SPREAD_CACHE[symbol_key] = {"params": params, "expires_at": now + SPREAD_CACHE_TTL_SECONDS}
+        log.info(f"Loaded Avellaneda parameters for {symbol_key} from {params['source']}")
+        return params
+    else:
+        # Fallback to default spreads if file not found or invalid
+        default_params = {"buy_spread": DEFAULT_BUY_SPREAD, "sell_spread": DEFAULT_SELL_SPREAD, "source": "default"}
+        _SPREAD_CACHE[symbol_key] = {"params": default_params, "expires_at": now + SPREAD_CACHE_TTL_SECONDS}
+        log.info(f"No Avellaneda parameter file found for {symbol_key}; using default spreads.")
+        return default_params
 
 
 async def market_making_loop(state, client, args):
@@ -748,37 +697,41 @@ async def market_making_loop(state, client, args):
                     log.debug(f"Supertrend signal is {'DOWNTREND' if state.supertrend_signal == -1 else 'UPTREND'}, but position is open (${current_notional:.2f}). Holding current strategy bias.")
 
             # --- State Synchronization ---
-            # At the start of each loop, get the authoritative position state from the API
-            try:
-                log.debug("Synchronizing position state with the exchange...")
-                positions = await client.get_position_risk(args.symbol)
-                if positions:
-                    position = positions[0]
-                    current_position_size = float(position.get('positionAmt', 0.0))
-                    notional_value = abs(float(position.get('notional', 0.0)))
+            # Trust the WebSocket for real-time position data when connected.
+            # Only use the REST API as a fallback or for the initial state.
+            if not state.user_data_ws_connected:
+                try:
+                    log.warning("User data WebSocket is disconnected. Synchronizing position state with the exchange via REST API.")
+                    positions = await client.get_position_risk(args.symbol)
+                    if positions:
+                        position = positions[0]
+                        current_position_size = float(position.get('positionAmt', 0.0))
+                        notional_value = abs(float(position.get('notional', 0.0)))
 
-                    # Update state based on fetched data
-                    state.position_size = current_position_size
+                        # Update state based on fetched data
+                        state.position_size = current_position_size
 
-                    if notional_value < POSITION_THRESHOLD_USD:
-                        if state.mode != opening_mode:
-                            log.info(f"Position notional (${notional_value:.2f}) is below threshold. Resetting to {opening_mode} mode.")
-                            state.mode = opening_mode
-                        state.position_size = 0.0 # Reset position size to avoid tiny dust amounts causing issues
+                        if notional_value < POSITION_THRESHOLD_USD:
+                            if state.mode != opening_mode:
+                                log.info(f"Position notional (${notional_value:.2f}) is below threshold. Resetting to {opening_mode} mode.")
+                                state.mode = opening_mode
+                            state.position_size = 0.0 # Reset position size to avoid tiny dust amounts causing issues
+                        else:
+                            if state.mode != closing_mode:
+                                log.info(f"Found significant position (size: {current_position_size}, notional: ${notional_value:.2f}). Switching to {closing_mode} mode.")
+                                state.mode = closing_mode
                     else:
-                        if state.mode != closing_mode:
-                            log.info(f"Found significant position (size: {current_position_size}, notional: ${notional_value:.2f}). Switching to {closing_mode} mode.")
-                            state.mode = closing_mode
-                else:
-                    # If no position data is returned, assume no position
-                    state.position_size = 0.0
-                    state.mode = opening_mode
-                log.debug(f"State synchronized: position_size={state.position_size}, mode={state.mode}")
-            except Exception as e:
-                log.error(f"Failed to synchronize position state, relying on last known state. Error: {e}")
-                # If we fail to get the position, we should wait and retry rather than trading on stale data.
-                await asyncio.sleep(1)
-                continue
+                        # If no position data is returned, assume no position
+                        state.position_size = 0.0
+                        state.mode = opening_mode
+                    log.debug(f"State synchronized via REST: position_size={state.position_size}, mode={state.mode}")
+                except Exception as e:
+                    log.error(f"Failed to synchronize position state via REST, relying on last known state. Error: {e}")
+                    # If we fail to get the position, we should wait and retry rather than trading on stale data.
+                    await asyncio.sleep(1)
+                    continue
+            else:
+                log.debug(f"Relying on WebSocket for position state. Current size: {state.position_size:.6f}, Mode: {state.mode}")
 
             # --- Secondary checks for fresh data ---
             if not is_price_data_valid(state):
@@ -818,31 +771,54 @@ async def market_making_loop(state, client, args):
                     log.warning(f"Failed to double-check position, proceeding with current mode: {e}")
 
             # --- Determine Strategy and Parameters ---
-            buy_spread, sell_spread = get_spreads(state)
-            
-            if state.mode == closing_mode:
-                log.info(f"Position size is {state.position_size}. Entering {closing_mode} mode.")
-                side, reduce_only = closing_mode, True
-                quantity_to_trade = abs(state.position_size)
-                if closing_mode == 'SELL':
-                    limit_price = state.mid_price * (1 + sell_spread)
-                else:  # closing_mode == 'BUY'
-                    limit_price = state.mid_price * (1 - buy_spread)
-                log.debug(f"{closing_mode} mode parameters: side={side}, reduce_only={reduce_only}, quantity_to_trade={quantity_to_trade}, limit_price={limit_price}")
-            else:  # Opening mode
-                log.info(f"No significant position. Entering {opening_mode} mode.")
-                side, reduce_only = opening_mode, False
-                order_amount_usd = state.account_balance * DEFAULT_BALANCE_FRACTION
-                quantity_to_trade = order_amount_usd / state.mid_price
-                if opening_mode == 'BUY':
-                    limit_price = state.mid_price * (1 - buy_spread)
-                else:  # opening_mode == 'SELL'
-                    limit_price = state.mid_price * (1 + sell_spread)
-                log.debug(f"{opening_mode} mode parameters: side={side}, reduce_only={reduce_only}, order_amount_usd={order_amount_usd:.2f}, quantity_to_trade={quantity_to_trade}, limit_price={limit_price}")
+            symbol = getattr(global_args, "symbol", DEFAULT_SYMBOL)
+            params = get_avellaneda_params(symbol)
+
+            # Use full Avellaneda-Stoikov logic if params are from a file
+            if params["source"] != "default":
+                # Unpack parameters
+                gamma, sigma, k, T = params["gamma"], params["sigma"], params["k"], params["time_horizon_days"]
+                q, s = state.position_size, state.mid_price
+
+                # Calculate reservation price and optimal quotes
+                r = s - q * gamma * (sigma**2) * T
+                spread_base = gamma * (sigma**2) * T + (2 / gamma) * np.log(1 + (gamma / k))
+                half_spread = spread_base / 2.0
+                gap = abs(r - s)
+                
+                delta_a, delta_b = (half_spread + gap, half_spread - gap) if r >= s else (half_spread - gap, half_spread + gap)
+                ask_price, bid_price = r + delta_a, r - delta_b
+                log.info(f"Avellaneda quotes: r={r:.4f}, spread={spread_base:.4f}, bid={bid_price:.4f}, ask={ask_price:.4f}")
+
+                if state.mode == closing_mode:
+                    side, reduce_only = closing_mode, True
+                    quantity_to_trade = abs(state.position_size)
+                    limit_price = ask_price if closing_mode == 'SELL' else bid_price
+                else: # Opening mode
+                    side, reduce_only = opening_mode, False
+                    quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
+                    limit_price = bid_price if opening_mode == 'BUY' else ask_price
+                
+                used_spread = (ask_price - bid_price) / s if s > 0 else 0
+
+            # Fallback to simple spread logic
+            else:
+                buy_spread, sell_spread = params["buy_spread"], params["sell_spread"]
+                log.info(f"Using default spreads: buy={buy_spread:.4%}, sell={sell_spread:.4%}")
+
+                if state.mode == closing_mode:
+                    side, reduce_only = closing_mode, True
+                    quantity_to_trade = abs(state.position_size)
+                    limit_price = state.mid_price * (1 + sell_spread) if closing_mode == 'SELL' else state.mid_price * (1 - buy_spread)
+                else:  # Opening mode
+                    side, reduce_only = opening_mode, False
+                    quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
+                    limit_price = state.mid_price * (1 - buy_spread) if opening_mode == 'BUY' else state.mid_price * (1 + sell_spread)
+                
+                used_spread = sell_spread if side == 'SELL' else buy_spread
 
             log.info(f"Calculated order parameters: side={side}, quantity={quantity_to_trade:.8f}, price={limit_price:.8f}, reduce_only={reduce_only}")
-            current_spread = sell_spread if side == 'SELL' else buy_spread
-            log.debug(f"Market data: mid_price={state.mid_price:.8f}, bid={state.bid_price:.8f}, ask={state.ask_price:.8f}, using_spread={current_spread}")
+            log.debug(f"Market data: mid_price={state.mid_price:.8f}, bid={state.bid_price:.8f}, ask={state.ask_price:.8f}, using_spread={used_spread:.6f}")
 
             # --- Adjust order to conform to exchange filters ---
             log.debug(f"Symbol filters: {symbol_filters}")

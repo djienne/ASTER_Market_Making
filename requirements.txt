@@ -11,4 +11,4 @@ numpy
 requests
 scipy
 arch
-pandas-ta
+numba

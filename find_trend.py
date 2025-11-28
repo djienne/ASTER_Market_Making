@@ -8,6 +8,9 @@ import json
 from datetime import datetime
 import time
 from numba import jit, njit
+from api_fetcher import _fetch_with_backoff
+
+MIN_TRADES_FOR_VALID_RESULT = 6
 
 @jit(nopython=True)
 def _calculate_performance_numba(entry_prices, exit_prices, signals, trading_fee):
@@ -202,83 +205,84 @@ def perform_grid_search(symbol, interval):
     # ATR Multipliers: From 1.8 to roughly 8.1, in steps of 0.3
     atr_multipliers = np.arange(1.8, 8.4, 0.3)
 
+    # --- Dynamic Candle Calculation ---
+    interval_map_ms = {'m': 60000, 'h': 3600000, 'd': 86400000}
+    interval_unit = interval[-1]
+    interval_value = int(interval[:-1])
+    interval_ms = interval_value * interval_map_ms.get(interval_unit, 60000)
+    
+    # Aim for roughly 60 days of data, but clamp between a min and max
+    target_duration_ms = 60 * 86400000
+    total_candles = int(target_duration_ms / interval_ms)
+    total_candles = max(500, min(total_candles, 15000)) # Clamp between 500 and 15k candles
+    print(f"Interval '{interval}' requires approximately {total_candles} candles for a ~60-day backtest.")
+
     # --- Fetch Data ---
     limit = 1000 
-    total_candles = 10000
     BASE_URL = "https://fapi.asterdex.com"
     endpoint = f"{BASE_URL}/fapi/v1/klines"
     
-    # --- Caching Logic ---
     os.makedirs('params', exist_ok=True)
     kline_cache_file = f"params/klines_{symbol}_{interval}.csv"
     
     all_klines = []
-
     if os.path.exists(kline_cache_file):
         print(f"Loading cached k-lines from {kline_cache_file}...")
         df_cache = pd.read_csv(kline_cache_file)
         all_klines = df_cache.values.tolist()
 
-    try:
-        # Fetch new candles since the last one in the cache
-        if all_klines:
-            last_timestamp = int(all_klines[-1][0])
-            print(f"Fetching new candles since {pd.to_datetime(last_timestamp, unit='ms')}...")
+    # --- Iterative Catch-up and Backfill ---
+    # 1. Catch up on new candles since the last cached one
+    if all_klines:
+        last_timestamp = int(all_klines[-1][0])
+        print(f"Fetching new candles since {pd.to_datetime(last_timestamp, unit='ms')}...")
+        while True:
             params = {'symbol': symbol, 'interval': interval, 'limit': limit, 'startTime': last_timestamp + 1}
-            response = requests.get(endpoint, params=params)
-            response.raise_for_status()
-            new_klines = response.json()
+            new_klines = _fetch_with_backoff(endpoint, params)
             if new_klines:
                 print(f"Fetched {len(new_klines)} new candles.")
                 all_klines.extend(new_klines)
+                last_timestamp = int(new_klines[-1][0])
+                if len(new_klines) < limit: break # Reached the most recent candle
             else:
                 print("No new candles to fetch.")
-
-        # Fetch older candles if we don't have enough
-        while len(all_klines) < total_candles:
-            needed = total_candles - len(all_klines)
-            fetch_limit = min(needed, limit)
-            
-            if not all_klines:
-                # First fetch if cache is empty
-                print(f"Cache is empty. Fetching most recent {fetch_limit} candles...")
-                params = {'symbol': symbol, 'interval': interval, 'limit': fetch_limit}
-            else:
-                # Fetch older candles
-                oldest_timestamp = int(all_klines[0][0])
-                print(f"Fetching {fetch_limit} older candles before {pd.to_datetime(oldest_timestamp, unit='ms')}...")
-                params = {'symbol': symbol, 'interval': interval, 'limit': fetch_limit, 'endTime': oldest_timestamp - 1}
-            
-            time.sleep(0.5)
-            response = requests.get(endpoint, params=params)
-            response.raise_for_status()
-            older_klines = response.json()
-
-            if not older_klines:
-                print("No more older k-lines available.")
-                break
-            
-            all_klines = older_klines + all_klines
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching data: {e}")
+                break # Exit loop if no new data
+    
+    # 2. Backfill older candles if we don't have enough
+    while len(all_klines) < total_candles:
+        needed = total_candles - len(all_klines)
+        fetch_limit = min(needed, limit)
+        
         if not all_klines:
-            return # Can't proceed if fetch fails and cache is empty
+            print(f"Cache is empty. Fetching most recent {fetch_limit} candles...")
+            params = {'symbol': symbol, 'interval': interval, 'limit': fetch_limit}
+        else:
+            oldest_timestamp = int(all_klines[0][0])
+            print(f"Fetching {fetch_limit} older candles before {pd.to_datetime(oldest_timestamp, unit='ms')}...")
+            params = {'symbol': symbol, 'interval': interval, 'limit': fetch_limit, 'endTime': oldest_timestamp - 1}
+
+        older_klines = _fetch_with_backoff(endpoint, params)
+        if not older_klines:
+            print("No more older k-lines available.")
+            break
+        
+        all_klines = older_klines + all_klines
+
+    if not all_klines:
+        print("Could not fetch any k-line data. Aborting.")
+        return
 
     # --- Process and Save Final Dataset ---
     df = pd.DataFrame(all_klines, columns=['Open Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close Time', 
                                            'Quote Asset Volume', 'Number of Trades', 'Taker Buy Base Asset Volume', 
                                            'Taker Buy Quote Asset Volume', 'Ignore'])
     df.drop_duplicates(subset=['Open Time'], keep='last', inplace=True)
-    df = df.tail(total_candles)
+    df.sort_values(by='Open Time', inplace=True) # Ensure data is sorted chronologically
+    df = df.tail(total_candles) # Keep the most recent N candles
     df.to_csv(kline_cache_file, index=False)
     
-    klines = df.values.tolist()
-    print(f"Saved {len(klines)} k-lines to cache.")
-
-    df = pd.DataFrame(klines, columns=['Open Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close Time', 
-                                       'Quote Asset Volume', 'Number of Trades', 'Taker Buy Base Asset Volume', 
-                                       'Taker Buy Quote Asset Volume', 'Ignore'])
+    print(f"Saved {len(df)} k-lines to cache.")
+    
     df['Open Time'] = pd.to_numeric(df['Open Time'])
     df = df.astype({'Open': 'float', 'High': 'float', 'Low': 'float', 'Close': 'float', 'Volume': 'float'})
 
@@ -291,12 +295,7 @@ def perform_grid_search(symbol, interval):
 
     # --- Data Continuity Check ---
     print("Verifying data continuity...")
-    # Convert interval string to milliseconds
-    interval_map = {'m': 60000, 'h': 3600000, 'd': 86400000}
-    interval_unit = interval[-1]
-    interval_value = int(interval[:-1])
-    expected_interval_ms = interval_value * interval_map[interval_unit]
-
+    expected_interval_ms = interval_ms
     time_diffs = df['Open Time'].diff().dropna()
     gaps = time_diffs[time_diffs > expected_interval_ms]
 
@@ -305,7 +304,7 @@ def perform_grid_search(symbol, interval):
     else:
         print("Data continuity verified. No gaps found.")
 
-    print(f"Using {len(klines)} candles for backtest.")
+    print(f"Using {len(df)} candles for backtest.")
     print("Running backtest grid search...")
     results = []
     total_tests = len(atr_periods) * len(atr_multipliers)
@@ -325,6 +324,12 @@ def perform_grid_search(symbol, interval):
     print("\n\nFinding the best result based on Sharpe Ratio...")
     if not results:
         print("No valid backtest results found.")
+        return
+
+    # Filter out results with too few trades to be statistically significant
+    results = [r for r in results if r['flips'] >= MIN_TRADES_FOR_VALID_RESULT]
+    if not results:
+        print(f"No backtest results with at least {MIN_TRADES_FOR_VALID_RESULT} trades found.")
         return
 
     # Sort by Sharpe Ratio to find the best individual performer and the top performers for consensus
@@ -360,7 +365,7 @@ def perform_grid_search(symbol, interval):
     # --- Save Best Parameters and Current Trend ---
     print("\nSaving best parameters and consensus trend to JSON file...")
     
-    last_candle_timestamp = pd.to_datetime(klines[-1][0], unit='ms').isoformat()
+    last_candle_timestamp = pd.to_datetime(df.values[-1][0], unit='ms').isoformat()
 
     output_data = {
         'best_parameters': {
@@ -397,7 +402,7 @@ def perform_grid_search(symbol, interval):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Backtest Supertrend strategy and find best parameters.')
     parser.add_argument('--symbol', type=str, default='BNBUSDT',
-                        help='The trading symbol to backtest (e.g., BTCUSDT). Defaults to ETHUSDT.')
+                        help='The trading symbol to backtest (e.g., BTCUSDT). Defaults to BNBUSDT.')
     parser.add_argument('--interval', type=str, default='1m',
                         help='The k-line interval (e.g., 1m, 5m, 1h, 1d). Defaults to 1m.')
     args = parser.parse_args()

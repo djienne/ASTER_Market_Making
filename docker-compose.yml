@@ -14,11 +14,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./ASTER_data:/app/ASTER_data
-      - ./params:/app/params
-      - ./data_collector.py:/app/data_collector.py:ro
-      - ./api_client.py:/app/api_client.py:ro
-      - ./.env:/app/.env:ro
+      - ./:/app/
     command: >
       sh -c "while true; do \
         python data_collector.py; \
