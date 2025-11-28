@@ -418,8 +418,8 @@ class WebSocketDataCollector:
         
         try:
             # Save to Parquet with ZSTD compression using the pyarrow engine
-            df.to_parquet(file_path, engine='pyarrow', compression='ZSTD')
-            print(f"Flushed {len(df)} order book records for {symbol} to {file_path}")
+            df.to_parquet(staging_file_path, engine='pyarrow', compression='ZSTD')
+            print(f"Flushed {len(df)} order book records for {symbol} to {staging_file_path}")
             
             # Check if it's time to archive the file
             if force_archive or len(self.orderbook_buffer[symbol]) >= self.ORDERBOOK_BUFFER_SIZE_LIMIT:

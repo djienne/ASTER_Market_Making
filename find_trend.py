@@ -391,7 +391,7 @@ def perform_grid_search(symbol, interval):
     # Create filename without USDT suffix
     filename_symbol = symbol[:-4] if symbol.endswith('USDT') else symbol
     file_path = f'params/supertrend_params_{filename_symbol}.json'
-    with open(file_path, 'w') as f:
+    with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(output_data, f, indent=4)
     
     print(f"Successfully saved data to {file_path}")

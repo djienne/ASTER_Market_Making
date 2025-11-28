@@ -65,6 +65,17 @@ def print_summary(results: dict, periods: list, df=None):
         return
         
     print(f"\n{'='*80}\nAVELLANEDA-STOIKOV PARAMETERS - {results['ticker']}\n{'='*80}")
+
+    # Display analysis information
+    minutes_window = results.get('current_state', {}).get('minutes_window', 5)
+    num_periods = len(periods)
+    print(f"Analysis Window:\n  Period length: {minutes_window} minutes")
+    print(f"  Number of periods analyzed: {num_periods}")
+    if df is not None and not df.empty:
+        print(f"  Data range: {df.index.min()} to {df.index.max()}\n")
+    else:
+        print()
+
     print(f"Market Data:\n  Mid Price: ${results['market_data']['mid_price']:,.4f}")
     
     garch_sigma = results['market_data']['garch_sigma']
@@ -102,13 +113,75 @@ def print_summary(results: dict, periods: list, df=None):
         print("⚠️ Invalid params calculated, previous file was not updated.")
     print("="*80)
 
+def get_continuous_recent_data(raw_df, processed_df, max_gap_seconds=60):
+    """
+    Extract the most recent continuous block of data.
+    Works backwards from the most recent timestamp and stops at the first gap > max_gap_seconds.
+    Also checks for gaps between the current time and the latest data point.
+
+    Args:
+        raw_df: Raw DataFrame with DatetimeIndex (before resampling)
+        processed_df: Processed DataFrame (resampled to 1-second)
+        max_gap_seconds: Maximum allowed gap in seconds (default 60 = 1 minute)
+
+    Returns:
+        Tuple of (filtered_raw_df, filtered_processed_df) containing only continuous recent data
+    """
+    if raw_df.empty:
+        return raw_df, processed_df
+
+    # Sort raw data in descending order (newest first) to work backwards from current time
+    raw_sorted = raw_df.sort_index(ascending=False)
+    
+    # Check for gap between NOW and the latest data point
+    latest_time = raw_sorted.index[0]
+    now_utc = pd.Timestamp.utcnow().replace(tzinfo=None)
+    time_since_update = (now_utc - latest_time).total_seconds()
+    
+    if time_since_update > max_gap_seconds:
+        print(f"[WARNING] Data is stale! Last update was {time_since_update:.0f}s ago (Limit: {max_gap_seconds}s)")
+        print(f"  Latest data timestamp: {latest_time} UTC")
+        print(f"  Current system time:   {now_utc} UTC")
+        print("  Continuing with available data, but be aware it may not be live.\n")
+
+    # Calculate time differences between consecutive rows (in seconds)
+    time_diffs = raw_sorted.index.to_series().diff(-1).abs().dt.total_seconds()
+
+    # Find gaps larger than tolerance
+    gaps = time_diffs[time_diffs > max_gap_seconds]
+
+    if len(gaps) == 0:
+        # No gaps found, all data is continuous
+        print(f"[OK] Data is continuous with no internal gaps > {max_gap_seconds}s")
+        return raw_df, processed_df
+
+    # Get the most recent gap (first in our descending sorted data)
+    first_gap_idx = gaps.index[0]
+
+    # Keep only data after the gap (more recent than the gap)
+    # logic: if gap is at T3 (diff between T3 and T2), then T3 is the start of the new block.
+    # So we want >= first_gap_idx.
+    cutoff_time = first_gap_idx
+    continuous_raw = raw_df[raw_df.index >= cutoff_time]
+    continuous_processed = processed_df[processed_df.index >= cutoff_time]
+
+    # Calculate how much data was discarded
+    discarded_pct = (len(raw_df) - len(continuous_raw)) / len(raw_df) * 100
+    gap_size = gaps.iloc[0]
+
+    print(f"[WARNING] Gap detected: {gap_size:.0f}s at {cutoff_time}")
+    print(f"[OK] Using continuous data from {continuous_raw.index.min()} to {continuous_raw.index.max()}")
+    print(f"  Discarded {discarded_pct:.1f}% of older data due to time gap\n")
+
+    return continuous_raw, continuous_processed
+
 def main():
     """Main execution hub for the parameter calculation."""
     global TICKER
     args = parse_arguments()
     TICKER = args.ticker
     window_minutes = args.minutes
-    
+
     ma_window = 3 if window_minutes <= 8 * 60 else (2 if window_minutes < 20 * 60 else 1)
 
     # Load and process order book data to get VWAP mid-price
@@ -118,6 +191,20 @@ def main():
     except (FileNotFoundError, ValueError) as e:
         print(f"Error loading data: {e}. Exiting.")
         sys.exit(1)
+
+    # Filter to continuous recent data only (stop at gaps > 60 seconds)
+    print("\n" + "="*80)
+    print("Checking data continuity...")
+    raw_ob_df, processed_ob_df = get_continuous_recent_data(raw_ob_df, processed_ob_df, max_gap_seconds=60)
+
+    # Also filter trades to match the continuous data time range
+    if not processed_ob_df.empty:
+        min_time = processed_ob_df.index.min()
+        max_time = processed_ob_df.index.max()
+        original_trades = len(trades_df)
+        trades_df = trades_df[(trades_df.index >= min_time) & (trades_df.index <= max_time)]
+        print(f"[OK] Filtered trades to continuous time range: {len(trades_df)}/{original_trades} trades kept")
+    print("="*80)
 
     # Prepare data periods using a more robust grouping method
     freq_str = f'{window_minutes}min'

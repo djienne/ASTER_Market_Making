@@ -4,7 +4,7 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.12.48.0/22
+        - subnet: 10.5.0.0/22
 services:
   data-collector:
     build: .
@@ -14,6 +14,10 @@ services:
     env_file:
       - .env
     volumes:
+      # Mount entire directory so ASTER_data/ files are accessible both inside and outside container
+      # This ensures data collector works identically whether run natively or with Docker
+      # - Native: saves to ./ASTER_data/ relative to script location
+      # - Docker: saves to /app/ASTER_data/ which maps back to ./ASTER_data/ on host
       - ./:/app/
     command: >
       sh -c "while true; do \
@@ -22,63 +26,54 @@ services:
       done"
     restart: unless-stopped
 
-  avellaneda-params:
-    build: .
-    container_name: aster_avellaneda_params
-    environment:
-      - PARAM_REFRESH_MINUTES=10
-    env_file:
-      - .env
-    volumes:
-      - ./ASTER_data:/app/ASTER_data
-      - ./params:/app/params
-      - ./calculate_avellaneda_parameters.py:/app/calculate_avellaneda_parameters.py:ro
-      - ./api_client.py:/app/api_client.py:ro
-    command: >
-      sh -c "while true; do
-        python calculate_avellaneda_parameters.py $$SYMBOL --minutes $$PARAM_REFRESH_MINUTES;
-        sleep $${PARAM_REFRESH_MINUTES}m;
-      done"
-    restart: unless-stopped
+  # avellaneda-params:
+  #   build: .
+  #   container_name: aster_avellaneda_params
+  #   environment:
+  #     - PARAM_REFRESH_MINUTES=10
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./:/app/
+  #   command: >
+  #     sh -c "while true; do
+  #       python calculate_avellaneda_parameters.py $$SYMBOL --minutes $$PARAM_REFRESH_MINUTES;
+  #       sleep $${PARAM_REFRESH_MINUTES}m;
+  #     done"
+  #   restart: unless-stopped
 
-  market-maker:
-    build: .
-    container_name: aster_market_maker
-    environment:
-      - RESTART_MINUTES=2
-    env_file:
-      - .env
-    volumes:
-      - ./ASTER_data:/app/ASTER_data
-      - ./params:/app/params
-      - ./market_maker.py:/app/market_maker.py:ro
-      - ./api_client.py:/app/api_client.py:ro
-      - ./calculate_avellaneda_parameters.py:/app/calculate_avellaneda_parameters.py:ro
-      - ./.env:/app/.env:ro
-    command: >
-      sh -c "while true; do
-        python market_maker.py --symbol $$SYMBOL;
-        sleep $${RESTART_MINUTES}m;
-      done"
-    depends_on:
-      - data-collector
-      - avellaneda-params
-    restart: unless-stopped
+  # market-maker:
+  #   build: .
+  #   container_name: aster_market_maker
+  #   environment:
+  #     - RESTART_MINUTES=2
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./:/app/
+  #   command: >
+  #     sh -c "while true; do
+  #       python market_maker.py --symbol $$SYMBOL;
+  #       sleep $${RESTART_MINUTES}m;
+  #     done"
+  #   depends_on:
+  #     - data-collector
+  #     - avellaneda-params
+  #   restart: unless-stopped
 
-  trend-finder:
-    build: .
-    container_name: aster_trend_finder
-    environment:
-      - TREND_REFRESH_MINUTES=5
-      - TREND_INTERVAL=5m
-    env_file:
-      - .env
-    volumes:
-      - ./params:/app/params
-      - ./find_trend.py:/app/find_trend.py:ro
-    command: >
-      sh -c "while true; do
-        python find_trend.py --symbol $$SYMBOL --interval $$TREND_INTERVAL;
-        sleep $${TREND_REFRESH_MINUTES}m;
-      done"
-    restart: unless-stopped
+  # trend-finder:
+  #   build: .
+  #   container_name: aster_trend_finder
+  #   environment:
+  #     - TREND_REFRESH_MINUTES=5
+  #     - TREND_INTERVAL=5m
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./:/app/
+  #   command: >
+  #     sh -c "while true; do
+  #       python find_trend.py --symbol $$SYMBOL --interval $$TREND_INTERVAL;
+  #       sleep $${TREND_REFRESH_MINUTES}m;
+  #     done"
+  #   restart: unless-stopped

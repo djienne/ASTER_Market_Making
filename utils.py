@@ -31,9 +31,9 @@ def save_avellaneda_params_atomic(params: dict, symbol: str) -> bool:
 
     final_path = os.path.join(PARAMS_DIR, f"avellaneda_parameters_{symbol}.json")
     tmp_path = f"{final_path}.tmp"
-    
+
     os.makedirs(PARAMS_DIR, exist_ok=True)
-    with open(tmp_path, "w") as f:
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(params, f, indent=4)
     
     os.replace(tmp_path, final_path)
@@ -82,9 +82,18 @@ def load_and_process_orderbook_data(symbol: str, target_volume_usd: float = 1000
     df.drop_duplicates(subset=['timestamp', 'lastUpdateId'], inplace=True)
     df.sort_index(inplace=True)
 
-    # Critical Fix: Parse stringified lists back into actual lists
-    df['bids'] = df['bids'].apply(json.loads)
-    df['asks'] = df['asks'].apply(json.loads)
+    # Parse bids/asks: handle both JSON strings (from older format) and arrays (from parquet)
+    def parse_orderbook_side(data):
+        """Parse orderbook data - handle both JSON strings and arrays/lists."""
+        if isinstance(data, str):
+            return json.loads(data)
+        elif isinstance(data, (list, np.ndarray)):
+            # Convert numpy arrays to regular lists for consistency
+            return [list(order) if isinstance(order, np.ndarray) else order for order in data]
+        return data
+
+    df['bids'] = df['bids'].apply(parse_orderbook_side)
+    df['asks'] = df['asks'].apply(parse_orderbook_side)
 
     df['vwap_bid'] = df['bids'].apply(lambda x: calculate_vwap(x, target_volume_usd))
     df['vwap_ask'] = df['asks'].apply(lambda x: calculate_vwap(x, target_volume_usd))

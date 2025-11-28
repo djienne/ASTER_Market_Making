@@ -461,7 +461,7 @@ async def initialize_supertrend_signal(state, symbol):
 
     try:
         if os.path.exists(params_file):
-            with open(params_file, 'r') as f:
+            with open(params_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
             initial_signal = data.get('current_signal', {}).get('trend')
@@ -497,7 +497,7 @@ async def supertrend_signal_updater(state, symbol):
     while not shutdown_requested:
         try:
             if os.path.exists(params_file):
-                with open(params_file, 'r') as f:
+                with open(params_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 
                 new_signal = data.get('current_signal', {}).get('trend')
@@ -1156,9 +1156,10 @@ async def main():
     API_PRIVATE_KEY = os.getenv("API_PRIVATE_KEY")
     global_api_creds = (API_USER, API_SIGNER, API_PRIVATE_KEY)
 
-    # Set up signal handlers
-    signal.signal(signal.SIGTERM, signal_handler)
+    # Set up signal handlers (SIGTERM not available on Windows, use SIGINT as fallback)
     signal.signal(signal.SIGINT, signal_handler)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, signal_handler)
 
     client = None
     tasks = []
