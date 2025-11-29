@@ -1,33 +1,43 @@
 {
     "ticker": "BNB",
-    "timestamp": "2025-11-28T14:52:25.014008",
+    "timestamp": "2025-11-29T17:24:54.877560",
     "market_data": {
-        "mid_price": 896.95,
-        "sigma": 0.020801951309936884,
-        "A": 0.3342483344785993,
-        "k": 3.821902187712901,
-        "garch_sigma": NaN,
-        "rolling_sigma": 0.020801951309936884
+        "mid_price": 881.6500000000001,
+        "sigma": 0.008305618207207967,
+        "A_buy": 0.019492090835812527,
+        "k_buy": 7.163411642184723,
+        "A_sell": 0.021364059393096133,
+        "k_sell": 10.252965910646202,
+        "garch_sigma": 0.008305618207207967,
+        "rolling_sigma": 0.006478898679138675
     },
     "optimal_parameters": {
-        "gamma": 0.5,
-        "time_horizon_days": 0.041666666666666664
+        "gamma": 0.05000000000000001,
+        "time_horizon_days": 0.003472222222222222
     },
     "current_state": {
-        "inventory": 1,
+        "inventory": 0,
         "minutes_window": 5,
         "ma_window": 3
     },
     "calculated_values": {
-        "reservation_price": 896.9499909849754,
-        "gap": 9.015024602376798e-06
+        "reservation_price": 881.6500000000001,
+        "gap": 0.0
     },
     "limit_orders": {
-        "ask_price": 897.1958812234515,
-        "bid_price": 896.7040827164502,
-        "delta_a": 0.24589023847599448,
-        "delta_b": 0.24590826852519923,
-        "delta_a_percent": 0.027414040746529287,
-        "delta_b_percent": 0.027416050897508135
+        "ask_price": 881.7891133569689,
+        "bid_price": 881.5527042858075,
+        "delta_a": 0.13911335696878804,
+        "delta_b": 0.09729571419256394,
+        "delta_a_percent": 0.01577875086131549,
+        "delta_b_percent": 0.011035639334493726
+    },
+    "backtest_performance": {
+        "avg_pnl": 5874.092000211053,
+        "total_buys": 0,
+        "total_sells": 10,
+        "avg_buys_per_period": 0.0,
+        "avg_sells_per_period": 3.3333333333333335,
+        "total_trades": 10
     }
 }
