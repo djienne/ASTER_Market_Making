@@ -62,8 +62,8 @@ def calculate_final_quotes(gamma, sigma, A_buy, k_buy, A_sell, k_sell, time_hori
     q = 0  # Assuming 0 inventory for the standard quote output, though bot will have real q
 
     # Calculate volatility term
-    # risk_term = gamma * sigma^2 * T
-    risk_term = gamma * (sigma**2) * time_horizon
+    # risk_term = gamma * (sigma * s)^2 * T
+    risk_term = gamma * ((sigma * s)**2) * time_horizon
 
     # Calculate spreads from mid-price
     # Ask spread (uses k_buy - liquidity of buyers hitting our ask)

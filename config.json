@@ -1,15 +1,15 @@
 {
   "avellaneda_calculation": {
     "fixed_gamma": 0.05,
-    "recent_param_periods": 4,
+    "recent_param_periods": 10,
     "data_completeness_threshold": 0.90,
     "max_gap_seconds": 60,
     "ma_window_config": {
       "short_period_threshold_minutes": 480,
       "medium_period_threshold_minutes": 1200,
-      "short_period_ma_window": 3,
-      "medium_period_ma_window": 2,
-      "long_period_ma_window": 1
+      "short_period_ma_window": 6,
+      "medium_period_ma_window": 4,
+      "long_period_ma_window": 2
     }
   },
   "description": {

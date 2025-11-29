@@ -1,43 +1,43 @@
 {
     "ticker": "BNB",
-    "timestamp": "2025-11-29T17:24:54.877560",
+    "timestamp": "2025-11-29T17:39:08.354549",
     "market_data": {
-        "mid_price": 881.6500000000001,
-        "sigma": 0.008305618207207967,
-        "A_buy": 0.019492090835812527,
-        "k_buy": 7.163411642184723,
-        "A_sell": 0.021364059393096133,
-        "k_sell": 10.252965910646202,
-        "garch_sigma": 0.008305618207207967,
-        "rolling_sigma": 0.006478898679138675
+        "mid_price": 880.55,
+        "sigma": 0.008616012528476475,
+        "A_buy": 0.02234476607955317,
+        "k_buy": 9.574078079452521,
+        "A_sell": 0.031981520751473654,
+        "k_sell": 13.706138341656809,
+        "garch_sigma": 0.008616012528476475,
+        "rolling_sigma": 0.007288310890988116
     },
     "optimal_parameters": {
-        "gamma": 0.05000000000000001,
-        "time_horizon_days": 0.003472222222222222
+        "gamma": 0.05,
+        "time_horizon_days": 0.049479166666666664
     },
     "current_state": {
         "inventory": 0,
         "minutes_window": 5,
-        "ma_window": 3
+        "ma_window": 6
     },
     "calculated_values": {
-        "reservation_price": 881.6500000000001,
+        "reservation_price": 880.55,
         "gap": 0.0
     },
     "limit_orders": {
-        "ask_price": 881.7891133569689,
-        "bid_price": 881.5527042858075,
-        "delta_a": 0.13911335696878804,
-        "delta_b": 0.09729571419256394,
-        "delta_a_percent": 0.01577875086131549,
-        "delta_b_percent": 0.011035639334493726
+        "ask_price": 880.7253774112771,
+        "bid_price": 880.4059722409905,
+        "delta_a": 0.17537741127716827,
+        "delta_b": 0.14402775900945863,
+        "delta_a_percent": 0.01991680327944674,
+        "delta_b_percent": 0.016356567941565914
     },
     "backtest_performance": {
-        "avg_pnl": 5874.092000211053,
+        "avg_pnl": 240710.69112559827,
         "total_buys": 0,
-        "total_sells": 10,
+        "total_sells": 548,
         "avg_buys_per_period": 0.0,
-        "avg_sells_per_period": 3.3333333333333335,
-        "total_trades": 10
+        "avg_sells_per_period": 91.33333333333333,
+        "total_trades": 548
     }
 }

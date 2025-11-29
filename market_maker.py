@@ -781,8 +781,10 @@ async def market_making_loop(state, client, args):
                 q, s = state.position_size, state.mid_price
 
                 # Calculate reservation price and optimal quotes
-                r = s - q * gamma * (sigma**2) * T
-                spread_base = gamma * (sigma**2) * T + (2 / gamma) * np.log(1 + (gamma / k))
+                # Use absolute volatility (sigma * s)^2
+                risk_term = gamma * ((sigma * s)**2) * T
+                r = s - q * risk_term
+                spread_base = risk_term + (2 / gamma) * np.log(1 + (gamma / k))
                 half_spread = spread_base / 2.0
                 gap = abs(r - s)
                 

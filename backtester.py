@@ -11,12 +11,14 @@ def jit_backtest_loop(s_values, buy_min_values, sell_max_values, gamma, k, sigma
     """Core JIT-compiled backtest loop for performance."""
     N = len(s_values)
     q, x, pnl = np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1)
-    gamma_sigma2 = gamma * sigma**2
+    # gamma_sigma2 calculation removed
     buy_count = 0
     sell_count = 0
 
     for i in range(N):
-        r = s_values[i] - q[i] * gamma_sigma2 * time_remaining[i]
+        # Calculate risk term using absolute volatility (sigma * price)^2
+        risk_term_i = gamma * (sigma * s_values[i])**2 * time_remaining[i]
+        r = s_values[i] - q[i] * risk_term_i
         gap = abs(r - s_values[i])
         delta_a, delta_b = (half_spread[i] + gap, half_spread[i] - gap) if r >= s_values[i] else (half_spread[i] - gap, half_spread[i] + gap)
 
@@ -48,7 +50,7 @@ def run_backtest(mid_prices, buy_trades, sell_trades, gamma, k, sigma, window_mi
     dt = T_backtest / N if N > 0 else 0
 
     time_remaining = np.maximum(0, time_horizon - np.arange(N) * dt)
-    spread_base = gamma * sigma**2 * time_remaining + (2 / gamma) * np.log(1 + (gamma / k))
+    spread_base = gamma * (sigma * s_values)**2 * time_remaining + (2 / gamma) * np.log(1 + (gamma / k))
 
     pnl, buy_count, sell_count = jit_backtest_loop(s_values, buy_min.values, sell_max.values, gamma, k, sigma, fee, time_remaining, spread_base, spread_base / 2.0)
     return {'pnl': pnl, 'buys': buy_count, 'sells': sell_count}
@@ -80,7 +82,7 @@ def find_gamma(target_spread, spread_func, k):
 def generate_gamma_grid(s, sigma, k, time_horizon):
     """Generate a grid of gamma values to test for optimization."""
     time_remaining = time_horizon / 2.0
-    spread_func = lambda g: (g * sigma**2 * time_remaining + (2 / g) * np.log(1 + (g / k))) / s * 100.0
+    spread_func = lambda g: (g * (sigma * s)**2 * time_remaining + (2 / g) * np.log(1 + (g / k))) / s * 100.0
 
     def safe_find_gamma(target):
         try:
