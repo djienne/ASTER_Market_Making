@@ -1,13 +1,15 @@
-import time
-import aiohttp
-import hmac
 import hashlib
-from web3 import Web3
-from eth_account import Account
-from eth_account.messages import encode_defunct
-from eth_abi import encode
+import hmac
 import json
 import math
+import time
+import urllib.parse
+
+import aiohttp
+from eth_abi import encode
+from eth_account import Account
+from eth_account.messages import encode_defunct
+from web3 import Web3
 
 
 def _trim_dict(my_dict):
@@ -30,7 +32,6 @@ class ApiClient:
     """
 
     def __init__(self, api_user, api_signer, api_private_key, release_mode=True):
-        # Ethereum-style credentials
         if not api_user or not Web3.is_address(api_user):
             raise ValueError("API_USER is missing or not a valid Ethereum address.")
         if not api_signer or not Web3.is_address(api_signer):
@@ -45,9 +46,10 @@ class ApiClient:
 
         self.base_url = "https://fapi.asterdex.com"
         self.session = None
+        self.timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_connect=10, sock_read=20)
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(timeout=self.timeout)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -55,7 +57,7 @@ class ApiClient:
             await self.session.close()
 
     def _sign(self, params):
-        """Signs the request parameters using the Ethereum signature method."""
+        """Sign request params using the Ethereum signature method."""
         nonce = math.trunc(time.time() * 1000000)
         my_dict = {k: v for k, v in params.items() if v is not None}
         my_dict["recvWindow"] = 50000
@@ -64,8 +66,7 @@ class ApiClient:
         _trim_dict(my_dict)
         json_str = json.dumps(my_dict, sort_keys=True).replace(' ', '').replace("'", '"')
 
-        encoded = encode(['string', 'address', 'address', 'uint256'],
-                         [json_str, self.api_user, self.api_signer, nonce])
+        encoded = encode(['string', 'address', 'address', 'uint256'], [json_str, self.api_user, self.api_signer, nonce])
         keccak_hex = Web3.keccak(encoded).hex()
 
         signable_msg = encode_defunct(hexstr=keccak_hex)
@@ -75,11 +76,65 @@ class ApiClient:
         my_dict['user'] = self.api_user
         my_dict['signer'] = self.api_signer
         my_dict['signature'] = '0x' + signed_message.signature.hex()
-
         return my_dict
 
+    def _build_headers(self, api_key=None):
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'PythonApp/1.0',
+        }
+        if api_key:
+            headers['X-MBX-APIKEY'] = api_key
+        return headers
+
+    def _build_hmac_request_params(self, params: dict, api_secret: str) -> dict:
+        request_params = dict(params)
+        request_params['timestamp'] = int(time.time() * 1000)
+        request_params['recvWindow'] = 5000
+
+        query_string = urllib.parse.urlencode(sorted(request_params.items()))
+        request_params['signature'] = hmac.new(
+            api_secret.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        return request_params
+
+    def _prepare_request(self, params: dict = None, use_binance_auth=False, api_key=None, api_secret=None):
+        clean_params = dict(params or {})
+        if use_binance_auth and api_key and api_secret:
+            request_params = self._build_hmac_request_params(clean_params, api_secret)
+            headers = self._build_headers(api_key=api_key)
+        else:
+            request_params = self._sign(clean_params)
+            headers = self._build_headers()
+        return request_params, headers
+
+    async def _request_json(self, method: str, url: str, request_params: dict, headers: dict):
+        request_specs = {
+            'GET': (self.session.get, 'params'),
+            'POST': (self.session.post, 'data'),
+            'PUT': (self.session.put, 'data'),
+            'DELETE': (self.session.delete, 'data'),
+        }
+
+        method = method.upper()
+        if method not in request_specs:
+            raise ValueError(f"Unsupported HTTP method: {method}")
+
+        request_fn, payload_key = request_specs[method]
+        request_kwargs = {payload_key: request_params, 'headers': headers}
+
+        async with request_fn(url, **request_kwargs) as response:
+            if not response.ok:
+                error_body = await response.text()
+                if not self.release_mode:
+                    print(f"API Error on {method} {url}: Status={response.status}, Body={error_body}")
+            response.raise_for_status()
+            return await response.json()
+
     async def get_exchange_info(self):
-        """Gets exchange information. This is a public endpoint."""
+        """Get exchange information from the public endpoint."""
         url = f"{self.base_url}/fapi/v1/exchangeInfo"
         async with self.session.get(url) as response:
             response.raise_for_status()
@@ -105,209 +160,55 @@ class ApiClient:
                 }
         raise ValueError(f"Could not find filters for symbol '{symbol}'.")
 
+    async def signed_request(self, method: str, endpoint: str, params: dict = None, use_binance_auth=False, api_key=None, api_secret=None):
+        """Generic method for making signed requests to the API."""
+        url = f"{self.base_url}{endpoint}"
+        request_params, headers = self._prepare_request(
+            params,
+            use_binance_auth=use_binance_auth,
+            api_key=api_key,
+            api_secret=api_secret,
+        )
+        return await self._request_json(method, url, request_params, headers)
+
     async def place_order(self, symbol, price, quantity, side, reduce_only=False):
-        """Places a limit post-only order using Ethereum signature auth."""
-        url = f"{self.base_url}/fapi/v3/order"
+        """Place a limit post-only order using Ethereum signature auth."""
         params = {
-            "symbol": symbol, "side": side, "type": "LIMIT",
-            "timeInForce": "GTX", "price": price, "quantity": quantity,
-            "positionSide": "BOTH"
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "timeInForce": "GTX",
+            "price": price,
+            "quantity": quantity,
+            "positionSide": "BOTH",
         }
         if reduce_only:
             params['reduceOnly'] = 'true'
-
-        signed_params = self._sign(params)
-        headers = {'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'PythonApp/1.0'}
-
-        # print("📤 Sending order request with params:", params)
-        # print("🔐 Signed params keys:", list(signed_params.keys()))
-        # print("📋 Full signed params:", signed_params)
-
-        async with self.session.post(url, data=signed_params, headers=headers) as response:
-            # print(f"📨 Response status: {response.status}")
-            if not response.ok:
-                error_body = await response.text()
-                # print(f"❌ API Error on order placement: Status={response.status}")
-                # print(f"❌ Error body: {error_body}")
-                # print(f"📋 Request params that caused error: {params}")
-                # print(f"🔐 Signed params that caused error: {signed_params}")
-            else:
-                # print("✅ Order request successful")
-                pass
-            response.raise_for_status()
-            result = await response.json()
-            # print("📨 Order response:", result)
-            return result
+        return await self.signed_request("POST", "/fapi/v3/order", params)
 
     async def get_order_status(self, symbol, order_id):
-        """Gets order status using Ethereum signature auth."""
-        url = f"{self.base_url}/fapi/v3/order"
+        """Get order status using Ethereum signature auth."""
         params = {"symbol": symbol, "orderId": order_id}
-        signed_params = self._sign(params)
-
-        if not self.release_mode:
-            print("Sending status request with params:", params)
-        async with self.session.get(url, params=signed_params) as response:
-            if not response.ok:
-                error_body = await response.text()
-                print(f"API Error on order status check: Status={response.status}, Body={error_body}")
-            response.raise_for_status()
-            return await response.json()
+        return await self.signed_request("GET", "/fapi/v3/order", params)
 
     async def cancel_order(self, symbol: str, order_id: int) -> dict:
-        """Cancels an order using Ethereum signature auth."""
-        url = f"{self.base_url}/fapi/v3/order"
+        """Cancel an order using Ethereum signature auth."""
         params = {"symbol": symbol, "orderId": order_id}
-        signed_params = self._sign(params)
-        headers = {'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'PythonApp/1.0'}
-
-        if not self.release_mode:
-            print(f"Cancelling order {order_id} for symbol: {symbol}")
-        async with self.session.delete(url, data=signed_params, headers=headers) as response:
-            if not response.ok:
-                error_body = await response.text()
-                print(f"API Error on cancel order: Status={response.status}, Body={error_body}")
-            response.raise_for_status()
-            return await response.json()
+        return await self.signed_request("DELETE", "/fapi/v3/order", params)
 
     async def cancel_all_orders(self, symbol: str) -> dict:
-        """Cancels all orders for a symbol using Ethereum signature auth."""
-        url = f"{self.base_url}/fapi/v3/allOpenOrders"
+        """Cancel all orders for a symbol using Ethereum signature auth."""
         params = {"symbol": symbol}
-        signed_params = self._sign(params)
-        headers = {'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'PythonApp/1.0'}
-
-        if not self.release_mode:
-            print(f"Cancelling all open orders for symbol: {symbol}")
-        async with self.session.delete(url, data=signed_params, headers=headers) as response:
-            if not response.ok:
-                error_body = await response.text()
-                print(f"API Error on cancel all orders: Status={response.status}, Body={error_body}")
-            response.raise_for_status()
-            return await response.json()
+        return await self.signed_request("DELETE", "/fapi/v3/allOpenOrders", params)
 
     async def get_position_risk(self, symbol: str = None):
-        """Gets position risk information using Ethereum signature auth."""
-        url = f"{self.base_url}/fapi/v3/positionRisk"
+        """Get position risk information using Ethereum signature auth."""
         params = {}
         if symbol:
             params["symbol"] = symbol
-
-        signed_params = self._sign(params)
-
-        async with self.session.get(url, params=signed_params) as response:
-            if not response.ok:
-                error_body = await response.text()
-                print(f"API Error on get position risk: Status={response.status}, Body={error_body}")
-            response.raise_for_status()
-            return await response.json()
-
-    async def signed_request(self, method: str, endpoint: str, params: dict = None, use_binance_auth=False, api_key=None, api_secret=None):
-        """Generic method for making signed requests to the API.
-
-        Args:
-            method: HTTP method (GET, POST, PUT, DELETE)
-            endpoint: API endpoint path
-            params: Request parameters
-            use_binance_auth: If True, use Binance-style HMAC authentication
-            api_key: API key for Binance-style auth
-            api_secret: API secret for Binance-style auth
-        """
-        if params is None:
-            params = {}
-
-        url = f"{self.base_url}{endpoint}"
-
-        if use_binance_auth and api_key and api_secret:
-            # For USER_STREAM endpoints - use Binance-style HMAC authentication
-            import time
-            import hmac
-            import hashlib
-            import urllib.parse
-
-            # Add timestamp
-            params['timestamp'] = int(time.time() * 1000)
-            params['recvWindow'] = 5000
-
-            # Create query string
-            query_string = urllib.parse.urlencode(sorted(params.items()))
-
-            # Create signature
-            signature = hmac.new(
-                api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-
-            # Add signature to params
-            params['signature'] = signature
-
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'User-Agent': 'PythonApp/1.0',
-                'X-MBX-APIKEY': api_key
-            }
-            request_params = params
-        else:
-            # For TRADE/USER_DATA endpoints - need full signature
-            signed_params = self._sign(params)
-            headers = {'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'PythonApp/1.0'}
-            request_params = signed_params
-
-        if method.upper() == 'GET':
-            async with self.session.get(url, params=request_params, headers=headers) as response:
-                if not response.ok:
-                    error_body = await response.text()
-                    if not self.release_mode:
-                        print(f"API Error on {method} {endpoint}: Status={response.status}, Body={error_body}")
-                response.raise_for_status()
-                return await response.json()
-
-        elif method.upper() == 'POST':
-            async with self.session.post(url, data=request_params, headers=headers) as response:
-                if not response.ok:
-                    error_body = await response.text()
-                    if not self.release_mode:
-                        print(f"API Error on {method} {endpoint}: Status={response.status}, Body={error_body}")
-                response.raise_for_status()
-                return await response.json()
-
-        elif method.upper() == 'PUT':
-            async with self.session.put(url, data=request_params, headers=headers) as response:
-                if not response.ok:
-                    error_body = await response.text()
-                    if not self.release_mode:
-                        print(f"API Error on {method} {endpoint}: Status={response.status}, Body={error_body}")
-                response.raise_for_status()
-                return await response.json()
-
-        elif method.upper() == 'DELETE':
-            async with self.session.delete(url, data=request_params, headers=headers) as response:
-                if not response.ok:
-                    error_body = await response.text()
-                    if not self.release_mode:
-                        print(f"API Error on {method} {endpoint}: Status={response.status}, Body={error_body}")
-                response.raise_for_status()
-                return await response.json()
-
-        else:
-            raise ValueError(f"Unsupported HTTP method: {method}")
+        return await self.signed_request("GET", "/fapi/v3/positionRisk", params)
 
     async def change_leverage(self, symbol: str, leverage: int):
-        """Changes the initial leverage for a symbol."""
-        url = f"{self.base_url}/fapi/v3/leverage"
-        params = {
-            "symbol": symbol,
-            "leverage": leverage
-        }
-        signed_params = self._sign(params)
-        headers = {'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'PythonApp/1.0'}
-
-        if not self.release_mode:
-            print(f"Changing leverage for {symbol} to {leverage}x")
-        async with self.session.post(url, data=signed_params, headers=headers) as response:
-            if not response.ok:
-                error_body = await response.text()
-                print(f"API Error on changing leverage: Status={response.status}, Body={error_body}")
-            response.raise_for_status()
-            return await response.json()
+        """Change the initial leverage for a symbol."""
+        params = {"symbol": symbol, "leverage": leverage}
+        return await self.signed_request("POST", "/fapi/v3/leverage", params)

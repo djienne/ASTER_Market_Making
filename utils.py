@@ -42,7 +42,8 @@ def save_avellaneda_params_atomic(params: dict, symbol: str) -> bool:
 def parse_arguments():
     """Parse command-line arguments for the script."""
     parser = argparse.ArgumentParser(description='Calculate Avellaneda-Stoikov market making parameters')
-    parser.add_argument('ticker', nargs='?', default='BNB', help='Ticker symbol (default: BNB)')
+    default_ticker = os.getenv("SYMBOL", "BTCUSDT").upper().removesuffix("USDT")
+    parser.add_argument('ticker', nargs='?', default=default_ticker, help=f'Ticker symbol (default: {default_ticker})')
     parser.add_argument('--minutes', type=int, default=5, help='Frequency in minutes for parameter recalculation (default: 5)')
     return parser.parse_args()
 
@@ -107,24 +108,24 @@ def load_and_process_orderbook_data(symbol: str, target_volume_usd: float = 1000
 
 def calculate_vwap(orders, target_volume):
     """Calculates the volume-weighted average price for one side of the order book."""
-    volume_seen = 0
-    weighted_sum = 0
+    quote_volume_seen = 0.0
+    base_quantity_filled = 0.0
     for order in orders:
         if isinstance(order, (list, tuple)) and len(order) >= 2:
             price, qty = order
             volume_usd = price * qty
 
             # If the first level alone exceeds the target, its price is the VWAP
-            if volume_seen == 0 and volume_usd >= target_volume:
+            if quote_volume_seen == 0 and volume_usd >= target_volume:
                 return price
 
-            if volume_seen + volume_usd >= target_volume:
-                remaining_qty = (target_volume - volume_seen) / price
-                weighted_sum += remaining_qty * price * price # qty * price * price
-                volume_seen = target_volume
+            if quote_volume_seen + volume_usd >= target_volume:
+                remaining_quote = target_volume - quote_volume_seen
+                base_quantity_filled += remaining_quote / price
+                quote_volume_seen = target_volume
                 break
 
-            weighted_sum += qty * price * price # qty * price * price
-            volume_seen += volume_usd
+            base_quantity_filled += qty
+            quote_volume_seen += volume_usd
 
-    return weighted_sum / (volume_seen * 1.0) if volume_seen > 0 else np.nan
+    return quote_volume_seen / base_quantity_filled if base_quantity_filled > 0 else np.nan

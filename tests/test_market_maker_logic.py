@@ -1,0 +1,297 @@
+import asyncio
+import logging
+
+import market_maker
+
+
+def test_classify_order_update_distinguishes_fill_from_cancel():
+    canceled = market_maker.classify_order_update({"X": "CANCELED", "z": "0", "ap": "100"})
+    assert canceled["is_terminal"] is True
+    assert canceled["treat_as_fill"] is False
+
+    canceled_with_fill = market_maker.classify_order_update({"X": "CANCELED", "z": "0.2", "ap": "100"})
+    assert canceled_with_fill["is_terminal"] is True
+    assert canceled_with_fill["treat_as_fill"] is True
+
+
+def test_classify_order_update_keeps_small_partial_open():
+    partial = market_maker.classify_order_update({"X": "PARTIALLY_FILLED", "z": "0.05", "ap": "100"})
+
+    assert partial["is_terminal"] is False
+    assert partial["treat_as_fill"] is False
+
+
+def test_classify_order_update_keeps_large_partial_open_until_terminal():
+    partial = market_maker.classify_order_update({"X": "PARTIALLY_FILLED", "z": "0.2", "ap": "100"})
+
+    assert partial["is_terminal"] is False
+    assert partial["treat_as_fill"] is False
+
+
+def test_apply_fill_to_state_uses_position_snapshot_source_of_truth():
+    state = market_maker.StrategyState(flip_mode=False)
+    state.mid_price = 100.0
+    state.position_size = 0.2
+    state.mode = "BUY"
+
+    previous_mode, new_mode = market_maker.apply_fill_to_state(state, "BUY", 0.2)
+    assert previous_mode == "BUY"
+    assert new_mode == "SELL"
+    assert state.position_size == 0.2
+
+    state = market_maker.StrategyState(flip_mode=False)
+    state.mid_price = 100.0
+    state.position_size = 0.05
+    state.mode = "BUY"
+
+    previous_mode, new_mode = market_maker.apply_fill_to_state(state, "BUY", 0.05)
+    assert previous_mode == "BUY"
+    assert new_mode == "BUY"
+    assert state.position_size == 0.05
+
+
+def test_sync_mode_with_position_respects_updated_flip_mode():
+    state = market_maker.StrategyState(flip_mode=False)
+    state.mode = "BUY"
+    state.mid_price = 100.0
+    state.flip_mode = True
+
+    market_maker.sync_mode_with_position(state)
+
+    assert state.mode == "SELL"
+    assert state.position_size == 0.0
+
+
+def test_apply_position_snapshot_preserves_small_residual_position():
+    state = market_maker.StrategyState(flip_mode=False)
+    state.mid_price = 100.0
+
+    market_maker.apply_position_snapshot(state, 0.05, position_notional=5.0)
+
+    assert state.mode == "BUY"
+    assert state.position_size == 0.05
+
+
+def test_significant_inventory_closes_using_position_direction():
+    state = market_maker.StrategyState(flip_mode=False)
+    state.mid_price = 100.0
+
+    market_maker.apply_position_snapshot(state, -0.2, position_notional=20.0)
+    assert state.mode == "BUY"
+
+    state = market_maker.StrategyState(flip_mode=True)
+    state.mid_price = 100.0
+
+    market_maker.apply_position_snapshot(state, 0.2, position_notional=20.0)
+    assert state.mode == "SELL"
+
+
+def test_round_price_to_tick_stays_passive_for_each_side():
+    assert abs(market_maker.round_price_to_tick(100.06, 0.1, "BUY") - 100.0) < 1e-9
+    assert abs(market_maker.round_price_to_tick(100.06, 0.1, "SELL") - 100.1) < 1e-9
+
+
+def test_wait_for_terminal_order_update_ignores_non_terminal_events():
+    async def runner():
+        queue = asyncio.Queue()
+        await queue.put({"e": "ORDER_TRADE_UPDATE", "o": {"i": 42, "X": "PARTIALLY_FILLED", "z": "0.05", "ap": "100"}})
+        await queue.put({"e": "ORDER_TRADE_UPDATE", "o": {"i": 42, "X": "FILLED", "z": "0.2", "ap": "100"}})
+
+        terminal = await market_maker.wait_for_terminal_order_update(
+            queue,
+            42,
+            1.0,
+            logging.getLogger("test"),
+            "Test",
+        )
+
+        assert terminal["status"] == "FILLED"
+        assert terminal["treat_as_fill"] is True
+
+    asyncio.run(runner())
+
+
+def test_wait_for_terminal_order_update_handles_partial_then_canceled_fill():
+    async def runner():
+        queue = asyncio.Queue()
+        await queue.put({"e": "ORDER_TRADE_UPDATE", "o": {"i": 42, "X": "PARTIALLY_FILLED", "z": "0.05", "ap": "100"}})
+        await queue.put({"e": "ORDER_TRADE_UPDATE", "o": {"i": 42, "X": "CANCELED", "z": "0.2", "ap": "100"}})
+
+        terminal = await market_maker.wait_for_terminal_order_update(
+            queue,
+            42,
+            1.0,
+            logging.getLogger("test"),
+            "Test",
+        )
+
+        assert terminal["status"] == "CANCELED"
+        assert terminal["treat_as_fill"] is True
+        assert terminal["filled_qty"] == 0.2
+
+    asyncio.run(runner())
+
+
+def test_user_data_idle_timeout_does_not_reconnect(monkeypatch):
+    class DummyClient:
+        def __init__(self):
+            self.listen_key_requests = 0
+
+        async def signed_request(self, method, endpoint, params, use_binance_auth=False, api_key=None, api_secret=None):
+            self.listen_key_requests += 1
+            return {"listenKey": "dummy-listen-key"}
+
+    class DummyWebSocket:
+        async def recv(self):
+            await asyncio.sleep(3600)
+
+    class DummyConnection:
+        def __init__(self, websocket):
+            self.websocket = websocket
+
+        async def __aenter__(self):
+            return self.websocket
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def fake_keepalive(state, client, runtime):
+        await asyncio.Event().wait()
+
+    wait_calls = {"count": 0}
+
+    async def fake_wait_for(awaitable, timeout):
+        wait_calls["count"] += 1
+        awaitable.close()
+        if wait_calls["count"] >= 2:
+            runtime.request_shutdown()
+        raise asyncio.TimeoutError
+
+    state = market_maker.StrategyState()
+    client = DummyClient()
+    runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 61.0)
+
+    monkeypatch.setenv("APIV1_PUBLIC_KEY", "public")
+    monkeypatch.setenv("APIV1_PRIVATE_KEY", "private")
+    monkeypatch.setattr(market_maker, "keepalive_balance_listen_key", fake_keepalive)
+    monkeypatch.setattr(market_maker.websockets, "connect", lambda *args, **kwargs: DummyConnection(DummyWebSocket()))
+    monkeypatch.setattr(market_maker.asyncio, "wait_for", fake_wait_for)
+
+    asyncio.run(market_maker.websocket_user_data_updater(state, client, "BTCUSDT", runtime))
+
+    assert client.listen_key_requests == 1
+    assert wait_calls["count"] == 2
+
+
+def test_reconcile_fill_with_position_waits_for_ws_snapshot():
+    class DummyClient:
+        async def get_position_risk(self, symbol):
+            raise AssertionError("REST fallback should not be used")
+
+    async def runner():
+        state = market_maker.StrategyState(flip_mode=False)
+        state.mid_price = 100.0
+        previous_seq = state.position_update_seq
+
+        async def push_position_update():
+            await asyncio.sleep(0.05)
+            market_maker.apply_position_snapshot(state, 0.2, position_notional=20.0)
+
+        task = asyncio.create_task(push_position_update())
+        synced_via_ws, previous_mode, new_mode = await market_maker.reconcile_fill_with_position(
+            state,
+            DummyClient(),
+            "BTCUSDT",
+            logging.getLogger("test"),
+            previous_seq,
+            "Test fill",
+        )
+        await task
+
+        assert synced_via_ws is True
+        assert previous_mode == "BUY"
+        assert new_mode == "SELL"
+        assert state.position_size == 0.2
+
+    asyncio.run(runner())
+
+
+def test_reconcile_fill_with_position_falls_back_to_rest():
+    class DummyClient:
+        async def get_position_risk(self, symbol):
+            return [{"positionAmt": "0.2", "notional": "20.0"}]
+
+    async def runner():
+        state = market_maker.StrategyState(flip_mode=False)
+        state.mid_price = 100.0
+        previous_seq = state.position_update_seq
+
+        synced_via_ws, previous_mode, new_mode = await market_maker.reconcile_fill_with_position(
+            state,
+            DummyClient(),
+            "BTCUSDT",
+            logging.getLogger("test"),
+            previous_seq,
+            "Test fill",
+        )
+
+        assert synced_via_ws is False
+        assert previous_mode == "BUY"
+        assert new_mode == "SELL"
+        assert state.position_size == 0.2
+
+    asyncio.run(runner())
+
+
+def test_cancel_active_order_failure_preserves_tracking():
+    class FailingClient:
+        async def cancel_order(self, symbol, order_id):
+            raise RuntimeError("boom")
+
+    async def runner():
+        state = market_maker.StrategyState()
+        state.active_order_id = 42
+        state.last_order_price = 100.0
+        state.last_order_side = "BUY"
+        state.last_order_quantity = 0.1
+
+        success = await market_maker.cancel_active_order(
+            state,
+            FailingClient(),
+            "BTCUSDT",
+            logging.getLogger("test"),
+            "Test cancel",
+        )
+
+        assert success is False
+        assert state.active_order_id == 42
+        assert state.last_order_price == 100.0
+
+    asyncio.run(runner())
+
+
+def test_cancel_active_order_success_clears_tracking():
+    class SuccessfulClient:
+        async def cancel_order(self, symbol, order_id):
+            return {"orderId": order_id}
+
+    async def runner():
+        state = market_maker.StrategyState()
+        state.active_order_id = 42
+        state.last_order_price = 100.0
+        state.last_order_side = "BUY"
+        state.last_order_quantity = 0.1
+
+        success = await market_maker.cancel_active_order(
+            state,
+            SuccessfulClient(),
+            "BTCUSDT",
+            logging.getLogger("test"),
+            "Test cancel",
+        )
+
+        assert success is True
+        assert state.active_order_id is None
+        assert state.last_order_price is None
+
+    asyncio.run(runner())

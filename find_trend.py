@@ -401,8 +401,9 @@ def perform_grid_search(symbol, interval):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Backtest Supertrend strategy and find best parameters.')
-    parser.add_argument('--symbol', type=str, default='BNBUSDT',
-                        help='The trading symbol to backtest (e.g., BTCUSDT). Defaults to BNBUSDT.')
+    default_symbol = os.getenv("SYMBOL", "BTCUSDT").upper()
+    parser.add_argument('--symbol', type=str, default=default_symbol,
+                        help=f'The trading symbol to backtest (e.g., BTCUSDT). Defaults to {default_symbol}.')
     parser.add_argument('--interval', type=str, default='1m',
                         help='The k-line interval (e.g., 1m, 5m, 1h, 1d). Defaults to 1m.')
     args = parser.parse_args()

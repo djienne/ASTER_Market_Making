@@ -10,7 +10,12 @@ from datetime import datetime
 from collections import deque
 import pandas as pd
 
-LIST_MARKETS = ['ETHUSDT','BNBUSDT']
+def _default_markets():
+    raw_symbols = os.getenv("SYMBOLS") or os.getenv("SYMBOL") or "BTCUSDT"
+    return [symbol.strip().upper() for symbol in raw_symbols.split(",") if symbol.strip()]
+
+
+LIST_MARKETS = _default_markets()
 
 class WebSocketDataCollector:
     def __init__(self, symbols, flush_interval=5, order_book_levels=10):

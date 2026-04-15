@@ -7,19 +7,18 @@ import json
 import signal
 import time
 import numpy as np
-from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
 from api_client import ApiClient
 
 # --- Configuration ---
 # STRATEGY
-DEFAULT_SYMBOL = "BNBUSDT"
+DEFAULT_SYMBOL = "BTCUSDT"
 FLIP_MODE = False # True for short-biased (SELL first), False for long-biased (BUY first)
 DEFAULT_BUY_SPREAD = 0.006   # 0.6% below mid-price for buy orders
 DEFAULT_SELL_SPREAD = 0.006  # 0.6% above mid-price for sell orders
 USE_AVELLANEDA_SPREADS = True  # Toggle to pull spreads from Avellaneda parameter files
 DEFAULT_LEVERAGE = 1
-DEFAULT_BALANCE_FRACTION = 0.2  # Use fraction of available balance for each order
+DEFAULT_BALANCE_FRACTION = 0.2  # Use a fraction of tracked wallet balance for each order
 POSITION_THRESHOLD_USD = 15.0  # USD threshold to switch to sell mode in case of partial order fill
 
 # TIMING (in seconds)
@@ -27,9 +26,10 @@ ORDER_REFRESH_INTERVAL = 30     # How long to wait before cancelling an unfilled
 RETRY_ON_ERROR_INTERVAL = 30    # How long to wait after a major error before retrying.
 PRICE_REPORT_INTERVAL = 60      # How often to report current prices and spread to terminal.
 BALANCE_REPORT_INTERVAL = 60    # How often to report account balance to terminal.
+POSITION_SYNC_TIMEOUT = 2.0     # How long to wait for a position snapshot after a fill.
 
 # ORDER REUSE SETTINGS
-DEFAULT_PRICE_CHANGE_THRESHOLD = 0.001  # minimum price change to cancel and replace order
+DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001  # 1 bp minimum price change to cancel and replace order
 
 # SUPERTREND INTEGRATION
 USE_SUPERTREND_SIGNAL = True  # Toggle to use Supertrend signal for dynamic flip_mode
@@ -43,9 +43,6 @@ CANCEL_SPECIFIC_ORDER = True # If True, cancel specific order ID. If False, canc
 LOG_FILE = 'market_maker.log'
 RELEASE_MODE = True  # When True, suppress all non-error logs and prints
 
-# Global variables for price data and rate limiting
-price_last_updated = None
-last_order_time = 0
 MIN_ORDER_INTERVAL = 1.0  # Minimum seconds between order placements
 
 # Spread configuration
@@ -55,6 +52,34 @@ SPREAD_MIN_THRESHOLD = 0.00005  # 0.005%
 SPREAD_MAX_THRESHOLD = 0.02     # 2%
 SPREAD_CACHE_TTL_SECONDS = 10
 _SPREAD_CACHE = {}
+
+
+def resolve_symbol(cli_symbol=None):
+    """Resolve the active symbol from CLI input, env var, or the hardcoded default."""
+    symbol = cli_symbol or os.getenv("SYMBOL") or DEFAULT_SYMBOL
+    return symbol.upper()
+
+
+class RuntimeContext:
+    """Holds runtime-only state such as timing and shutdown signals."""
+    def __init__(self, symbol, clock=None):
+        self.symbol = resolve_symbol(symbol)
+        self.shutdown_requested = False
+        self.price_last_updated = None
+        self.last_order_time = 0.0
+        self._clock = clock
+
+    def now(self):
+        if self._clock is not None:
+            return self._clock()
+
+        try:
+            return asyncio.get_running_loop().time()
+        except RuntimeError:
+            return time.monotonic()
+
+    def request_shutdown(self):
+        self.shutdown_requested = True
 
 
 def setup_logging(file_log_level):
@@ -130,18 +155,186 @@ class StrategyState:
         self.user_data_ws_connected = False
         # Supertrend signal
         self.supertrend_signal = None # Can be 1 (up) or -1 (down)
+        # Position snapshots are the source of truth for inventory state
+        self.position_update_seq = 0
 
 
-async def websocket_price_updater(state, symbol):
+def get_strategy_modes(flip_mode):
+    """Return the opening and closing order sides for the current bias."""
+    opening_mode = 'SELL' if flip_mode else 'BUY'
+    closing_mode = 'BUY' if flip_mode else 'SELL'
+    return opening_mode, closing_mode
+
+
+def get_position_close_side(position_size):
+    """Return the side required to reduce the current position."""
+    if position_size > 0:
+        return 'SELL'
+    if position_size < 0:
+        return 'BUY'
+    return None
+
+
+def has_significant_position(state, position_notional=None):
+    """Return True when inventory is non-zero and large enough to require an explicit close."""
+    if position_notional is None:
+        position_notional = get_position_notional_usd(state.position_size, state.mid_price)
+
+    return get_position_close_side(state.position_size) is not None and is_position_significant(position_notional)
+
+
+def get_target_mode(state, position_notional=None):
+    """Return the desired trading side given current bias and tracked inventory."""
+    opening_mode, _ = get_strategy_modes(state.flip_mode)
+
+    if position_notional is None:
+        position_notional = get_position_notional_usd(state.position_size, state.mid_price)
+
+    close_side = get_position_close_side(state.position_size)
+    if close_side and is_position_significant(position_notional):
+        return close_side
+
+    return opening_mode
+
+
+def clear_order_tracking(state):
+    """Clear the active order id and reuse-tracking fields."""
+    state.active_order_id = None
+    state.last_order_price = None
+    state.last_order_side = None
+    state.last_order_quantity = None
+
+
+def get_position_notional_usd(position_size, reference_price):
+    """Estimate the USD notional of a position from a reference price."""
+    if reference_price is None or reference_price <= 0:
+        return 0.0
+    return abs(position_size * reference_price)
+
+
+def is_position_significant(position_notional):
+    """Return True when the position is large enough to force closing mode."""
+    return position_notional >= POSITION_THRESHOLD_USD
+
+
+def apply_position_snapshot(state, position_size, position_notional=None):
+    """Store the latest position size and align the mode without erasing residual inventory."""
+    state.position_size = position_size
+    state.position_update_seq += 1
+    return sync_mode_with_position(state, position_notional=position_notional)
+
+
+def extract_position_snapshot(position_data, reference_price=None):
+    """Normalize an exchange position payload into size and notional values."""
+    raw_size = position_data.get('positionAmt')
+    if raw_size is None:
+        raw_size = position_data.get('pa', 0.0)
+
+    position_size = float(raw_size or 0.0)
+
+    raw_notional = position_data.get('notional')
+    if raw_notional is not None:
+        return position_size, abs(float(raw_notional))
+
+    entry_price = float(position_data.get('ep', position_data.get('entryPrice', 0.0)) or 0.0)
+    reference = reference_price if reference_price and reference_price > 0 else entry_price
+    return position_size, get_position_notional_usd(position_size, reference)
+
+
+def sync_state_from_position_data(state, position_data, reference_price=None):
+    """Apply an exchange position payload to local state."""
+    previous_mode = state.mode
+    position_size, notional_value = extract_position_snapshot(position_data, reference_price=reference_price)
+    apply_position_snapshot(state, position_size, position_notional=notional_value)
+    return position_size, notional_value, previous_mode, state.mode
+
+
+def sync_mode_with_position(state, position_notional=None):
+    """Keep the strategy mode aligned with the current bias and inventory threshold."""
+    state.mode = get_target_mode(state, position_notional=position_notional)
+    return state.mode
+
+
+def round_price_to_tick(price, tick_size, side):
+    """Round prices to a passive tick for the given side."""
+    if tick_size <= 0:
+        raise ValueError("tick_size must be positive")
+
+    scaled = price / tick_size
+    if side == 'BUY':
+        rounded = np.floor(scaled + 1e-12) * tick_size
+    elif side == 'SELL':
+        rounded = np.ceil(scaled - 1e-12) * tick_size
+    else:
+        raise ValueError(f"Unsupported side for price rounding: {side}")
+
+    return rounded
+
+
+async def cancel_active_order(state, client, symbol, log, reason):
+    """Cancel the currently tracked order and only clear local tracking on success."""
+    if not state.active_order_id:
+        return True
+
+    order_id_to_cancel = state.active_order_id
+    try:
+        if CANCEL_SPECIFIC_ORDER:
+            await client.cancel_order(symbol, order_id_to_cancel)
+        else:
+            await client.cancel_all_orders(symbol)
+    except Exception as cancel_error:
+        log.error(f"{reason}: failed to cancel active order {order_id_to_cancel}: {cancel_error}")
+        return False
+
+    clear_order_tracking(state)
+    log.info(f"{reason}: cancelled active order {order_id_to_cancel}.")
+    return True
+
+
+async def wait_for_position_sync(state, previous_seq, timeout):
+    """Wait for the next position snapshot to arrive."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    while state.position_update_seq <= previous_seq:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.05, remaining))
+
+    return True
+
+
+async def reconcile_fill_with_position(state, client, symbol, log, previous_position_seq, fill_context):
+    """Refresh strategy mode after a fill using position snapshots as the source of truth."""
+    previous_mode = state.mode
+
+    if await wait_for_position_sync(state, previous_position_seq, POSITION_SYNC_TIMEOUT):
+        sync_mode_with_position(state)
+        new_mode = state.mode
+        return True, previous_mode, new_mode
+
+    log.warning(f"{fill_context}: no position snapshot arrived within {POSITION_SYNC_TIMEOUT:.1f}s; falling back to REST sync.")
+    positions = await client.get_position_risk(symbol)
+    if positions:
+        sync_state_from_position_data(state, positions[0], reference_price=state.mid_price)
+    else:
+        apply_position_snapshot(state, 0.0, position_notional=0.0)
+
+    sync_mode_with_position(state)
+    new_mode = state.mode
+    return False, previous_mode, new_mode
+
+
+async def websocket_price_updater(state, symbol, runtime):
     """[MODIFIED] WebSocket-based price updater with exponential backoff and stale connection detection."""
-    global price_last_updated
     log = logging.getLogger('WebSocketPriceUpdater')
 
     websocket_url = f"wss://fstream.asterdex.com/ws/{symbol.lower()}@depth5"
     reconnect_delay = 5  # Initial delay
     max_reconnect_delay = 60 # Maximum wait time
 
-    while not shutdown_requested:
+    while not runtime.shutdown_requested:
         try:
             log.info(f"Connecting to WebSocket: {websocket_url}")
             state.price_ws_connected = False # Mark as disconnected while attempting
@@ -150,13 +343,13 @@ async def websocket_price_updater(state, symbol):
                 log.info(f"WebSocket connected for {symbol} depth stream")
                 state.price_ws_connected = True # Mark as connected
                 reconnect_delay = 5  # Reset reconnect delay on successful connection
-                last_message_time = asyncio.get_event_loop().time()
+                last_message_time = runtime.now()
 
-                while not shutdown_requested:
+                while not runtime.shutdown_requested:
                     try:
                         # [MODIFIED] Wait for a message with a timeout to detect stale connections
                         message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
-                        last_message_time = asyncio.get_event_loop().time()
+                        last_message_time = runtime.now()
 
                         try:
                             data = json.loads(message)
@@ -173,7 +366,7 @@ async def websocket_price_updater(state, symbol):
                                     state.bid_price = best_bid
                                     state.ask_price = best_ask
                                     state.mid_price = mid_price
-                                    price_last_updated = asyncio.get_event_loop().time()
+                                    runtime.price_last_updated = runtime.now()
 
                                     log.debug(f"Updated prices for {symbol}: Bid={best_bid}, Ask={best_ask}, Mid={mid_price:.4f}")
 
@@ -184,7 +377,7 @@ async def websocket_price_updater(state, symbol):
                     
                     # [ADDED] Stale connection detection logic
                     except asyncio.TimeoutError:
-                        time_since_last_msg = asyncio.get_event_loop().time() - last_message_time
+                        time_since_last_msg = runtime.now() - last_message_time
                         if time_since_last_msg > 60:
                             log.warning(f"No price messages received for {time_since_last_msg:.1f}s. Connection may be stale. Reconnecting...")
                             break # Exit inner loop to force reconnection
@@ -199,7 +392,7 @@ async def websocket_price_updater(state, symbol):
         finally:
             state.price_ws_connected = False # Mark as disconnected on any error/exit
 
-        if not shutdown_requested:
+        if not runtime.shutdown_requested:
             log.info(f"Reconnecting to price WebSocket in {reconnect_delay:.1f}s...")
             await asyncio.sleep(reconnect_delay)
             # [MODIFIED] Implement exponential backoff
@@ -207,16 +400,14 @@ async def websocket_price_updater(state, symbol):
 
     log.info("WebSocket price updater shutting down")
 
-def is_price_data_valid(state):
+def is_price_data_valid(state, runtime):
     """Check if the price data is valid and recent."""
-    global price_last_updated
-
-    if state.mid_price is None or price_last_updated is None:
+    if state.mid_price is None or runtime.price_last_updated is None:
         return False
 
     # Check if price data is recent (within 30 seconds)
-    current_time = asyncio.get_event_loop().time()
-    if current_time - price_last_updated > 30:
+    current_time = runtime.now()
+    if current_time - runtime.price_last_updated > 30:
         return False
 
     return True
@@ -230,18 +421,18 @@ def is_balance_data_valid(state):
     return True
 
 
-async def keepalive_balance_listen_key(state, client):
+async def keepalive_balance_listen_key(state, client, runtime):
     """Periodically send keepalive for balance listen key."""
     log = logging.getLogger('BalanceKeepalive')
     apiv1_public = os.getenv('APIV1_PUBLIC_KEY')
     apiv1_private = os.getenv('APIV1_PRIVATE_KEY')
 
-    while not shutdown_requested and state.balance_listen_key:
+    while not runtime.shutdown_requested and state.balance_listen_key:
         try:
             # Sleep for 10 minutes (listen key expires in 60 minutes)
             await asyncio.sleep(600)
 
-            if shutdown_requested or not state.balance_listen_key:
+            if runtime.shutdown_requested or not state.balance_listen_key:
                 break
 
             log.info("Sending keepalive for balance listen key...")
@@ -262,14 +453,14 @@ async def keepalive_balance_listen_key(state, client):
     log.info("Balance keepalive task shutting down")
 
 
-async def websocket_user_data_updater(state, client, symbol):
+async def websocket_user_data_updater(state, client, symbol, runtime):
     """[MODIFIED] WebSocket-based user data updater for account and order updates."""
     log = logging.getLogger('UserDataUpdater')
     reconnect_delay = 5
     max_reconnect_delay = 60 # Maximum wait time between reconnection attempts
     keepalive_task = None
 
-    while not shutdown_requested:
+    while not runtime.shutdown_requested:
         try:
             log.info("Getting listen key for user data stream...")
             state.user_data_ws_connected = False # Mark as disconnected
@@ -290,7 +481,7 @@ async def websocket_user_data_updater(state, client, symbol):
             state.balance_listen_key = response['listenKey']
             log.info(f"User data listen key obtained: {state.balance_listen_key[:20]}...")
 
-            keepalive_task = asyncio.create_task(keepalive_balance_listen_key(state, client))
+            keepalive_task = asyncio.create_task(keepalive_balance_listen_key(state, client, runtime))
 
             ws_url = f"wss://fstream.asterdex.com/ws/{state.balance_listen_key}"
             log.info(f"Connecting to user data WebSocket: {ws_url}")
@@ -304,13 +495,11 @@ async def websocket_user_data_updater(state, client, symbol):
                 log.info("User data WebSocket connected!")
                 state.user_data_ws_connected = True # Mark as connected
                 reconnect_delay = 5  # Reset reconnect delay on successful connection
-                last_message_time = asyncio.get_event_loop().time()
 
-                while not shutdown_requested:
+                while not runtime.shutdown_requested:
                     try:
                         # Wait for a message with a timeout to detect stale connections
                         message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
-                        last_message_time = asyncio.get_event_loop().time()
 
                         try:
                             data = json.loads(message)
@@ -328,35 +517,30 @@ async def websocket_user_data_updater(state, client, symbol):
                                         state.usdc_balance = float(balance.get('wb', '0'))
 
                                 state.account_balance = state.usdf_balance + state.usdt_balance + state.usdc_balance
-                                state.balance_last_updated = asyncio.get_event_loop().time()
+                                state.balance_last_updated = runtime.now()
                                 log.info(f"Balance updated: USDF={state.usdf_balance:.4f}, USDT={state.usdt_balance:.4f}, USDC={state.usdc_balance:.4f}, Total=${state.account_balance:.4f}")
 
                                 # Also check for position updates in the same event
                                 positions = account_data.get('P', [])
                                 for position in positions:
                                     if position.get('s') == symbol:
-                                        new_position_size = float(position.get('pa', '0'))
-                                        entry_price = float(position.get('ep', '0'))
-                                        notional_value = abs(new_position_size * entry_price)
+                                        reference_price = state.mid_price if state.mid_price and state.mid_price > 0 else float(position.get('ep', '0') or 0.0)
+                                        previous_position_size = state.position_size
+                                        new_position_size, notional_value, previous_mode, _ = sync_state_from_position_data(
+                                            state,
+                                            position,
+                                            reference_price=reference_price,
+                                        )
 
-                                        # Only update and log if there's a meaningful change in position size
-                                        if abs(state.position_size - new_position_size) > 1e-9:
-                                            log.info(f"Real-time position update for {symbol}: size changed from {state.position_size:.6f} to {new_position_size:.6f}")
-                                            state.position_size = new_position_size
+                                        if abs(previous_position_size - new_position_size) > 1e-9:
+                                            log.info(f"Real-time position update for {symbol}: size changed from {previous_position_size:.6f} to {new_position_size:.6f}")
 
                                         # Update mode based on notional value
-                                        opening_mode = 'SELL' if state.flip_mode else 'BUY'
-                                        closing_mode = 'BUY' if state.flip_mode else 'SELL'
-                                        if notional_value < POSITION_THRESHOLD_USD:
-                                            if state.mode != opening_mode:
-                                                log.info(f"Position notional from WS (${notional_value:.2f}) is below threshold. Switching to {opening_mode} mode.")
-                                                state.mode = opening_mode
-                                                # If we are switching to opening mode, it implies we have no significant position.
-                                                state.position_size = 0.0
-                                        else:
-                                            if state.mode != closing_mode:
-                                                log.info(f"Position notional from WS (${notional_value:.2f}) is above threshold. Switching to {closing_mode} mode.")
-                                                state.mode = closing_mode
+                                        if state.mode != previous_mode:
+                                            log.info(
+                                                f"Position notional from WS (${notional_value:.2f}) changed mode: "
+                                                f"{previous_mode} -> {state.mode}."
+                                            )
 
                             
                             elif event_type == 'ORDER_TRADE_UPDATE':
@@ -374,13 +558,8 @@ async def websocket_user_data_updater(state, client, symbol):
                             log.error(f"Error processing user data message: {e}", exc_info=True)
 
                     except asyncio.TimeoutError:
-                        time_since_last_msg = asyncio.get_event_loop().time() - last_message_time
-                        if time_since_last_msg > 60:
-                            log.warning(f"No user data messages received for {time_since_last_msg:.1f}s. Connection may be stale. Reconnecting...")
-                            break # Exit inner loop to force reconnection
-                        else:
-                            log.debug(f"User data WebSocket recv timed out ({time_since_last_msg:.1f}s since last message), but connection seems alive.")
-                            continue # Continue waiting for messages
+                        log.debug("No user data events received in 30.0s; keeping the WebSocket open.")
+                        continue
 
         except (websockets.exceptions.ConnectionClosed, websockets.exceptions.InvalidState) as e:
             log.warning(f"User data WebSocket connection issue: {e}")
@@ -395,7 +574,7 @@ async def websocket_user_data_updater(state, client, symbol):
                 except asyncio.CancelledError:
                     pass # Expected cancellation
 
-        if not shutdown_requested:
+        if not runtime.shutdown_requested:
             log.info(f"Reconnecting to user data WebSocket in {reconnect_delay:.1f}s...")
             await asyncio.sleep(reconnect_delay)
             # Exponential backoff
@@ -404,8 +583,7 @@ async def websocket_user_data_updater(state, client, symbol):
     log.info("User data updater shutting down")
 
 
-async def balance_reporter(state):
-    global BALANCE_REPORT_INTERVAL
+async def balance_reporter(state, runtime):
     """Periodically reports current account balance (only when not in release mode)."""
     log = logging.getLogger('BalanceReporter')
 
@@ -414,11 +592,11 @@ async def balance_reporter(state):
         log.info("Balance reporter disabled in release mode")
         return
 
-    while not shutdown_requested:
+    while not runtime.shutdown_requested:
         try:
             await asyncio.sleep(BALANCE_REPORT_INTERVAL)  # Report every 30 seconds
 
-            if not shutdown_requested and is_balance_data_valid(state):
+            if not runtime.shutdown_requested and is_balance_data_valid(state):
                 log.info(f"Account Balance: USDF={state.usdf_balance:.4f}, USDT={state.usdt_balance:.4f}, USDC={state.usdc_balance:.4f}, Total=${state.account_balance:.4f}")
 
         except Exception as e:
@@ -427,15 +605,15 @@ async def balance_reporter(state):
     log.info("Balance reporter shutting down")
 
 
-async def price_reporter(state, symbol):
+async def price_reporter(state, symbol, runtime):
     """Periodically reports current mid-price and bid-ask spread."""
     log = logging.getLogger('PriceReporter')
 
-    while not shutdown_requested:
+    while not runtime.shutdown_requested:
         try:
             await asyncio.sleep(PRICE_REPORT_INTERVAL)
 
-            if not shutdown_requested and is_price_data_valid(state):
+            if not runtime.shutdown_requested and is_price_data_valid(state, runtime):
                 bid_ask_spread = state.ask_price - state.bid_price
                 spread_percentage = (bid_ask_spread / state.mid_price) * 100 if state.mid_price > 0 else 0
 
@@ -474,6 +652,7 @@ async def initialize_supertrend_signal(state, symbol):
                 new_flip_mode = (initial_signal == -1)
                 if state.flip_mode != new_flip_mode:
                     state.flip_mode = new_flip_mode
+                    sync_mode_with_position(state)
                     log.info(f"Initialized Supertrend signal to: {'UPTREND (+1)' if initial_signal == 1 else 'DOWNTREND (-1)'}")
                     log.info(f"Initial strategy bias set by signal: FLIP_MODE -> {state.flip_mode}")
                 else:
@@ -486,7 +665,7 @@ async def initialize_supertrend_signal(state, symbol):
         log.error(f"Error initializing Supertrend signal: {e}. Using default FLIP_MODE={state.flip_mode}.")
 
 
-async def supertrend_signal_updater(state, symbol):
+async def supertrend_signal_updater(state, symbol, runtime):
     """Periodically reads the Supertrend signal file and updates the strategy state."""
     log = logging.getLogger('SupertrendUpdater')
     
@@ -494,7 +673,7 @@ async def supertrend_signal_updater(state, symbol):
     filename_symbol = symbol[:-4] if symbol.endswith('USDT') else symbol
     params_file = os.path.join(PARAMS_DIR, SUPERTREND_PARAMS_TEMPLATE.format(filename_symbol))
 
-    while not shutdown_requested:
+    while not runtime.shutdown_requested:
         try:
             if os.path.exists(params_file):
                 with open(params_file, 'r', encoding='utf-8') as f:
@@ -550,6 +729,83 @@ def should_reuse_order(state, new_price, new_side, new_quantity, threshold=DEFAU
     return price_change_pct < threshold
 
 
+def classify_order_update(order_data, fill_notional_threshold=POSITION_THRESHOLD_USD):
+    """Classify an order update into terminal/non-terminal and fill/non-fill outcomes."""
+    status = order_data.get('X')
+    filled_qty = float(order_data.get('z', 0.0))
+
+    if status == 'PARTIALLY_FILLED':
+        return {
+            "is_terminal": False,
+            "treat_as_fill": False,
+            "status": status,
+            "filled_qty": filled_qty,
+        }
+
+    if status == 'FILLED':
+        return {
+            "is_terminal": True,
+            "treat_as_fill": filled_qty > 0,
+            "status": status,
+            "filled_qty": filled_qty,
+        }
+
+    if status in {'CANCELED', 'REJECTED', 'EXPIRED'}:
+        return {
+            "is_terminal": True,
+            "treat_as_fill": filled_qty > 0,
+            "status": status,
+            "filled_qty": filled_qty,
+        }
+
+    return {
+        "is_terminal": False,
+        "treat_as_fill": False,
+        "status": status,
+        "filled_qty": filled_qty,
+    }
+
+
+async def wait_for_terminal_order_update(order_updates, order_id, timeout, log, context):
+    """Wait for a terminal update for the given order id."""
+    start_time = asyncio.get_event_loop().time()
+
+    while True:
+        remaining_timeout = timeout - (asyncio.get_event_loop().time() - start_time)
+        if remaining_timeout <= 0:
+            raise asyncio.TimeoutError
+
+        update = await asyncio.wait_for(order_updates.get(), timeout=remaining_timeout)
+        if update.get('e') != 'ORDER_TRADE_UPDATE':
+            continue
+
+        order_data = update.get('o', {})
+        if order_data.get('i') != order_id:
+            continue
+
+        terminal_update = classify_order_update(order_data)
+        if not terminal_update["is_terminal"]:
+            continue
+
+        status = terminal_update["status"]
+        filled_qty = terminal_update["filled_qty"]
+
+        log.info(f"{context} order {order_id} reached final state {status}. Filled: {filled_qty}")
+
+        return terminal_update
+
+
+def apply_fill_to_state(state, side, filled_qty):
+    """Refresh strategy mode after a fill using the latest position snapshot."""
+    if filled_qty is not None and filled_qty <= 0:
+        return state.mode, state.mode
+
+    previous_mode = state.mode
+
+    sync_mode_with_position(state)
+    return previous_mode, state.mode
+
+
 def _safe_float(value):
     try:
         return float(value)
@@ -593,18 +849,22 @@ def _load_avellaneda_params(symbol):
         # Extract all necessary parameters
         optimal_params = payload.get("optimal_parameters", {})
         market_data = payload.get("market_data", {})
+        legacy_k = _safe_float(market_data.get("k"))
         
         params = {
             "gamma": _safe_float(optimal_params.get("gamma")),
             "time_horizon_days": _safe_float(optimal_params.get("time_horizon_days")),
             "sigma": _safe_float(market_data.get("sigma")),
-            "k": _safe_float(market_data.get("k")),
+            "A_buy": _safe_float(market_data.get("A_buy")),
+            "A_sell": _safe_float(market_data.get("A_sell")),
+            "k_buy": _safe_float(market_data.get("k_buy")) or legacy_k,
+            "k_sell": _safe_float(market_data.get("k_sell")) or legacy_k,
             "source_path": file_path
         }
         
-        # Basic validation to ensure all required params are present
-        if not all(params[key] is not None for key in ["gamma", "time_horizon_days", "sigma", "k"]):
-            log.warning(f"File {file_path} is missing one or more required Avellaneda parameters. Skipping.")
+        required_positive = ["gamma", "time_horizon_days", "sigma", "k_buy", "k_sell"]
+        if not all(params[key] is not None and params[key] > 0 for key in required_positive):
+            log.warning(f"File {file_path} is missing one or more positive Avellaneda parameters. Skipping.")
             continue
 
         return params
@@ -644,39 +904,26 @@ def get_avellaneda_params(symbol):
         return default_params
 
 
-async def market_making_loop(state, client, args):
+async def market_making_loop(state, client, symbol, runtime):
     """The main market making logic loop."""
     log = logging.getLogger('MarketMakerLoop')
-    log.info(f"Fetching trading rules for {args.symbol}...")
-    symbol_filters = await client.get_symbol_filters(args.symbol)
+    log.info(f"Fetching trading rules for {symbol}...")
+    symbol_filters = await client.get_symbol_filters(symbol)
     log.info(f"Filters loaded: {symbol_filters}")
 
-    opening_mode = 'SELL' if state.flip_mode else 'BUY'
-    closing_mode = 'BUY' if state.flip_mode else 'SELL'
-
-    while not shutdown_requested:
+    while not runtime.shutdown_requested:
         try:
-            # [ADDED] Primary check for WebSocket health before proceeding.
+            opening_mode, _ = get_strategy_modes(state.flip_mode)
+
+            # We do not trade without both WebSockets because price freshness and order-state
+            # monitoring are both safety-critical.
             if not state.price_ws_connected or not state.user_data_ws_connected:
                 ws_status = f"Price_WS_Connected={state.price_ws_connected}, User_Data_WS_Connected={state.user_data_ws_connected}"
                 log.warning(f"A WebSocket is disconnected ({ws_status}). Pausing trading logic.")
 
-                # [ADDED] Safety measure: Cancel active order if we lose connectivity
                 if state.active_order_id:
-                    log.warning(f"Attempting to cancel active order {state.active_order_id} due to WebSocket disconnection.")
-                    try:
-                        if CANCEL_SPECIFIC_ORDER:
-                            await client.cancel_order(args.symbol, state.active_order_id)
-                        else:
-                            await client.cancel_all_orders(args.symbol)
-                        state.active_order_id = None
-                        state.last_order_price = None
-                        state.last_order_side = None
-                        state.last_order_quantity = None
-                        log.info(f"Successfully cancelled order {state.active_order_id} as a safety measure.")
-                    except Exception as cancel_error:
-                        log.error(f"Could not cancel order {state.active_order_id} during WS outage: {cancel_error}")
-                
+                    await cancel_active_order(state, client, symbol, log, "WebSocket disconnection")
+                 
                 await asyncio.sleep(1) # Wait before checking again
                 continue
 
@@ -693,48 +940,14 @@ async def market_making_loop(state, client, args):
                         log.info(f"Supertrend signal changed to {'DOWNTREND' if new_flip_mode else 'UPTREND'}.")
                         log.info(f"Position is flat. Adjusting strategy bias: FLIP_MODE -> {new_flip_mode}")
                         state.flip_mode = new_flip_mode
+                        opening_mode, _ = get_strategy_modes(state.flip_mode)
+                        sync_mode_with_position(state, position_notional=current_notional)
                 else:
                     log.debug(f"Supertrend signal is {'DOWNTREND' if state.supertrend_signal == -1 else 'UPTREND'}, but position is open (${current_notional:.2f}). Holding current strategy bias.")
-
-            # --- State Synchronization ---
-            # Trust the WebSocket for real-time position data when connected.
-            # Only use the REST API as a fallback or for the initial state.
-            if not state.user_data_ws_connected:
-                try:
-                    log.warning("User data WebSocket is disconnected. Synchronizing position state with the exchange via REST API.")
-                    positions = await client.get_position_risk(args.symbol)
-                    if positions:
-                        position = positions[0]
-                        current_position_size = float(position.get('positionAmt', 0.0))
-                        notional_value = abs(float(position.get('notional', 0.0)))
-
-                        # Update state based on fetched data
-                        state.position_size = current_position_size
-
-                        if notional_value < POSITION_THRESHOLD_USD:
-                            if state.mode != opening_mode:
-                                log.info(f"Position notional (${notional_value:.2f}) is below threshold. Resetting to {opening_mode} mode.")
-                                state.mode = opening_mode
-                            state.position_size = 0.0 # Reset position size to avoid tiny dust amounts causing issues
-                        else:
-                            if state.mode != closing_mode:
-                                log.info(f"Found significant position (size: {current_position_size}, notional: ${notional_value:.2f}). Switching to {closing_mode} mode.")
-                                state.mode = closing_mode
-                    else:
-                        # If no position data is returned, assume no position
-                        state.position_size = 0.0
-                        state.mode = opening_mode
-                    log.debug(f"State synchronized via REST: position_size={state.position_size}, mode={state.mode}")
-                except Exception as e:
-                    log.error(f"Failed to synchronize position state via REST, relying on last known state. Error: {e}")
-                    # If we fail to get the position, we should wait and retry rather than trading on stale data.
-                    await asyncio.sleep(1)
-                    continue
-            else:
-                log.debug(f"Relying on WebSocket for position state. Current size: {state.position_size:.6f}, Mode: {state.mode}")
+            log.debug(f"Relying on WebSocket for position state. Current size: {state.position_size:.6f}, Mode: {state.mode}")
 
             # --- Secondary checks for fresh data ---
-            if not is_price_data_valid(state):
+            if not is_price_data_valid(state, runtime):
                 log.info("Waiting for valid price data from WebSocket...")
                 await asyncio.sleep(2)
                 continue
@@ -744,58 +957,59 @@ async def market_making_loop(state, client, args):
                 await asyncio.sleep(2)
                 continue
 
+            current_position_notional = get_position_notional_usd(state.position_size, state.mid_price)
+            close_side = get_position_close_side(state.position_size) if has_significant_position(state, current_position_notional) else None
+
             # --- Double-check position before entering opening mode ---
-            if state.mode == opening_mode:
+            if close_side is None:
                 try:
                     log.debug(f"Double-checking position before placing {opening_mode} order...")
-                    positions = await client.get_position_risk(args.symbol)
+                    positions = await client.get_position_risk(symbol)
                     if positions:
-                        position = positions[0]
-                        current_position_size = float(position.get('positionAmt', 0.0))
-                        notional_value = abs(float(position.get('notional', 0.0)))
-                        
-                        position_is_long = current_position_size > 0
-                        position_is_short = current_position_size < 0
+                        current_position_size, notional_value, previous_mode, _ = sync_state_from_position_data(
+                            state,
+                            positions[0],
+                            reference_price=state.mid_price,
+                        )
+                        current_position_notional = notional_value
+                        close_side = get_position_close_side(state.position_size) if has_significant_position(state, current_position_notional) else None
 
-                        # If in normal mode (opening BUY) and we find a long position, switch to close.
-                        if not state.flip_mode and position_is_long and notional_value > POSITION_THRESHOLD_USD:
-                            log.info(f"Found existing LONG position of size {current_position_size} with notional ${notional_value:.2f} - switching to {closing_mode} mode")
-                            state.position_size = current_position_size
-                            state.mode = closing_mode
-                        # If in flip mode (opening SELL) and we find a short position, switch to close.
-                        elif state.flip_mode and position_is_short and notional_value > POSITION_THRESHOLD_USD:
-                            log.info(f"Found existing SHORT position of size {current_position_size} with notional ${notional_value:.2f} - switching to {closing_mode} mode")
-                            state.position_size = current_position_size
-                            state.mode = closing_mode
+                        if close_side and state.mode != previous_mode:
+                            log.info(
+                                f"Found existing {'LONG' if current_position_size > 0 else 'SHORT'} position of size "
+                                f"{current_position_size} with notional ${notional_value:.2f} - switching to {state.mode} mode"
+                            )
                 except Exception as e:
                     log.warning(f"Failed to double-check position, proceeding with current mode: {e}")
 
             # --- Determine Strategy and Parameters ---
-            symbol = getattr(global_args, "symbol", DEFAULT_SYMBOL)
             params = get_avellaneda_params(symbol)
 
             # Use full Avellaneda-Stoikov logic if params are from a file
             if params["source"] != "default":
                 # Unpack parameters
-                gamma, sigma, k, T = params["gamma"], params["sigma"], params["k"], params["time_horizon_days"]
+                gamma = params["gamma"]
+                sigma = params["sigma"]
+                k_buy = params["k_buy"]
+                k_sell = params["k_sell"]
+                T = params["time_horizon_days"]
                 q, s = state.position_size, state.mid_price
 
-                # Calculate reservation price and optimal quotes
-                # Use absolute volatility (sigma * s)^2
                 risk_term = gamma * ((sigma * s)**2) * T
-                r = s - q * risk_term
-                spread_base = risk_term + (2 / gamma) * np.log(1 + (gamma / k))
-                half_spread = spread_base / 2.0
-                gap = abs(r - s)
-                
-                delta_a, delta_b = (half_spread + gap, half_spread - gap) if r >= s else (half_spread - gap, half_spread + gap)
-                ask_price, bid_price = r + delta_a, r - delta_b
-                log.info(f"Avellaneda quotes: r={r:.4f}, spread={spread_base:.4f}, bid={bid_price:.4f}, ask={ask_price:.4f}")
+                reservation_price = s - q * risk_term
+                ask_offset = (1 / gamma) * np.log(1 + (gamma / k_buy)) + (risk_term / 2.0)
+                bid_offset = (1 / gamma) * np.log(1 + (gamma / k_sell)) + (risk_term / 2.0)
+                ask_price = reservation_price + ask_offset
+                bid_price = reservation_price - bid_offset
+                log.info(
+                    f"Avellaneda quotes: r={reservation_price:.4f}, bid={bid_price:.4f}, "
+                    f"ask={ask_price:.4f}, k_buy={k_buy:.6f}, k_sell={k_sell:.6f}"
+                )
 
-                if state.mode == closing_mode:
-                    side, reduce_only = closing_mode, True
+                if close_side:
+                    side, reduce_only = close_side, True
                     quantity_to_trade = abs(state.position_size)
-                    limit_price = ask_price if closing_mode == 'SELL' else bid_price
+                    limit_price = ask_price if side == 'SELL' else bid_price
                 else: # Opening mode
                     side, reduce_only = opening_mode, False
                     quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
@@ -808,10 +1022,10 @@ async def market_making_loop(state, client, args):
                 buy_spread, sell_spread = params["buy_spread"], params["sell_spread"]
                 log.info(f"Using default spreads: buy={buy_spread:.4%}, sell={sell_spread:.4%}")
 
-                if state.mode == closing_mode:
-                    side, reduce_only = closing_mode, True
+                if close_side:
+                    side, reduce_only = close_side, True
                     quantity_to_trade = abs(state.position_size)
-                    limit_price = state.mid_price * (1 + sell_spread) if closing_mode == 'SELL' else state.mid_price * (1 - buy_spread)
+                    limit_price = state.mid_price * (1 + sell_spread) if side == 'SELL' else state.mid_price * (1 - buy_spread)
                 else:  # Opening mode
                     side, reduce_only = opening_mode, False
                     quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
@@ -824,7 +1038,7 @@ async def market_making_loop(state, client, args):
 
             # --- Adjust order to conform to exchange filters ---
             log.debug(f"Symbol filters: {symbol_filters}")
-            rounded_price = round(limit_price / symbol_filters['tick_size']) * symbol_filters['tick_size']
+            rounded_price = round_price_to_tick(limit_price, symbol_filters['tick_size'], side)
             formatted_price = f"{rounded_price:.{symbol_filters['price_precision']}f}"
             log.debug(f"Price adjustment: {limit_price:.8f} -> {rounded_price:.8f} -> {formatted_price}")
 
@@ -857,65 +1071,36 @@ async def market_making_loop(state, client, args):
                 filled_qty = 0.0
                 try:
                     log.debug(f"Continuing to monitor existing order {state.active_order_id} via WebSocket with timeout {ORDER_REFRESH_INTERVAL}s")
-                    start_time = asyncio.get_event_loop().time()
-                    while True:
-                        remaining_timeout = ORDER_REFRESH_INTERVAL - (asyncio.get_event_loop().time() - start_time)
-                        if remaining_timeout <= 0:
-                            raise asyncio.TimeoutError
-                        
-                        update = await asyncio.wait_for(state.order_updates.get(), timeout=remaining_timeout)
-                        if update.get('e') == 'ORDER_TRADE_UPDATE':
-                            order_data = update.get('o', {})
-                            if order_data.get('i') == state.active_order_id:
-                                status = order_data.get('X')
-                                filled_qty = float(order_data.get('z', 0.0))
+                    order_id = state.active_order_id
+                    position_update_seq_before_fill = state.position_update_seq
+                    terminal_update = await wait_for_terminal_order_update(
+                        state.order_updates,
+                        order_id,
+                        ORDER_REFRESH_INTERVAL,
+                        log,
+                        "Monitored",
+                    )
+                    filled_qty = terminal_update["filled_qty"]
 
-                                if status == 'PARTIALLY_FILLED':
-                                    avg_price = float(order_data.get('ap', 0.0))
-                                    if avg_price > 0:
-                                        filled_notional = filled_qty * avg_price
-                                        if filled_notional > POSITION_THRESHOLD_USD:
-                                            log.info(f"Monitored order {state.active_order_id} is PARTIALLY_FILLED with notional ${filled_notional:.2f} > ${POSITION_THRESHOLD_USD}. Treating as FILLED.")
-                                            break # Treat as filled
-                                
-                                if status in ['FILLED', 'CANCELED', 'REJECTED', 'EXPIRED']:
-                                    log.info(f"Monitored order {state.active_order_id} reached final state {status}. Filled: {filled_qty}")
-                                    break
-                    
-                    log.info(f"Reused order {state.active_order_id} filled! Quantity: {filled_qty}")
+                    if terminal_update["treat_as_fill"]:
+                        log.info(f"Reused order {order_id} filled! Quantity: {filled_qty}")
+                        synced_via_ws, previous_mode, new_mode = await reconcile_fill_with_position(
+                            state,
+                            client,
+                            symbol,
+                            log,
+                            position_update_seq_before_fill,
+                            f"Reused order {order_id}",
+                        )
+                        sync_source = "WebSocket" if synced_via_ws else "REST fallback"
+                        log.info(f"{side} fill reconciled via {sync_source}: tracked position size {state.position_size:.6f}")
+                        if new_mode != previous_mode:
+                            log.info(f"Mode change: {previous_mode} -> {new_mode}")
+                    else:
+                        log.info(f"Reused order {order_id} ended as {terminal_update['status']} without an executed fill.")
 
-                    # Update state after a fill (same logic as new order)
-                    previous_mode = state.mode
-                    previous_position = state.position_size
-
-                    if state.mode == opening_mode:  # An opening order was filled
-                        if opening_mode == 'BUY':
-                            state.position_size += filled_qty
-                        else:  # opening_mode == 'SELL'
-                            state.position_size -= filled_qty
-                        log.info(f"{opening_mode} fill processed: new position size {state.position_size:.6f}")
-                        state.mode = closing_mode  # Flip to closing mode
-                        log.info(f"Mode change: {previous_mode} -> {state.mode}")
-                    else:  # A closing order was filled
-                        if closing_mode == 'SELL':
-                            state.position_size -= filled_qty
-                        else:  # closing_mode == 'BUY'
-                            state.position_size += filled_qty
-                        log.info(f"{closing_mode} fill processed: new position size {state.position_size:.6f}")
-
-                        # Check if position is mostly closed
-                        position_threshold_coins = POSITION_THRESHOLD_USD / state.mid_price
-                        if abs(state.position_size) < position_threshold_coins:
-                            state.mode = opening_mode  # Flip back to opening mode
-                            log.info(f"Position below threshold ({position_threshold_coins:.6f}), mode change: {previous_mode} -> {state.mode}")
-                        else:
-                            log.info(f"Position still above threshold, keeping {closing_mode} mode.")
-
-                    # Clear order tracking after fill
-                    state.last_order_price = None
-                    state.last_order_side = None
-                    state.last_order_quantity = None
-                    log.debug("Adding 0.1s delay after order fill to avoid API rate limits")
+                    clear_order_tracking(state)
+                    log.debug("Adding 0.01s delay after reused-order terminal update")
                     await asyncio.sleep(0.01)
 
                 except asyncio.TimeoutError:
@@ -925,9 +1110,8 @@ async def market_making_loop(state, client, args):
                 continue  # Skip to next iteration
 
             # --- Rate Limiting Protection ---
-            global last_order_time
-            current_time = asyncio.get_event_loop().time()
-            time_since_last_order = current_time - last_order_time
+            current_time = runtime.now()
+            time_since_last_order = current_time - runtime.last_order_time
 
             if time_since_last_order < MIN_ORDER_INTERVAL:
                 wait_time = MIN_ORDER_INTERVAL - time_since_last_order
@@ -936,24 +1120,19 @@ async def market_making_loop(state, client, args):
 
             # --- Cancel existing order if we're placing a new one ---
             if state.active_order_id:
-                try:
-                    log.info(f"Cancelling existing order {state.active_order_id} to place new order")
-                    if CANCEL_SPECIFIC_ORDER:
-                        await client.cancel_order(args.symbol, state.active_order_id)
-                    else:
-                        await client.cancel_all_orders(args.symbol)
-                    state.active_order_id = None
-                except Exception as cancel_error:
-                    log.warning(f"Error cancelling existing order: {cancel_error}")
+                log.info(f"Cancelling existing order {state.active_order_id} to place new order")
+                if not await cancel_active_order(state, client, symbol, log, "Order replacement"):
+                    await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+                    continue
 
             # --- Place and Monitor Order ---
             percentage_diff = (float(formatted_price) - state.mid_price) / state.mid_price * 100
-            log.info(f"Placing {side} order: {formatted_quantity} {args.symbol} @ {formatted_price} ({percentage_diff:+.4f}% from mid-price)")
-            log.info(f"Order details: symbol={args.symbol}, price={formatted_price}, quantity={formatted_quantity}, side={side}, reduceOnly={reduce_only}")
+            log.info(f"Placing {side} order: {formatted_quantity} {symbol} @ {formatted_price} ({percentage_diff:+.4f}% from mid-price)")
+            log.info(f"Order details: symbol={symbol}, price={formatted_price}, quantity={formatted_quantity}, side={side}, reduceOnly={reduce_only}")
 
             try:
-                active_order = await client.place_order(args.symbol, formatted_price, formatted_quantity, side, reduce_only)
-                last_order_time = asyncio.get_event_loop().time()
+                active_order = await client.place_order(symbol, formatted_price, formatted_quantity, side, reduce_only)
+                runtime.last_order_time = runtime.now()
                 state.active_order_id = active_order.get('orderId')
 
                 # Track order details for reuse logic
@@ -965,92 +1144,51 @@ async def market_making_loop(state, client, args):
                 log.debug(f"Full order response: {active_order}")
             except Exception as order_error:
                 log.error(f"Failed to place order: {order_error}")
-                log.error(f"Order parameters: symbol={args.symbol}, price={formatted_price}, quantity={formatted_quantity}, side={side}, reduceOnly={reduce_only}")
+                log.error(f"Order parameters: symbol={symbol}, price={formatted_price}, quantity={formatted_quantity}, side={side}, reduceOnly={reduce_only}")
                 raise
 
             filled_qty = 0.0
             try:
                 log.debug(f"Waiting for WebSocket update for order {state.active_order_id} with timeout {ORDER_REFRESH_INTERVAL}s")
-                start_time = asyncio.get_event_loop().time()
-                while True:
-                    remaining_timeout = ORDER_REFRESH_INTERVAL - (asyncio.get_event_loop().time() - start_time)
-                    if remaining_timeout <= 0:
-                        raise asyncio.TimeoutError
+                order_id = state.active_order_id
+                position_update_seq_before_fill = state.position_update_seq
+                terminal_update = await wait_for_terminal_order_update(
+                    state.order_updates,
+                    order_id,
+                    ORDER_REFRESH_INTERVAL,
+                    log,
+                    "Placed",
+                )
+                filled_qty = terminal_update["filled_qty"]
 
-                    update = await asyncio.wait_for(state.order_updates.get(), timeout=remaining_timeout)
-                    if update.get('e') == 'ORDER_TRADE_UPDATE':
-                        order_data = update.get('o', {})
-                        if order_data.get('i') == state.active_order_id:
-                            status = order_data.get('X')
-                            filled_qty = float(order_data.get('z', 0.0))
+                if terminal_update["treat_as_fill"]:
+                    log.info(f"Order {order_id} filled! Quantity: {filled_qty}")
+                    synced_via_ws, previous_mode, new_mode = await reconcile_fill_with_position(
+                        state,
+                        client,
+                        symbol,
+                        log,
+                        position_update_seq_before_fill,
+                        f"Order {order_id}",
+                    )
+                    sync_source = "WebSocket" if synced_via_ws else "REST fallback"
+                    log.info(f"{side} fill reconciled via {sync_source}: tracked position size {state.position_size:.6f}")
+                    if new_mode != previous_mode:
+                        log.info(f"Mode change: {previous_mode} -> {new_mode}")
+                else:
+                    log.info(f"Order {order_id} ended as {terminal_update['status']} without an executed fill.")
 
-                            if status == 'PARTIALLY_FILLED':
-                                avg_price = float(order_data.get('ap', 0.0))
-                                if avg_price > 0:
-                                    filled_notional = filled_qty * avg_price
-                                    if filled_notional > POSITION_THRESHOLD_USD:
-                                        log.info(f"Order {state.active_order_id} is PARTIALLY_FILLED with notional ${filled_notional:.2f} > ${POSITION_THRESHOLD_USD}. Treating as FILLED.")
-                                        break # Treat as filled
+                clear_order_tracking(state)
 
-                            if status in ['FILLED', 'CANCELED', 'REJECTED', 'EXPIRED']:
-                                log.info(f"Order {state.active_order_id} reached final state {status}. Filled: {filled_qty}")
-                                break
-
-                log.info(f"Order {state.active_order_id} filled! Quantity: {filled_qty}")
-
-                # Update state after a fill
-                previous_mode = state.mode
-                previous_position = state.position_size
-
-                if state.mode == opening_mode:  # An opening order was filled
-                    if opening_mode == 'BUY':
-                        state.position_size += filled_qty
-                    else:  # opening_mode == 'SELL'
-                        state.position_size -= filled_qty
-                    log.info(f"{opening_mode} fill processed: new position size {state.position_size:.6f}")
-                    state.mode = closing_mode  # Flip to closing mode
-                    log.info(f"Mode change: {previous_mode} -> {state.mode}")
-                else:  # A closing order was filled
-                    if closing_mode == 'SELL':
-                        state.position_size -= filled_qty
-                    else:  # closing_mode == 'BUY'
-                        state.position_size += filled_qty
-                    log.info(f"{closing_mode} fill processed: new position size {state.position_size:.6f}")
-
-                    # Check if position is mostly closed
-                    position_threshold_coins = POSITION_THRESHOLD_USD / state.mid_price
-                    if abs(state.position_size) < position_threshold_coins:
-                        state.mode = opening_mode  # Flip back to opening mode
-                        log.info(f"Position below threshold ({position_threshold_coins:.6f}), mode change: {previous_mode} -> {state.mode}")
-                    else:
-                        log.info(f"Position still above threshold, keeping {closing_mode} mode.")
-
-                # Clear order tracking after fill
-                state.last_order_price = None
-                state.last_order_side = None
-                state.last_order_quantity = None
-
-                # Add a small delay to avoid hammering the API after fills
-                log.debug("Adding 0.01s delay after order fill to avoid API rate limits")
+                # Add a small delay to avoid hammering the API after terminal updates
+                log.debug("Adding 0.01s delay after order terminal update to avoid API rate limits")
                 await asyncio.sleep(0.01)
 
             except asyncio.TimeoutError:
                 log.info(f"Order {state.active_order_id} not filled within {ORDER_REFRESH_INTERVAL}s. Cancelling and refreshing.")
-                try:
-                    if CANCEL_SPECIFIC_ORDER and state.active_order_id:
-                        cancel_result = await client.cancel_order(args.symbol, state.active_order_id)
-                        log.debug(f"Cancel order result: {cancel_result}")
-                    else:
-                        cancel_result = await client.cancel_all_orders(args.symbol)
-                        log.debug(f"Cancel all orders result: {cancel_result}")
-                except Exception as cancel_error:
-                    log.warning(f"Error cancelling orders: {cancel_error}")
-
-                # Clear order tracking data
-                state.active_order_id = None
-                state.last_order_price = None
-                state.last_order_side = None
-                state.last_order_quantity = None
+                if not await cancel_active_order(state, client, symbol, log, "Timed-out order refresh"):
+                    await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+                    continue
 
                 log.debug("Adding 0.1s delay after order timeout to avoid API rate limits")
                 await asyncio.sleep(0.01)
@@ -1065,26 +1203,14 @@ async def market_making_loop(state, client, args):
 
             # Try to cancel any outstanding orders
             if state.active_order_id:
-                try:
-                    log.info(f"Attempting to cancel active order {state.active_order_id} due to error")
-                    if CANCEL_SPECIFIC_ORDER:
-                        await client.cancel_order(args.symbol, state.active_order_id)
-                    else:
-                        await client.cancel_all_orders(args.symbol)
-                    state.active_order_id = None
-                    # Clear tracking data
-                    state.last_order_price = None
-                    state.last_order_side = None
-                    state.last_order_quantity = None
-                except Exception as cleanup_error:
-                    log.error(f"Failed to cancel orders during error cleanup: {cleanup_error}")
+                await cancel_active_order(state, client, symbol, log, "Error handling")
 
             log.info(f"Waiting for {RETRY_ON_ERROR_INTERVAL} seconds before retrying...")
             await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
 
 
 
-async def fetch_initial_balance(state, client):
+async def fetch_initial_balance(state, client, runtime):
     """Fetch initial account balance via REST API."""
     log = logging.getLogger('InitialBalance')
 
@@ -1109,7 +1235,7 @@ async def fetch_initial_balance(state, client):
 
         # Calculate total balance
         state.account_balance = state.usdf_balance + state.usdt_balance + state.usdc_balance
-        state.balance_last_updated = asyncio.get_event_loop().time()
+        state.balance_last_updated = runtime.now()
 
         log.info(f"Initial balance loaded: USDF={state.usdf_balance:.4f}, USDT={state.usdt_balance:.4f}, USDC={state.usdc_balance:.4f}, Total=${state.account_balance:.4f}")
         return True
@@ -1129,36 +1255,38 @@ async def cleanup_orders(symbol, api_user, api_signer, api_private_key):
     except Exception as e:
         logging.error(f"Error during final order cancellation: {e}")
 
-# Global variables for signal handling
-shutdown_requested = False
-global_args = None
-global_api_creds = None
+def build_signal_handler(runtime):
+    """Build a signal handler bound to the active runtime context."""
+    def signal_handler(signum, frame):
+        logging.info(f"Signal {signum} received, initiating shutdown...")
+        runtime.request_shutdown()
 
-def signal_handler(signum, frame):
-    """Handle SIGTERM and SIGINT signals"""
-    global shutdown_requested
-    logging.info(f"Signal {signum} received, initiating shutdown...")
-    shutdown_requested = True
+    return signal_handler
 
 async def main():
-    global global_args, global_api_creds
-
     parser = argparse.ArgumentParser(description="A market making bot for Aster Finance.")
-    parser.add_argument("--symbol", type=str, default=DEFAULT_SYMBOL, help="The symbol to trade.")
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        default=None,
+        help="The symbol to trade. Defaults to SYMBOL in .env or BTCUSDT.",
+    )
     args = parser.parse_args()
-    global_args = args
 
     setup_logging("INFO")
+    load_dotenv()
+    args.symbol = resolve_symbol(args.symbol)
+    runtime = RuntimeContext(args.symbol)
+
     logging.info(f"Starting market maker with arguments: {args}")
     logging.info(f"FLIP_MODE is set to: {FLIP_MODE}")
 
-    load_dotenv()
     API_USER = os.getenv("API_USER")
     API_SIGNER = os.getenv("API_SIGNER")
     API_PRIVATE_KEY = os.getenv("API_PRIVATE_KEY")
-    global_api_creds = (API_USER, API_SIGNER, API_PRIVATE_KEY)
 
     # Set up signal handlers (SIGTERM not available on Windows, use SIGINT as fallback)
+    signal_handler = build_signal_handler(runtime)
     signal.signal(signal.SIGINT, signal_handler)
     if hasattr(signal, 'SIGTERM'):
         signal.signal(signal.SIGTERM, signal_handler)
@@ -1180,7 +1308,7 @@ async def main():
             # [IMPROVED] Fetch initial account balance with a timeout
             logging.info("Fetching initial account balance...")
             try:
-                balance_success = await asyncio.wait_for(fetch_initial_balance(state, client), timeout=20.0)
+                balance_success = await asyncio.wait_for(fetch_initial_balance(state, client, runtime), timeout=20.0)
                 if not balance_success:
                     logging.error("Failed to fetch initial balance. Cannot proceed.")
                     return
@@ -1199,26 +1327,16 @@ async def main():
 
                 position_found = False
                 if positions:
-                    position = positions[0]
-                    position_size = float(position.get('positionAmt', 0.0))
-                    notional_value = abs(float(position.get('notional', 0.0)))
+                    position_size, notional_value, _, _ = sync_state_from_position_data(
+                        state,
+                        positions[0],
+                        reference_price=state.mid_price,
+                    )
 
-                    position_is_long = position_size > 0
-                    position_is_short = position_size < 0
-
-                    # If in normal mode, look for a LONG position to close.
-                    if not state.flip_mode and position_is_long and notional_value > 15.0:
-                        logging.info(f"Found existing LONG position of size {position_size} with notional value ${notional_value:.2f}.")
-                        state.position_size = position_size
-                        state.mode = 'SELL'  # Set to closing mode
-                        logging.info(f"Starting in SELL mode to close position.")
-                        position_found = True
-                    # If in flip mode, look for a SHORT position to close.
-                    elif state.flip_mode and position_is_short and notional_value > 15.0:
-                        logging.info(f"Found existing SHORT position of size {position_size} with notional value ${notional_value:.2f}.")
-                        state.position_size = position_size
-                        state.mode = 'BUY'  # Set to closing mode
-                        logging.info(f"Starting in BUY mode to close position.")
+                    if has_significant_position(state, notional_value):
+                        position_side = "LONG" if position_size > 0 else "SHORT"
+                        logging.info(f"Found existing {position_side} position of size {position_size} with notional value ${notional_value:.2f}.")
+                        logging.info(f"Starting in {state.mode} mode to close position.")
                         position_found = True
 
                 if not position_found:
@@ -1230,26 +1348,27 @@ async def main():
                     except Exception as e:
                         logging.error(f"Failed to set leverage: {e}", exc_info=True)
                     
-                    opening_mode = 'SELL' if state.flip_mode else 'BUY'
+                    opening_mode, _ = get_strategy_modes(state.flip_mode)
+                    state.mode = opening_mode
                     logging.info(f"Starting in default {opening_mode} mode.")
 
             except Exception as e:
                 logging.warning(f"Could not check for existing position or set leverage, starting in default {state.mode} mode: {e}", exc_info=True)
 
             # Start all async tasks
-            mm_task = asyncio.create_task(market_making_loop(state, client, args))
+            mm_task = asyncio.create_task(market_making_loop(state, client, args.symbol, runtime))
             tasks = [
-                asyncio.create_task(websocket_price_updater(state, args.symbol)),
-                asyncio.create_task(websocket_user_data_updater(state, client, args.symbol)),
-                asyncio.create_task(balance_reporter(state)),
+                asyncio.create_task(websocket_price_updater(state, args.symbol, runtime)),
+                asyncio.create_task(websocket_user_data_updater(state, client, args.symbol, runtime)),
+                asyncio.create_task(balance_reporter(state, runtime)),
                 mm_task,
-                asyncio.create_task(price_reporter(state, args.symbol)),
+                asyncio.create_task(price_reporter(state, args.symbol, runtime)),
             ]
             if USE_SUPERTREND_SIGNAL:
-                tasks.append(asyncio.create_task(supertrend_signal_updater(state, args.symbol)))
+                tasks.append(asyncio.create_task(supertrend_signal_updater(state, args.symbol, runtime)))
 
             # Wait for either the market making task to complete or shutdown signal
-            while not shutdown_requested and not mm_task.done():
+            while not runtime.shutdown_requested and not mm_task.done():
                 await asyncio.sleep(0.01)
 
     except asyncio.CancelledError:
