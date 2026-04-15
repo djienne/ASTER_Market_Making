@@ -10,6 +10,7 @@ from decimal import Decimal, ROUND_DOWN
 import numpy as np
 from dotenv import load_dotenv
 from api_client import ApiClient
+from utils import normalize_symbol_base
 
 # --- Configuration ---
 # STRATEGY
@@ -28,6 +29,8 @@ RETRY_ON_ERROR_INTERVAL = 30    # How long to wait after a major error before re
 PRICE_REPORT_INTERVAL = 60      # How often to report current prices and spread to terminal.
 BALANCE_REPORT_INTERVAL = 60    # How often to report account balance to terminal.
 POSITION_SYNC_TIMEOUT = 2.0     # How long to wait for a position snapshot after a fill.
+STARTUP_CLEANUP_TIMEOUT = 20.0  # How long to wait for the initial cancel-all cleanup.
+CANCEL_CONFIRM_TIMEOUT = 5.0    # How long to wait for a terminal update after canceling a timed-out order.
 
 # ORDER REUSE SETTINGS
 DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001  # 1 bp minimum price change to cancel and replace order
@@ -267,6 +270,28 @@ def sync_mode_with_position(state, position_notional=None):
     return state.mode
 
 
+def get_supertrend_params_path(symbol):
+    """Return the normalized Supertrend params file path for a trading symbol."""
+    filename_symbol = normalize_symbol_base(symbol)
+    return os.path.join(PARAMS_DIR, SUPERTREND_PARAMS_TEMPLATE.format(filename_symbol))
+
+
+def load_supertrend_signal(symbol):
+    """Load the latest Supertrend signal from disk."""
+    params_file = get_supertrend_params_path(symbol)
+    if not os.path.exists(params_file):
+        raise FileNotFoundError(params_file)
+
+    with open(params_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    signal = data.get('current_signal', {}).get('trend')
+    if signal not in [1, -1]:
+        raise ValueError(f"Invalid signal '{signal}' in {params_file}")
+
+    return signal, params_file
+
+
 def round_price_to_tick(price, tick_size, side):
     """Round prices to a passive tick for the given side."""
     if tick_size <= 0:
@@ -298,8 +323,8 @@ def round_quantity_to_step(quantity, step_size):
     return float(rounded)
 
 
-async def cancel_active_order(state, client, symbol, log, reason):
-    """Cancel the currently tracked order and only clear local tracking on success."""
+async def cancel_active_order(state, client, symbol, log, reason, clear_tracking_on_success=True):
+    """Cancel the currently tracked order and optionally clear local tracking on success."""
     if not state.active_order_id:
         return True
 
@@ -313,7 +338,8 @@ async def cancel_active_order(state, client, symbol, log, reason):
         log.error(f"{reason}: failed to cancel active order {order_id_to_cancel}: {cancel_error}")
         return False
 
-    clear_order_tracking(state)
+    if clear_tracking_on_success:
+        clear_order_tracking(state)
     log.info(f"{reason}: cancelled active order {order_id_to_cancel}.")
     return True
 
@@ -667,35 +693,23 @@ async def price_reporter(state, symbol, runtime):
 async def initialize_supertrend_signal(state, symbol):
     """Reads the Supertrend signal file once at startup to set the initial state."""
     log = logging.getLogger('SupertrendInitializer')
-    
-    # Determine the symbol for the filename (e.g., BTC from BTCUSDT)
-    filename_symbol = symbol[:-4] if symbol.endswith('USDT') else symbol
-    params_file = os.path.join(PARAMS_DIR, SUPERTREND_PARAMS_TEMPLATE.format(filename_symbol))
 
     try:
-        if os.path.exists(params_file):
-            with open(params_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            initial_signal = data.get('current_signal', {}).get('trend')
-            
-            if initial_signal in [1, -1]:
-                state.supertrend_signal = initial_signal
-                # Update flip_mode based on the initial signal
-                # Downtrend (-1) -> flip_mode = True (short-biased)
-                # Uptrend (+1) -> flip_mode = False (long-biased)
-                new_flip_mode = (initial_signal == -1)
-                if state.flip_mode != new_flip_mode:
-                    state.flip_mode = new_flip_mode
-                    sync_mode_with_position(state)
-                    log.info(f"Initialized Supertrend signal to: {'UPTREND (+1)' if initial_signal == 1 else 'DOWNTREND (-1)'}")
-                    log.info(f"Initial strategy bias set by signal: FLIP_MODE -> {state.flip_mode}")
-                else:
-                    log.info(f"Initial Supertrend signal confirms default bias: FLIP_MODE -> {state.flip_mode}")
-            else:
-                log.warning(f"Invalid initial signal '{initial_signal}' in {params_file}. Using default FLIP_MODE={state.flip_mode}.")
+        initial_signal, params_file = load_supertrend_signal(symbol)
+        state.supertrend_signal = initial_signal
+        new_flip_mode = (initial_signal == -1)
+        if state.flip_mode != new_flip_mode:
+            state.flip_mode = new_flip_mode
+            sync_mode_with_position(state)
+            log.info(f"Initialized Supertrend signal to: {'UPTREND (+1)' if initial_signal == 1 else 'DOWNTREND (-1)'}")
+            log.info(f"Initial strategy bias set by signal: FLIP_MODE -> {state.flip_mode}")
         else:
-            log.warning(f"Supertrend params file not found at {params_file}. Using default FLIP_MODE={state.flip_mode}.")
+            log.info(f"Initial Supertrend signal confirms default bias: FLIP_MODE -> {state.flip_mode}")
+    except FileNotFoundError:
+        params_file = get_supertrend_params_path(symbol)
+        log.warning(f"Supertrend params file not found at {params_file}. Using default FLIP_MODE={state.flip_mode}.")
+    except ValueError as exc:
+        log.warning(f"{exc}. Using default FLIP_MODE={state.flip_mode}.")
     except Exception as e:
         log.error(f"Error initializing Supertrend signal: {e}. Using default FLIP_MODE={state.flip_mode}.")
 
@@ -703,40 +717,41 @@ async def initialize_supertrend_signal(state, symbol):
 async def supertrend_signal_updater(state, symbol, runtime):
     """Periodically reads the Supertrend signal file and updates the strategy state."""
     log = logging.getLogger('SupertrendUpdater')
-    
-    # Determine the symbol for the filename (e.g., BTC from BTCUSDT)
-    filename_symbol = symbol[:-4] if symbol.endswith('USDT') else symbol
-    params_file = os.path.join(PARAMS_DIR, SUPERTREND_PARAMS_TEMPLATE.format(filename_symbol))
 
     while not runtime.shutdown_requested:
         try:
-            if os.path.exists(params_file):
-                with open(params_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                new_signal = data.get('current_signal', {}).get('trend')
-                
-                if new_signal in [1, -1]:
-                    if state.supertrend_signal != new_signal:
-                        state.supertrend_signal = new_signal
-                        log.info(f"Supertrend signal updated to: {'UPTREND (+1)' if new_signal == 1 else 'DOWNTREND (-1)'}")
-                else:
-                    log.warning(f"Invalid signal '{new_signal}' in {params_file}. Defaulting to UPTREND (+1).")
-                    state.supertrend_signal = 1 # Default to uptrend on invalid signal
-            else:
-                if state.supertrend_signal != 1: # Only log if it's a change
-                    log.warning(f"Supertrend params file not found at {params_file}. Defaulting to UPTREND (+1).")
-                    state.supertrend_signal = 1 # Default to uptrend if file not found
+            new_signal, params_file = load_supertrend_signal(symbol)
+            if state.supertrend_signal != new_signal:
+                state.supertrend_signal = new_signal
+                log.info(f"Supertrend signal updated to: {'UPTREND (+1)' if new_signal == 1 else 'DOWNTREND (-1)'}")
 
             await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
 
+        except FileNotFoundError:
+            params_file = get_supertrend_params_path(symbol)
+            if state.supertrend_signal is None:
+                log.warning(f"Supertrend params file not found at {params_file}. Keeping default bias until a valid signal appears.")
+            else:
+                log.warning(f"Supertrend params file not found at {params_file}. Holding previous signal {state.supertrend_signal}.")
+            await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
         except json.JSONDecodeError:
-            log.error(f"Error decoding JSON from {params_file}. Defaulting to UPTREND (+1).")
-            state.supertrend_signal = 1
+            params_file = get_supertrend_params_path(symbol)
+            if state.supertrend_signal is None:
+                log.error(f"Error decoding JSON from {params_file}. Keeping default bias until a valid signal appears.")
+            else:
+                log.error(f"Error decoding JSON from {params_file}. Holding previous signal {state.supertrend_signal}.")
+            await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
+        except ValueError as exc:
+            if state.supertrend_signal is None:
+                log.warning(f"{exc}. Keeping default bias until a valid signal appears.")
+            else:
+                log.warning(f"{exc}. Holding previous signal {state.supertrend_signal}.")
             await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
         except Exception as e:
-            log.error(f"An error occurred in the Supertrend signal updater: {e}. Defaulting to UPTREND (+1).")
-            state.supertrend_signal = 1
+            if state.supertrend_signal is None:
+                log.error(f"An error occurred in the Supertrend signal updater: {e}. Keeping default bias until a valid signal appears.")
+            else:
+                log.error(f"An error occurred in the Supertrend signal updater: {e}. Holding previous signal {state.supertrend_signal}.")
             await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
     
     log.info("Supertrend signal updater shutting down.")
@@ -755,10 +770,131 @@ def should_reuse_order(state, new_price, new_side, new_quantity, threshold=DEFAU
     return price_change_pct < threshold
 
 
+def build_order_plan(state, opening_mode, params):
+    """Build the intended side, price, and size for the next quote."""
+    close_side = get_close_side_for_trading(state)
+
+    if params["source"] != "default":
+        gamma = params["gamma"]
+        sigma = params["sigma"]
+        k_buy = params["k_buy"]
+        k_sell = params["k_sell"]
+        time_horizon = params["time_horizon_days"]
+        position_size = state.position_size
+        mid_price = state.mid_price
+
+        risk_term = gamma * ((sigma * mid_price) ** 2) * time_horizon
+        reservation_price = mid_price - position_size * risk_term
+        ask_offset = (1 / gamma) * np.log(1 + (gamma / k_buy)) + (risk_term / 2.0)
+        bid_offset = (1 / gamma) * np.log(1 + (gamma / k_sell)) + (risk_term / 2.0)
+        ask_price = reservation_price + ask_offset
+        bid_price = reservation_price - bid_offset
+
+        if close_side:
+            side, reduce_only = close_side, True
+            quantity_to_trade = abs(state.position_size)
+            limit_price = ask_price if side == 'SELL' else bid_price
+        else:
+            side, reduce_only = opening_mode, False
+            quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
+            limit_price = bid_price if opening_mode == 'BUY' else ask_price
+
+        used_spread = (ask_price - bid_price) / mid_price if mid_price > 0 else 0
+        return {
+            "side": side,
+            "reduce_only": reduce_only,
+            "quantity_to_trade": quantity_to_trade,
+            "limit_price": limit_price,
+            "used_spread": used_spread,
+            "reservation_price": reservation_price,
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+        }
+
+    buy_spread, sell_spread = params["buy_spread"], params["sell_spread"]
+    if close_side:
+        side, reduce_only = close_side, True
+        quantity_to_trade = abs(state.position_size)
+        limit_price = state.mid_price * (1 + sell_spread) if side == 'SELL' else state.mid_price * (1 - buy_spread)
+    else:
+        side, reduce_only = opening_mode, False
+        quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
+        limit_price = state.mid_price * (1 - buy_spread) if opening_mode == 'BUY' else state.mid_price * (1 + sell_spread)
+
+    used_spread = sell_spread if side == 'SELL' else buy_spread
+    return {
+        "side": side,
+        "reduce_only": reduce_only,
+        "quantity_to_trade": quantity_to_trade,
+        "limit_price": limit_price,
+        "used_spread": used_spread,
+    }
+
+
+def prepare_order_candidate(symbol_filters, side, reduce_only, limit_price, quantity_to_trade):
+    """Round and validate an order candidate against exchange filters."""
+    rounded_price = round_price_to_tick(limit_price, symbol_filters['tick_size'], side)
+    formatted_price = f"{rounded_price:.{symbol_filters['price_precision']}f}"
+
+    rounded_quantity = round_quantity_to_step(quantity_to_trade, symbol_filters['step_size'])
+    formatted_quantity = f"{rounded_quantity:.{symbol_filters['quantity_precision']}f}"
+
+    quantity_value = float(formatted_quantity)
+    price_value = float(formatted_price)
+    min_qty = symbol_filters['min_qty']
+    min_notional = symbol_filters['min_notional']
+    order_notional = price_value * quantity_value
+
+    if quantity_value <= 0:
+        return {
+            "ok": False,
+            "reason": "non_positive_quantity",
+            "formatted_price": formatted_price,
+            "formatted_quantity": formatted_quantity,
+            "rounded_price": rounded_price,
+            "rounded_quantity": rounded_quantity,
+        }
+
+    if quantity_value + POSITION_SIZE_EPSILON < min_qty:
+        return {
+            "ok": False,
+            "reason": "min_qty",
+            "formatted_price": formatted_price,
+            "formatted_quantity": formatted_quantity,
+            "rounded_price": rounded_price,
+            "rounded_quantity": rounded_quantity,
+            "min_qty": min_qty,
+            "order_kind": "reduce-only" if reduce_only else "opening",
+        }
+
+    if order_notional < min_notional:
+        return {
+            "ok": False,
+            "reason": "min_notional",
+            "formatted_price": formatted_price,
+            "formatted_quantity": formatted_quantity,
+            "rounded_price": rounded_price,
+            "rounded_quantity": rounded_quantity,
+            "order_notional": order_notional,
+            "min_notional": min_notional,
+        }
+
+    return {
+        "ok": True,
+        "formatted_price": formatted_price,
+        "formatted_quantity": formatted_quantity,
+        "rounded_price": rounded_price,
+        "rounded_quantity": rounded_quantity,
+        "order_notional": order_notional,
+    }
+
+
 def classify_order_update(order_data, fill_notional_threshold=POSITION_THRESHOLD_USD):
     """Classify an order update into terminal/non-terminal and fill/non-fill outcomes."""
-    status = order_data.get('X')
-    filled_qty = float(order_data.get('z', 0.0))
+    del fill_notional_threshold  # Retained for compatibility with older callers/tests.
+
+    status = order_data.get('X', order_data.get('status'))
+    filled_qty = float(order_data.get('z', order_data.get('executedQty', 0.0)) or 0.0)
 
     if status == 'PARTIALLY_FILLED':
         return {
@@ -832,6 +968,68 @@ def apply_fill_to_state(state, side, filled_qty):
     return previous_mode, state.mode
 
 
+async def cancel_and_finalize_active_order(state, client, symbol, log, reason, order_label):
+    """Cancel the tracked order and wait for a terminal state before proceeding."""
+    if not state.active_order_id:
+        return True
+
+    order_id = state.active_order_id
+    position_update_seq_before_fill = state.position_update_seq
+    if not await cancel_active_order(
+        state,
+        client,
+        symbol,
+        log,
+        reason,
+        clear_tracking_on_success=False,
+    ):
+        return False
+
+    try:
+        terminal_update = await wait_for_terminal_order_update(
+            state.order_updates,
+            order_id,
+            CANCEL_CONFIRM_TIMEOUT,
+            log,
+            f"{order_label} cancel confirmation",
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            f"{order_label} {order_id}: no terminal user-data update after cancel within "
+            f"{CANCEL_CONFIRM_TIMEOUT:.1f}s; checking REST order status."
+        )
+        try:
+            order_data = await client.get_order_status(symbol, order_id)
+        except Exception as rest_error:
+            log.error(f"{order_label} {order_id}: failed to confirm terminal state via REST: {rest_error}")
+            return False
+
+        terminal_update = classify_order_update(order_data)
+        if not terminal_update["is_terminal"]:
+            log.warning(
+                f"{order_label} {order_id}: order still reports non-terminal status "
+                f"{terminal_update['status']} after cancel. Keeping tracking and pausing."
+            )
+            return False
+
+        log.info(
+            f"{order_label} {order_id}: terminal status {terminal_update['status']} confirmed via REST."
+        )
+
+    await handle_terminal_order_update(
+        state,
+        client,
+        symbol,
+        log,
+        state.last_order_side,
+        order_id,
+        terminal_update,
+        position_update_seq_before_fill,
+        order_label,
+    )
+    return True
+
+
 async def handle_terminal_order_update(
     state,
     client,
@@ -883,9 +1081,7 @@ def _parameter_file_candidates(symbol):
             candidates.append(candidate)
 
     add(symbol)
-    for suffix in ("USDT", "USDC", "USDF", "USD1", "USD"):
-        if symbol.endswith(suffix) and len(symbol) > len(suffix):
-            add(symbol[:-len(suffix)])
+    add(normalize_symbol_base(symbol))
 
     return candidates
 
@@ -1028,92 +1224,67 @@ async def market_making_loop(state, client, symbol, runtime):
 
             # --- Determine Strategy and Parameters ---
             params = get_avellaneda_params(symbol)
+            order_plan = build_order_plan(state, opening_mode, params)
+            side = order_plan["side"]
+            reduce_only = order_plan["reduce_only"]
+            quantity_to_trade = order_plan["quantity_to_trade"]
+            limit_price = order_plan["limit_price"]
+            used_spread = order_plan["used_spread"]
 
-            # Use full Avellaneda-Stoikov logic if params are from a file
             if params["source"] != "default":
-                # Unpack parameters
-                gamma = params["gamma"]
-                sigma = params["sigma"]
-                k_buy = params["k_buy"]
-                k_sell = params["k_sell"]
-                T = params["time_horizon_days"]
-                q, s = state.position_size, state.mid_price
-
-                risk_term = gamma * ((sigma * s)**2) * T
-                reservation_price = s - q * risk_term
-                ask_offset = (1 / gamma) * np.log(1 + (gamma / k_buy)) + (risk_term / 2.0)
-                bid_offset = (1 / gamma) * np.log(1 + (gamma / k_sell)) + (risk_term / 2.0)
-                ask_price = reservation_price + ask_offset
-                bid_price = reservation_price - bid_offset
                 log.info(
-                    f"Avellaneda quotes: r={reservation_price:.4f}, bid={bid_price:.4f}, "
-                    f"ask={ask_price:.4f}, k_buy={k_buy:.6f}, k_sell={k_sell:.6f}"
+                    f"Avellaneda quotes: r={order_plan['reservation_price']:.4f}, "
+                    f"bid={order_plan['bid_price']:.4f}, ask={order_plan['ask_price']:.4f}, "
+                    f"k_buy={params['k_buy']:.6f}, k_sell={params['k_sell']:.6f}"
                 )
-
-                if close_side:
-                    side, reduce_only = close_side, True
-                    quantity_to_trade = abs(state.position_size)
-                    limit_price = ask_price if side == 'SELL' else bid_price
-                else: # Opening mode
-                    side, reduce_only = opening_mode, False
-                    quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
-                    limit_price = bid_price if opening_mode == 'BUY' else ask_price
-                
-                used_spread = (ask_price - bid_price) / s if s > 0 else 0
-
-            # Fallback to simple spread logic
             else:
-                buy_spread, sell_spread = params["buy_spread"], params["sell_spread"]
-                log.info(f"Using default spreads: buy={buy_spread:.4%}, sell={sell_spread:.4%}")
-
-                if close_side:
-                    side, reduce_only = close_side, True
-                    quantity_to_trade = abs(state.position_size)
-                    limit_price = state.mid_price * (1 + sell_spread) if side == 'SELL' else state.mid_price * (1 - buy_spread)
-                else:  # Opening mode
-                    side, reduce_only = opening_mode, False
-                    quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
-                    limit_price = state.mid_price * (1 - buy_spread) if opening_mode == 'BUY' else state.mid_price * (1 + sell_spread)
-                
-                used_spread = sell_spread if side == 'SELL' else buy_spread
+                log.info(f"Using default spreads: buy={params['buy_spread']:.4%}, sell={params['sell_spread']:.4%}")
 
             log.info(f"Calculated order parameters: side={side}, quantity={quantity_to_trade:.8f}, price={limit_price:.8f}, reduce_only={reduce_only}")
             log.debug(f"Market data: mid_price={state.mid_price:.8f}, bid={state.bid_price:.8f}, ask={state.ask_price:.8f}, using_spread={used_spread:.6f}")
 
             # --- Adjust order to conform to exchange filters ---
             log.debug(f"Symbol filters: {symbol_filters}")
-            rounded_price = round_price_to_tick(limit_price, symbol_filters['tick_size'], side)
-            formatted_price = f"{rounded_price:.{symbol_filters['price_precision']}f}"
-            log.debug(f"Price adjustment: {limit_price:.8f} -> {rounded_price:.8f} -> {formatted_price}")
+            order_candidate = prepare_order_candidate(
+                symbol_filters,
+                side,
+                reduce_only,
+                limit_price,
+                quantity_to_trade,
+            )
+            formatted_price = order_candidate["formatted_price"]
+            formatted_quantity = order_candidate["formatted_quantity"]
+            rounded_price = order_candidate["rounded_price"]
+            rounded_quantity = order_candidate["rounded_quantity"]
 
-            rounded_quantity = round_quantity_to_step(quantity_to_trade, symbol_filters['step_size'])
-            formatted_quantity = f"{rounded_quantity:.{symbol_filters['quantity_precision']}f}"
+            log.debug(f"Price adjustment: {limit_price:.8f} -> {rounded_price:.8f} -> {formatted_price}")
             log.info(f"Adjusted order: price={formatted_price}, quantity={formatted_quantity}")
             log.debug(f"Quantity adjustment: {quantity_to_trade:.8f} -> {rounded_quantity:.8f} -> {formatted_quantity}")
 
-            if float(formatted_quantity) <= 0:
+            if not order_candidate["ok"] and order_candidate["reason"] == "non_positive_quantity":
                 log.warning(f"Calculated quantity is zero or negative: {formatted_quantity}. Skipping cycle.")
                 await asyncio.sleep(ORDER_REFRESH_INTERVAL)
                 continue
 
-            min_qty = symbol_filters['min_qty']
-            if float(formatted_quantity) + POSITION_SIZE_EPSILON < min_qty:
-                order_kind = "reduce-only" if reduce_only else "opening"
+            if not order_candidate["ok"] and order_candidate["reason"] == "min_qty":
                 log.warning(
-                    f"Order quantity too small: {formatted_quantity} < {min_qty:.{symbol_filters['quantity_precision']}f} "
-                    f"(minQty) for {order_kind} order. Skipping cycle."
+                    f"Order quantity too small: {formatted_quantity} < "
+                    f"{order_candidate['min_qty']:.{symbol_filters['quantity_precision']}f} "
+                    f"(minQty) for {order_candidate['order_kind']} order. Skipping cycle."
                 )
                 await asyncio.sleep(ORDER_REFRESH_INTERVAL)
                 continue
 
-            order_notional = float(formatted_price) * float(formatted_quantity)
-            min_notional = symbol_filters['min_notional']
-            if order_notional < min_notional:
+            if not order_candidate["ok"] and order_candidate["reason"] == "min_notional":
+                order_notional = order_candidate["order_notional"]
+                min_notional = order_candidate["min_notional"]
                 log.warning(f"Order notional too small: ${order_notional:.2f} < ${min_notional:.2f} (min required). Skipping cycle.")
                 log.debug(f"Notional calculation: {formatted_price} * {formatted_quantity} = ${order_notional:.2f}")
                 await asyncio.sleep(ORDER_REFRESH_INTERVAL)
                 continue
 
+            order_notional = order_candidate["order_notional"]
+            min_notional = symbol_filters['min_notional']
             log.debug(f"Order validation passed: notional=${order_notional:.2f} >= ${min_notional:.2f}")
 
             # --- Check if we can reuse existing order ---
@@ -1214,11 +1385,18 @@ async def market_making_loop(state, client, symbol, runtime):
 
             except asyncio.TimeoutError:
                 log.info(f"Order {state.active_order_id} not filled within {ORDER_REFRESH_INTERVAL}s. Cancelling and refreshing.")
-                if not await cancel_active_order(state, client, symbol, log, "Timed-out order refresh"):
+                if not await cancel_and_finalize_active_order(
+                    state,
+                    client,
+                    symbol,
+                    log,
+                    "Timed-out order refresh",
+                    "Timed-out order",
+                ):
                     await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
                     continue
 
-                log.debug("Adding 0.1s delay after order timeout to avoid API rate limits")
+                log.debug("Adding 0.01s delay after order timeout to avoid API rate limits")
                 await asyncio.sleep(0.01)
 
         except asyncio.TimeoutError:
@@ -1271,6 +1449,29 @@ async def fetch_initial_balance(state, client, runtime):
     except Exception as e:
         log.error(f"Failed to fetch initial balance: {e}", exc_info=True)
         return False
+
+
+async def ensure_clean_startup(client, symbol, timeout=STARTUP_CLEANUP_TIMEOUT):
+    """Cancel all open orders for the symbol before trading starts."""
+    log = logging.getLogger('StartupCleanup')
+    log.info(f"Sending initial cancel all orders for {symbol} to ensure a clean slate.")
+    try:
+        await asyncio.wait_for(client.cancel_all_orders(symbol), timeout=timeout)
+    except asyncio.TimeoutError:
+        log.error(
+            f"Initial cancel-all for {symbol} timed out after {timeout:.1f}s. "
+            "Aborting startup to avoid trading on top of stale orders."
+        )
+        return False
+    except Exception as exc:
+        log.error(
+            f"Initial cancel-all for {symbol} failed: {exc}. "
+            "Aborting startup to avoid trading on top of stale orders."
+        )
+        return False
+
+    log.info(f"Initial cancel-all for {symbol} completed successfully.")
+    return True
 
 
 async def cleanup_orders(symbol, api_user, api_signer, api_private_key):
@@ -1327,11 +1528,8 @@ async def main():
         state = StrategyState(flip_mode=FLIP_MODE)
 
         async with client:
-            try:
-                logging.info(f"Sending initial cancel all orders for {args.symbol} to ensure a clean slate.")
-                await client.cancel_all_orders(args.symbol)
-            except Exception as e:
-                logging.warning(f"Failed to send initial cancel all orders, proceeding anyway: {e}")
+            if not await ensure_clean_startup(client, args.symbol):
+                return
 
             # [IMPROVED] Fetch initial account balance with a timeout
             logging.info("Fetching initial account balance...")

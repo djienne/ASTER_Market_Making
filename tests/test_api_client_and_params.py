@@ -79,6 +79,25 @@ def test_normalize_symbol_base_handles_multiple_stable_quotes():
     assert utils.normalize_symbol_base("SOLUSD1") == "SOL"
 
 
+def test_quote_symbol_candidates_and_local_resolution_support_base_or_full_symbols(tmp_path):
+    orderbook_root = tmp_path / "orderbook_parquet"
+    orderbook_root.mkdir()
+    (orderbook_root / "BTCUSDC").mkdir()
+
+    trades_root = tmp_path / "ASTER_data"
+    trades_root.mkdir()
+    trades_csv = trades_root / "trades_BTCUSDC.csv"
+    trades_csv.write_text("id,unix_timestamp_ms,side,price,quantity\n1,1,buy,100,0.1\n", encoding="utf-8")
+
+    assert utils.quote_symbol_candidates("BTC") == ["BTCUSDT", "BTCUSDC", "BTCUSDF", "BTCUSD1", "BTCUSD"]
+    assert utils.quote_symbol_candidates("BTCUSDC") == ["BTCUSDC"]
+    assert utils.resolve_orderbook_symbol("BTC", data_root=orderbook_root) == "BTCUSDC"
+
+    resolved_path, resolved_symbol = utils.resolve_trades_csv_path("BTC", data_root=trades_root)
+    assert resolved_symbol == "BTCUSDC"
+    assert resolved_path == trades_csv
+
+
 def test_build_summary_text_handles_missing_results_without_crashing():
     df = pd.DataFrame({"value": [1, 2, 3]}, index=pd.date_range("2024-01-01", periods=3, freq="min"))
 

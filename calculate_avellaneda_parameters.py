@@ -14,6 +14,7 @@ from utils import (
     load_and_process_orderbook_data,
     load_trades_data,
     parse_arguments,
+    resolve_trades_csv_path,
     save_avellaneda_params_atomic,
 )
 from volatility import calculate_volatility
@@ -282,10 +283,14 @@ def main():
 
     try:
         raw_ob_df, processed_ob_df = load_and_process_orderbook_data(ticker, lookback_seconds=lookback_seconds)
-        trades_df = load_trades_data(os.path.join(Path(__file__).parent.absolute(), 'ASTER_data', f'trades_{ticker}USDT.csv'))
+        trades_csv_path, resolved_trade_symbol = resolve_trades_csv_path(ticker)
+        trades_df = load_trades_data(str(trades_csv_path))
     except (FileNotFoundError, ValueError) as e:
         print(f"Error loading data: {e}. Exiting.")
         sys.exit(1)
+
+    if resolved_trade_symbol:
+        print(f"Using local trades data for {resolved_trade_symbol}.")
 
     print("\n" + "=" * 80)
     print("Checking data continuity...")

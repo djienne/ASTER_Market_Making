@@ -14,6 +14,14 @@ def test_classify_order_update_distinguishes_fill_from_cancel():
     assert canceled_with_fill["treat_as_fill"] is True
 
 
+def test_classify_order_update_supports_rest_payload_fields():
+    rest_update = market_maker.classify_order_update({"status": "CANCELED", "executedQty": "0.2"})
+
+    assert rest_update["is_terminal"] is True
+    assert rest_update["treat_as_fill"] is True
+    assert rest_update["filled_qty"] == 0.2
+
+
 def test_classify_order_update_keeps_small_partial_open():
     partial = market_maker.classify_order_update({"X": "PARTIALLY_FILLED", "z": "0.05", "ap": "100"})
 
@@ -105,6 +113,28 @@ def test_round_quantity_to_step_respects_non_decimal_lot_sizes():
     assert abs(market_maker.round_quantity_to_step(0.0149, 0.005) - 0.01) < 1e-9
 
 
+def test_prepare_order_candidate_rejects_quantity_below_min_qty():
+    candidate = market_maker.prepare_order_candidate(
+        {
+            "tick_size": 0.1,
+            "price_precision": 1,
+            "step_size": 0.005,
+            "quantity_precision": 3,
+            "min_qty": 0.015,
+            "min_notional": 5.0,
+        },
+        side="BUY",
+        reduce_only=False,
+        limit_price=100.06,
+        quantity_to_trade=0.0149,
+    )
+
+    assert candidate["ok"] is False
+    assert candidate["reason"] == "min_qty"
+    assert candidate["formatted_price"] == "100.0"
+    assert candidate["formatted_quantity"] == "0.010"
+
+
 def test_wait_for_terminal_order_update_ignores_non_terminal_events():
     async def runner():
         queue = asyncio.Queue()
@@ -142,6 +172,57 @@ def test_wait_for_terminal_order_update_handles_partial_then_canceled_fill():
         assert terminal["status"] == "CANCELED"
         assert terminal["treat_as_fill"] is True
         assert terminal["filled_qty"] == 0.2
+
+    asyncio.run(runner())
+
+
+def test_cancel_and_finalize_active_order_reconciles_via_rest_after_cancel_timeout(monkeypatch):
+    class DummyClient:
+        def __init__(self):
+            self.cancel_calls = 0
+            self.status_calls = 0
+            self.position_calls = 0
+
+        async def cancel_order(self, symbol, order_id):
+            self.cancel_calls += 1
+            return {"orderId": order_id}
+
+        async def get_order_status(self, symbol, order_id):
+            self.status_calls += 1
+            return {"status": "CANCELED", "executedQty": "0.2"}
+
+        async def get_position_risk(self, symbol):
+            self.position_calls += 1
+            return [{"positionAmt": "0.2", "notional": "20.0"}]
+
+    async def runner():
+        state = market_maker.StrategyState()
+        state.mid_price = 100.0
+        state.active_order_id = 42
+        state.last_order_side = "BUY"
+        state.last_order_price = 100.0
+        state.last_order_quantity = 0.2
+        client = DummyClient()
+
+        monkeypatch.setattr(market_maker, "CANCEL_CONFIRM_TIMEOUT", 0.01)
+        monkeypatch.setattr(market_maker, "POSITION_SYNC_TIMEOUT", 0.01)
+
+        success = await market_maker.cancel_and_finalize_active_order(
+            state,
+            client,
+            "BTCUSDT",
+            logging.getLogger("test"),
+            "Timed-out order refresh",
+            "Timed-out order",
+        )
+
+        assert success is True
+        assert client.cancel_calls == 1
+        assert client.status_calls == 1
+        assert client.position_calls == 1
+        assert state.active_order_id is None
+        assert state.position_size == 0.2
+        assert state.mode == "SELL"
 
     asyncio.run(runner())
 
@@ -195,6 +276,25 @@ def test_user_data_idle_timeout_does_not_reconnect(monkeypatch):
 
     assert client.listen_key_requests == 1
     assert wait_calls["count"] == 2
+
+
+def test_supertrend_signal_updater_holds_previous_signal_on_invalid_payload(monkeypatch):
+    async def fake_sleep(_seconds):
+        runtime.request_shutdown()
+
+    state = market_maker.StrategyState()
+    state.supertrend_signal = -1
+    runtime = market_maker.RuntimeContext("BTCUSDT")
+
+    def fail_load(_symbol):
+        raise ValueError("bad signal")
+
+    monkeypatch.setattr(market_maker, "load_supertrend_signal", fail_load)
+    monkeypatch.setattr(market_maker.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(market_maker.supertrend_signal_updater(state, "BTCUSDT", runtime))
+
+    assert state.supertrend_signal == -1
 
 
 def test_reconcile_fill_with_position_waits_for_ws_snapshot():
@@ -253,6 +353,18 @@ def test_reconcile_fill_with_position_falls_back_to_rest():
         assert previous_mode == "BUY"
         assert new_mode == "SELL"
         assert state.position_size == 0.2
+
+    asyncio.run(runner())
+
+
+def test_ensure_clean_startup_fails_closed_on_cancel_error():
+    class FailingClient:
+        async def cancel_all_orders(self, symbol):
+            raise RuntimeError("boom")
+
+    async def runner():
+        success = await market_maker.ensure_clean_startup(FailingClient(), "BTCUSDT", timeout=0.01)
+        assert success is False
 
     asyncio.run(runner())
 

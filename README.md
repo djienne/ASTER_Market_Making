@@ -14,6 +14,7 @@ Referral link: [https://www.asterdex.com/en/referral/164f81](https://www.asterde
 - The market maker assumes it has exclusive control of the account and of `BTCUSDT` trading on that account.
 - Do not run this bot alongside a manual trader or another bot on the same account.
 - `market_maker.py` cancels all open orders for the configured symbol on startup and again during shutdown cleanup.
+- If the startup cancel-all cannot be confirmed, the bot aborts instead of trading on top of unknown open orders.
 - If that behavior is not acceptable for your setup, do not run the trading bot as-is.
 
 ## Quick Start
@@ -67,6 +68,7 @@ SYMBOL=BTCUSDT
 - `market_maker.py` uses `--symbol` first, then `.env` `SYMBOL`, then falls back to `BTCUSDT`.
 - `data_collector.py` defaults to `.env` `SYMBOL`, or `BTCUSDT` if unset.
 - `calculate_avellaneda_parameters.py` defaults to the base ticker derived from `.env` `SYMBOL` after stripping common stablecoin quotes like `USDT`, `USDC`, `USDF`, `USD1`, and `USD`.
+- The local analytics loader accepts either a base ticker like `BTC` or a full symbol like `BTCUSDT`, then resolves the matching local trades/orderbook data using the available quote-suffix files.
 - `find_trend.py` defaults to `.env` `SYMBOL`, or `BTCUSDT`, and writes its params file using the same base-symbol normalization.
 
 ## Main Strategy Parameters
@@ -101,7 +103,7 @@ Important notes:
 - Positions that round below exchange `minQty` or `minNotional` cannot be reduced automatically and will block new openings until they are cleared.
 - `DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001` means the bot tries not to refresh an order unless the intended price moves by at least 1 basis point.
 - The fallback spread logic is still `+/-0.6%` if dynamic parameters are unavailable.
-- The bot assumes exclusive ownership of the account and symbol and will cancel all open orders for the configured symbol during startup and shutdown.
+- The bot assumes exclusive ownership of the account and symbol, cancels all open orders for the configured symbol during startup and shutdown, and aborts startup if it cannot confirm the initial cleanup.
 
 ## Available Scripts
 

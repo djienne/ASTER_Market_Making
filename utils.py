@@ -37,6 +37,43 @@ def normalize_symbol_base(symbol: str) -> str:
     return symbol
 
 
+def quote_symbol_candidates(symbol: str) -> list[str]:
+    """Return preferred full-symbol candidates for a base or fully qualified symbol."""
+    symbol = (symbol or "").upper()
+    if not symbol:
+        return []
+
+    base_symbol = normalize_symbol_base(symbol)
+    if symbol != base_symbol:
+        return [symbol]
+
+    return [f"{base_symbol}{suffix}" for suffix in QUOTE_SUFFIXES]
+
+
+def resolve_orderbook_symbol(symbol: str, data_root: Path | None = None) -> str:
+    """Resolve which full symbol directory to use for local orderbook parquet data."""
+    root = Path(data_root) if data_root is not None else Path(__file__).parent.absolute() / 'ASTER_data' / 'orderbook_parquet'
+    candidates = quote_symbol_candidates(symbol)
+    for candidate in candidates:
+        if (root / candidate).is_dir():
+            return candidate
+
+    return candidates[0] if candidates else ""
+
+
+def resolve_trades_csv_path(symbol: str, data_root: Path | None = None) -> tuple[Path, str]:
+    """Resolve the local trades CSV path for a base or fully qualified symbol."""
+    root = Path(data_root) if data_root is not None else Path(__file__).parent.absolute() / 'ASTER_data'
+    candidates = quote_symbol_candidates(symbol)
+    for candidate in candidates:
+        csv_path = root / f"trades_{candidate}.csv"
+        if csv_path.is_file():
+            return csv_path, candidate
+
+    fallback_symbol = candidates[0] if candidates else ""
+    return root / f"trades_{fallback_symbol}.csv", fallback_symbol
+
+
 def _has_valid_runtime_avellaneda_fields(params: dict) -> bool:
     """Validate the subset of Avellaneda params required by the runtime loader."""
     optimal_parameters = params.get("optimal_parameters", {})
@@ -132,14 +169,19 @@ def load_and_process_orderbook_data(symbol: str, target_volume_usd: float = 1000
     """
     Loads all Parquet order book data for a symbol and calculates the VWAP bid, ask, and mid-price.
     """
-    data_dir = os.path.join(Path(__file__).parent.absolute(), 'ASTER_data', 'orderbook_parquet', f'{symbol}USDT')
+    orderbook_root = Path(__file__).parent.absolute() / 'ASTER_data' / 'orderbook_parquet'
+    resolved_symbol = resolve_orderbook_symbol(symbol, data_root=orderbook_root)
+    data_dir = orderbook_root / resolved_symbol
     if not os.path.isdir(data_dir):
-        raise FileNotFoundError(f"Order book data directory not found for symbol: {symbol}USDT")
+        attempted = ", ".join(quote_symbol_candidates(symbol))
+        raise FileNotFoundError(
+            f"Order book data directory not found for symbol '{symbol}'. Tried: {attempted}"
+        )
 
     parquet_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.parquet')]
     parquet_files = select_recent_orderbook_parquet_files(parquet_files, lookback_seconds=lookback_seconds)
     if not parquet_files:
-        raise ValueError(f"No Parquet files found for symbol: {symbol}")
+        raise ValueError(f"No Parquet files found for symbol: {resolved_symbol}")
 
     # Read all parquet files, including the staging file, into a single DataFrame
     df = pd.concat([pd.read_parquet(f) for f in parquet_files])

@@ -62,7 +62,7 @@ class WebSocketDataCollector:
             os.makedirs('ASTER_data')
 
     def load_seen_trade_ids(self, symbol):
-        """Loads the last 1000 existing trade IDs from the CSV file to prevent duplicates."""
+        """Loads the last 1000 raw trade IDs from the CSV file to prevent duplicates."""
         seen_ids = set()
         file_path = os.path.join('ASTER_data', f'trades_{symbol}.csv')
         if not os.path.isfile(file_path):
@@ -221,27 +221,25 @@ class WebSocketDataCollector:
             print(f"Error processing depth message: {e}")
 
     def on_trades_message(self, ws, message):
-        """Handle aggregate trades WebSocket messages."""
+        """Handle raw trade or aggregate trade WebSocket messages."""
         try:
             data = json.loads(message)
 
-            if data.get('e') == 'aggTrade':
+            event_type = data.get('e')
+            if event_type in {'trade', 'aggTrade'}:
                 symbol = data.get('s')
                 if symbol not in self.symbols:
                     return
 
-                # Extract trade data
-                agg_trade_id = data.get('a')
-                first_trade_id = data.get('f')
-                last_trade_id = data.get('l')
+                if event_type == 'trade':
+                    trade_id = data.get('t')
+                else:
+                    trade_id = data.get('a')
+
                 price = float(data.get('p', 0))
                 quantity = float(data.get('q', 0))
                 trade_time = data.get('T')
                 is_buyer_maker = data.get('m', False)
-
-                # Use first trade ID to avoid duplicates (since this represents multiple trades)
-                # But we need to be careful with aggregate trades vs individual trades
-                trade_id = agg_trade_id  # Use aggregate trade ID as unique identifier
 
                 if trade_id not in self.seen_trade_ids[symbol]:
                     side = "sell" if is_buyer_maker else "buy"
@@ -295,7 +293,7 @@ class WebSocketDataCollector:
             depth_suffix = "depth20"  # Max available via WebSocket
 
         depth_streams = [f"{symbol.lower()}@{depth_suffix}" for symbol in self.symbols]
-        trade_streams = [f"{symbol.lower()}@aggTrade" for symbol in self.symbols]
+        trade_streams = [f"{symbol.lower()}@trade" for symbol in self.symbols]
         all_streams = depth_streams + trade_streams
 
         stream_names = "/".join(all_streams)
@@ -312,7 +310,7 @@ class WebSocketDataCollector:
             if '@depth' in stream_name:
                 # Process as depth message
                 self.on_depth_message(None, json.dumps(stream_data))
-            elif '@aggTrade' in stream_name:
+            elif '@trade' in stream_name or '@aggTrade' in stream_name:
                 # Process as trade message
                 self.on_trades_message(None, json.dumps(stream_data))
 
