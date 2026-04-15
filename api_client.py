@@ -150,12 +150,14 @@ class ApiClient:
                 price_precision = len(tick_size_str.split('.')[1].rstrip('0')) if '.' in tick_size_str else 0
                 lot_size_filter = filters.get('LOT_SIZE', {})
                 step_size_str = lot_size_filter.get('stepSize', '0.01')
+                min_qty_str = lot_size_filter.get('minQty', step_size_str)
                 quantity_precision = len(step_size_str.split('.')[1].rstrip('0')) if '.' in step_size_str else 0
                 return {
                     'price_precision': price_precision,
                     'tick_size': float(tick_size_str),
                     'quantity_precision': quantity_precision,
                     'step_size': float(step_size_str),
+                    'min_qty': float(min_qty_str),
                     'min_notional': float(filters.get('MIN_NOTIONAL', {}).get('notional', '5.0'))
                 }
         raise ValueError(f"Could not find filters for symbol '{symbol}'.")

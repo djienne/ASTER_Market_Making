@@ -72,6 +72,15 @@ def test_apply_position_snapshot_preserves_small_residual_position():
     assert state.position_size == 0.05
 
 
+def test_small_residual_position_is_flattened_before_opening_new_inventory():
+    state = market_maker.StrategyState(flip_mode=False)
+    state.position_size = 0.05
+    assert market_maker.get_close_side_for_trading(state) == "SELL"
+
+    state.position_size = -0.05
+    assert market_maker.get_close_side_for_trading(state) == "BUY"
+
+
 def test_significant_inventory_closes_using_position_direction():
     state = market_maker.StrategyState(flip_mode=False)
     state.mid_price = 100.0
@@ -89,6 +98,11 @@ def test_significant_inventory_closes_using_position_direction():
 def test_round_price_to_tick_stays_passive_for_each_side():
     assert abs(market_maker.round_price_to_tick(100.06, 0.1, "BUY") - 100.0) < 1e-9
     assert abs(market_maker.round_price_to_tick(100.06, 0.1, "SELL") - 100.1) < 1e-9
+
+
+def test_round_quantity_to_step_respects_non_decimal_lot_sizes():
+    assert abs(market_maker.round_quantity_to_step(1.234, 0.005) - 1.23) < 1e-9
+    assert abs(market_maker.round_quantity_to_step(0.0149, 0.005) - 0.01) < 1e-9
 
 
 def test_wait_for_terminal_order_update_ignores_non_terminal_events():

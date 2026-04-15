@@ -9,6 +9,13 @@ The main strategy combines:
 
 Referral link: [https://www.asterdex.com/en/referral/164f81](https://www.asterdex.com/en/referral/164f81)
 
+## Operating Assumptions
+
+- The market maker assumes it has exclusive control of the account and of `BTCUSDT` trading on that account.
+- Do not run this bot alongside a manual trader or another bot on the same account.
+- `market_maker.py` cancels all open orders for the configured symbol on startup and again during shutdown cleanup.
+- If that behavior is not acceptable for your setup, do not run the trading bot as-is.
+
 ## Quick Start
 
 ```bash
@@ -59,8 +66,8 @@ SYMBOL=BTCUSDT
 
 - `market_maker.py` uses `--symbol` first, then `.env` `SYMBOL`, then falls back to `BTCUSDT`.
 - `data_collector.py` defaults to `.env` `SYMBOL`, or `BTCUSDT` if unset.
-- `calculate_avellaneda_parameters.py` defaults to the base ticker derived from `.env` `SYMBOL`, or `BTC`.
-- `find_trend.py` defaults to `.env` `SYMBOL`, or `BTCUSDT`.
+- `calculate_avellaneda_parameters.py` defaults to the base ticker derived from `.env` `SYMBOL` after stripping common stablecoin quotes like `USDT`, `USDC`, `USDF`, `USD1`, and `USD`.
+- `find_trend.py` defaults to `.env` `SYMBOL`, or `BTCUSDT`, and writes its params file using the same base-symbol normalization.
 
 ## Main Strategy Parameters
 
@@ -90,9 +97,11 @@ RELEASE_MODE = True
 
 Important notes:
 - `DEFAULT_BALANCE_FRACTION` currently sizes from tracked wallet balances (`walletBalance` from account snapshots / user stream), not `availableBalance`.
-- `POSITION_THRESHOLD_USD` controls when the bot switches into closing mode. Residual positions below the threshold are still tracked internally; the threshold controls mode switching, not whether a small position exists.
+- `POSITION_THRESHOLD_USD` controls when a position is treated as significant for bias/mode logic, but the bot still tries to flatten any non-zero BTC position before opening fresh inventory.
+- Positions that round below exchange `minQty` or `minNotional` cannot be reduced automatically and will block new openings until they are cleared.
 - `DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001` means the bot tries not to refresh an order unless the intended price moves by at least 1 basis point.
 - The fallback spread logic is still `+/-0.6%` if dynamic parameters are unavailable.
+- The bot assumes exclusive ownership of the account and symbol and will cancel all open orders for the configured symbol during startup and shutdown.
 
 ## Available Scripts
 
@@ -154,6 +163,8 @@ pytest -q
 # Only if you intentionally want live API test collection:
 RUN_LIVE_API_TESTS=1 pytest -q
 ```
+
+The default test suite does not place live trades. It covers local order-state logic, filter rounding, parameter-file loading, and analytics helpers.
 
 ## Performance Notes
 

@@ -275,9 +275,13 @@ def main():
     ticker = args.ticker
     window_minutes = args.minutes
     ma_window = get_ma_window(window_minutes, config)
+    recent_param_periods = config_params['recent_param_periods']
+    max_gap_seconds = config_params['max_gap_seconds']
+    lookback_periods = recent_param_periods + ma_window + 4
+    lookback_seconds = (lookback_periods * window_minutes * 60) + max_gap_seconds
 
     try:
-        raw_ob_df, processed_ob_df = load_and_process_orderbook_data(ticker)
+        raw_ob_df, processed_ob_df = load_and_process_orderbook_data(ticker, lookback_seconds=lookback_seconds)
         trades_df = load_trades_data(os.path.join(Path(__file__).parent.absolute(), 'ASTER_data', f'trades_{ticker}USDT.csv'))
     except (FileNotFoundError, ValueError) as e:
         print(f"Error loading data: {e}. Exiting.")
@@ -285,7 +289,6 @@ def main():
 
     print("\n" + "=" * 80)
     print("Checking data continuity...")
-    max_gap_seconds = config_params['max_gap_seconds']
     raw_ob_df, processed_ob_df = get_continuous_recent_data(raw_ob_df, processed_ob_df, max_gap_seconds)
 
     if not processed_ob_df.empty:
@@ -309,7 +312,6 @@ def main():
         print(build_summary_text(None, [], df=raw_ob_df, minutes_window=window_minutes))
         sys.exit()
 
-    recent_param_periods = config_params['recent_param_periods']
     calc_periods = list_of_periods[-min(len(list_of_periods), recent_param_periods + ma_window):]
     sigma_list, garch_sigma_list, rolling_sigma_list = calculate_volatility(
         processed_ob_df,

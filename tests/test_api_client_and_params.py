@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 
@@ -41,11 +42,41 @@ def test_api_client_has_default_http_timeout():
     assert client.timeout.connect == 10
 
 
+def test_get_symbol_filters_exposes_min_qty():
+    client = make_client()
+
+    async def fake_exchange_info():
+        return {
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.005", "minQty": "0.015"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5.0"},
+                    ],
+                }
+            ]
+        }
+
+    client.get_exchange_info = fake_exchange_info
+    filters = asyncio.run(client.get_symbol_filters("BTCUSDT"))
+
+    assert filters["step_size"] == 0.005
+    assert filters["min_qty"] == 0.015
+
+
 def test_resolve_symbol_prefers_cli_then_env(monkeypatch):
     monkeypatch.setenv("SYMBOL", "ETHUSDT")
 
     assert market_maker.resolve_symbol(None) == "ETHUSDT"
     assert market_maker.resolve_symbol("BTCUSDT") == "BTCUSDT"
+
+
+def test_normalize_symbol_base_handles_multiple_stable_quotes():
+    assert utils.normalize_symbol_base("BTCUSDT") == "BTC"
+    assert utils.normalize_symbol_base("ETHUSDC") == "ETH"
+    assert utils.normalize_symbol_base("SOLUSD1") == "SOL"
 
 
 def test_build_summary_text_handles_missing_results_without_crashing():
@@ -127,3 +158,41 @@ def test_calculate_vwap_uses_true_execution_price():
 
     assert abs(full_vwap - 150.0) < 1e-9
     assert abs(first_level_vwap - 100.0) < 1e-9
+
+
+def test_select_recent_orderbook_parquet_files_prefers_recent_history():
+    files = [
+        r"C:\tmp\1000.parquet",
+        r"C:\tmp\2000.parquet",
+        r"C:\tmp\3000.parquet",
+        r"C:\tmp\_latest.parquet",
+    ]
+
+    selected = utils.select_recent_orderbook_parquet_files(files, lookback_seconds=1.2)
+
+    assert r"C:\tmp\1000.parquet" not in selected
+    assert r"C:\tmp\2000.parquet" in selected
+    assert r"C:\tmp\3000.parquet" in selected
+    assert selected[-1] == r"C:\tmp\_latest.parquet"
+
+
+def test_save_avellaneda_params_rejects_payloads_missing_runtime_fields(monkeypatch, tmp_path):
+    monkeypatch.setattr(utils, "PARAMS_DIR", str(tmp_path))
+
+    invalid_payload = {
+        "market_data": {
+            "sigma": 0.02,
+            "k_buy": 2.0,
+            "k_sell": 3.0,
+        },
+        "optimal_parameters": {
+            "time_horizon_days": 0.5,
+        },
+        "limit_orders": {
+            "delta_a": 1.0,
+            "delta_b": 1.0,
+        },
+    }
+
+    assert utils.save_avellaneda_params_atomic(invalid_payload, "BTC") is False
+    assert not any(Path(tmp_path).glob("*.json"))

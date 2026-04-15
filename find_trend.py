@@ -9,6 +9,7 @@ from datetime import datetime
 import time
 from numba import jit, njit
 from api_fetcher import _fetch_with_backoff
+from utils import normalize_symbol_base
 
 MIN_TRADES_FOR_VALID_RESULT = 6
 
@@ -388,8 +389,8 @@ def perform_grid_search(symbol, interval):
     if not os.path.exists('params'):
         os.makedirs('params')
 
-    # Create filename without USDT suffix
-    filename_symbol = symbol[:-4] if symbol.endswith('USDT') else symbol
+    # Create filename without the stablecoin quote suffix
+    filename_symbol = normalize_symbol_base(symbol)
     file_path = f'params/supertrend_params_{filename_symbol}.json'
     with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(output_data, f, indent=4)

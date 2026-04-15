@@ -6,6 +6,7 @@ import websockets
 import json
 import signal
 import time
+from decimal import Decimal, ROUND_DOWN
 import numpy as np
 from dotenv import load_dotenv
 from api_client import ApiClient
@@ -19,7 +20,7 @@ DEFAULT_SELL_SPREAD = 0.006  # 0.6% above mid-price for sell orders
 USE_AVELLANEDA_SPREADS = True  # Toggle to pull spreads from Avellaneda parameter files
 DEFAULT_LEVERAGE = 1
 DEFAULT_BALANCE_FRACTION = 0.2  # Use a fraction of tracked wallet balance for each order
-POSITION_THRESHOLD_USD = 15.0  # USD threshold to switch to sell mode in case of partial order fill
+POSITION_THRESHOLD_USD = 15.0  # USD threshold before a position is treated as significant inventory
 
 # TIMING (in seconds)
 ORDER_REFRESH_INTERVAL = 30     # How long to wait before cancelling an unfilled order, in seconds.
@@ -44,6 +45,7 @@ LOG_FILE = 'market_maker.log'
 RELEASE_MODE = True  # When True, suppress all non-error logs and prints
 
 MIN_ORDER_INTERVAL = 1.0  # Minimum seconds between order placements
+POSITION_SIZE_EPSILON = 1e-12
 
 # Spread configuration
 PARAMS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "params")
@@ -175,12 +177,22 @@ def get_position_close_side(position_size):
     return None
 
 
+def has_open_position_size(position_size):
+    """Return True when the tracked position is materially non-zero."""
+    return abs(position_size) > POSITION_SIZE_EPSILON
+
+
+def has_open_position(state):
+    """Return True when the strategy is carrying any non-zero inventory."""
+    return has_open_position_size(state.position_size)
+
+
 def has_significant_position(state, position_notional=None):
     """Return True when inventory is non-zero and large enough to require an explicit close."""
     if position_notional is None:
         position_notional = get_position_notional_usd(state.position_size, state.mid_price)
 
-    return get_position_close_side(state.position_size) is not None and is_position_significant(position_notional)
+    return has_open_position(state) and is_position_significant(position_notional)
 
 
 def get_target_mode(state, position_notional=None):
@@ -271,6 +283,21 @@ def round_price_to_tick(price, tick_size, side):
     return rounded
 
 
+def round_quantity_to_step(quantity, step_size):
+    """Round quantity down to the nearest valid multiple of step_size."""
+    if step_size <= 0:
+        raise ValueError("step_size must be positive")
+
+    if quantity <= 0:
+        return 0.0
+
+    quantity_dec = Decimal(str(quantity))
+    step_dec = Decimal(str(step_size))
+    steps = (quantity_dec / step_dec).to_integral_value(rounding=ROUND_DOWN)
+    rounded = steps * step_dec
+    return float(rounded)
+
+
 async def cancel_active_order(state, client, symbol, log, reason):
     """Cancel the currently tracked order and only clear local tracking on success."""
     if not state.active_order_id:
@@ -289,6 +316,14 @@ async def cancel_active_order(state, client, symbol, log, reason):
     clear_order_tracking(state)
     log.info(f"{reason}: cancelled active order {order_id_to_cancel}.")
     return True
+
+
+def get_close_side_for_trading(state):
+    """Return the side needed to flatten any tracked inventory, including small residuals."""
+    if not has_open_position(state):
+        return None
+
+    return get_position_close_side(state.position_size)
 
 
 async def wait_for_position_sync(state, previous_seq, timeout):
@@ -705,15 +740,6 @@ async def supertrend_signal_updater(state, symbol, runtime):
             await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
     
     log.info("Supertrend signal updater shutting down.")
-
-
-
-def round_down(value, precision):
-    """Helper to round a value down to a given precision."""
-    factor = 10 ** precision
-    return (int(value * factor)) / factor
-
-
 def should_reuse_order(state, new_price, new_side, new_quantity, threshold=DEFAULT_PRICE_CHANGE_THRESHOLD):
     """Check if existing order can be reused based on price change threshold."""
     if (state.active_order_id is None or
@@ -804,6 +830,41 @@ def apply_fill_to_state(state, side, filled_qty):
 
     sync_mode_with_position(state)
     return previous_mode, state.mode
+
+
+async def handle_terminal_order_update(
+    state,
+    client,
+    symbol,
+    log,
+    side,
+    order_id,
+    terminal_update,
+    position_update_seq_before_fill,
+    order_label,
+):
+    """Finalize a tracked order after it reaches a terminal exchange status."""
+    filled_qty = terminal_update["filled_qty"]
+    if terminal_update["treat_as_fill"]:
+        log.info(f"{order_label} {order_id} filled! Quantity: {filled_qty}")
+        synced_via_ws, previous_mode, new_mode = await reconcile_fill_with_position(
+            state,
+            client,
+            symbol,
+            log,
+            position_update_seq_before_fill,
+            f"{order_label} {order_id}",
+        )
+        sync_source = "WebSocket" if synced_via_ws else "REST fallback"
+        log.info(f"{side} fill reconciled via {sync_source}: tracked position size {state.position_size:.6f}")
+        if new_mode != previous_mode:
+            log.info(f"Mode change: {previous_mode} -> {new_mode}")
+    else:
+        log.info(f"{order_label} {order_id} ended as {terminal_update['status']} without an executed fill.")
+
+    clear_order_tracking(state)
+    log.debug(f"Adding 0.01s delay after {order_label.lower()} terminal update")
+    await asyncio.sleep(0.01)
 
 
 def _safe_float(value):
@@ -958,29 +1019,12 @@ async def market_making_loop(state, client, symbol, runtime):
                 continue
 
             current_position_notional = get_position_notional_usd(state.position_size, state.mid_price)
-            close_side = get_position_close_side(state.position_size) if has_significant_position(state, current_position_notional) else None
-
-            # --- Double-check position before entering opening mode ---
-            if close_side is None:
-                try:
-                    log.debug(f"Double-checking position before placing {opening_mode} order...")
-                    positions = await client.get_position_risk(symbol)
-                    if positions:
-                        current_position_size, notional_value, previous_mode, _ = sync_state_from_position_data(
-                            state,
-                            positions[0],
-                            reference_price=state.mid_price,
-                        )
-                        current_position_notional = notional_value
-                        close_side = get_position_close_side(state.position_size) if has_significant_position(state, current_position_notional) else None
-
-                        if close_side and state.mode != previous_mode:
-                            log.info(
-                                f"Found existing {'LONG' if current_position_size > 0 else 'SHORT'} position of size "
-                                f"{current_position_size} with notional ${notional_value:.2f} - switching to {state.mode} mode"
-                            )
-                except Exception as e:
-                    log.warning(f"Failed to double-check position, proceeding with current mode: {e}")
+            close_side = get_close_side_for_trading(state)
+            if close_side and not has_significant_position(state, current_position_notional):
+                log.debug(
+                    f"Residual position detected ({state.position_size:.8f}, ${current_position_notional:.2f}). "
+                    "Flattening it before opening new inventory."
+                )
 
             # --- Determine Strategy and Parameters ---
             params = get_avellaneda_params(symbol)
@@ -1042,13 +1086,23 @@ async def market_making_loop(state, client, symbol, runtime):
             formatted_price = f"{rounded_price:.{symbol_filters['price_precision']}f}"
             log.debug(f"Price adjustment: {limit_price:.8f} -> {rounded_price:.8f} -> {formatted_price}")
 
-            rounded_quantity = round_down(quantity_to_trade, symbol_filters['quantity_precision'])
+            rounded_quantity = round_quantity_to_step(quantity_to_trade, symbol_filters['step_size'])
             formatted_quantity = f"{rounded_quantity:.{symbol_filters['quantity_precision']}f}"
             log.info(f"Adjusted order: price={formatted_price}, quantity={formatted_quantity}")
             log.debug(f"Quantity adjustment: {quantity_to_trade:.8f} -> {rounded_quantity:.8f} -> {formatted_quantity}")
 
             if float(formatted_quantity) <= 0:
                 log.warning(f"Calculated quantity is zero or negative: {formatted_quantity}. Skipping cycle.")
+                await asyncio.sleep(ORDER_REFRESH_INTERVAL)
+                continue
+
+            min_qty = symbol_filters['min_qty']
+            if float(formatted_quantity) + POSITION_SIZE_EPSILON < min_qty:
+                order_kind = "reduce-only" if reduce_only else "opening"
+                log.warning(
+                    f"Order quantity too small: {formatted_quantity} < {min_qty:.{symbol_filters['quantity_precision']}f} "
+                    f"(minQty) for {order_kind} order. Skipping cycle."
+                )
                 await asyncio.sleep(ORDER_REFRESH_INTERVAL)
                 continue
 
@@ -1068,7 +1122,6 @@ async def market_making_loop(state, client, symbol, runtime):
                 log.info(f"Reusing existing order {state.active_order_id}: price change {price_change_pct:.4f}% < {DEFAULT_PRICE_CHANGE_THRESHOLD*100:.2f}% threshold")
 
                 # Continue monitoring the existing order
-                filled_qty = 0.0
                 try:
                     log.debug(f"Continuing to monitor existing order {state.active_order_id} via WebSocket with timeout {ORDER_REFRESH_INTERVAL}s")
                     order_id = state.active_order_id
@@ -1080,28 +1133,17 @@ async def market_making_loop(state, client, symbol, runtime):
                         log,
                         "Monitored",
                     )
-                    filled_qty = terminal_update["filled_qty"]
-
-                    if terminal_update["treat_as_fill"]:
-                        log.info(f"Reused order {order_id} filled! Quantity: {filled_qty}")
-                        synced_via_ws, previous_mode, new_mode = await reconcile_fill_with_position(
-                            state,
-                            client,
-                            symbol,
-                            log,
-                            position_update_seq_before_fill,
-                            f"Reused order {order_id}",
-                        )
-                        sync_source = "WebSocket" if synced_via_ws else "REST fallback"
-                        log.info(f"{side} fill reconciled via {sync_source}: tracked position size {state.position_size:.6f}")
-                        if new_mode != previous_mode:
-                            log.info(f"Mode change: {previous_mode} -> {new_mode}")
-                    else:
-                        log.info(f"Reused order {order_id} ended as {terminal_update['status']} without an executed fill.")
-
-                    clear_order_tracking(state)
-                    log.debug("Adding 0.01s delay after reused-order terminal update")
-                    await asyncio.sleep(0.01)
+                    await handle_terminal_order_update(
+                        state,
+                        client,
+                        symbol,
+                        log,
+                        side,
+                        order_id,
+                        terminal_update,
+                        position_update_seq_before_fill,
+                        "Reused order",
+                    )
 
                 except asyncio.TimeoutError:
                     log.info(f"Reused order {state.active_order_id} not filled within {ORDER_REFRESH_INTERVAL}s. Will evaluate for replacement in next cycle.")
@@ -1147,7 +1189,6 @@ async def market_making_loop(state, client, symbol, runtime):
                 log.error(f"Order parameters: symbol={symbol}, price={formatted_price}, quantity={formatted_quantity}, side={side}, reduceOnly={reduce_only}")
                 raise
 
-            filled_qty = 0.0
             try:
                 log.debug(f"Waiting for WebSocket update for order {state.active_order_id} with timeout {ORDER_REFRESH_INTERVAL}s")
                 order_id = state.active_order_id
@@ -1159,30 +1200,17 @@ async def market_making_loop(state, client, symbol, runtime):
                     log,
                     "Placed",
                 )
-                filled_qty = terminal_update["filled_qty"]
-
-                if terminal_update["treat_as_fill"]:
-                    log.info(f"Order {order_id} filled! Quantity: {filled_qty}")
-                    synced_via_ws, previous_mode, new_mode = await reconcile_fill_with_position(
-                        state,
-                        client,
-                        symbol,
-                        log,
-                        position_update_seq_before_fill,
-                        f"Order {order_id}",
-                    )
-                    sync_source = "WebSocket" if synced_via_ws else "REST fallback"
-                    log.info(f"{side} fill reconciled via {sync_source}: tracked position size {state.position_size:.6f}")
-                    if new_mode != previous_mode:
-                        log.info(f"Mode change: {previous_mode} -> {new_mode}")
-                else:
-                    log.info(f"Order {order_id} ended as {terminal_update['status']} without an executed fill.")
-
-                clear_order_tracking(state)
-
-                # Add a small delay to avoid hammering the API after terminal updates
-                log.debug("Adding 0.01s delay after order terminal update to avoid API rate limits")
-                await asyncio.sleep(0.01)
+                await handle_terminal_order_update(
+                    state,
+                    client,
+                    symbol,
+                    log,
+                    side,
+                    order_id,
+                    terminal_update,
+                    position_update_seq_before_fill,
+                    "Order",
+                )
 
             except asyncio.TimeoutError:
                 log.info(f"Order {state.active_order_id} not filled within {ORDER_REFRESH_INTERVAL}s. Cancelling and refreshing.")
@@ -1333,14 +1361,17 @@ async def main():
                         reference_price=state.mid_price,
                     )
 
-                    if has_significant_position(state, notional_value):
+                    if has_open_position(state):
                         position_side = "LONG" if position_size > 0 else "SHORT"
                         logging.info(f"Found existing {position_side} position of size {position_size} with notional value ${notional_value:.2f}.")
-                        logging.info(f"Starting in {state.mode} mode to close position.")
+                        if has_significant_position(state, notional_value):
+                            logging.info(f"Starting in {state.mode} mode to close position.")
+                        else:
+                            logging.info("Position is below the significance threshold, but the bot will still flatten it before opening new inventory.")
                         position_found = True
 
                 if not position_found:
-                    logging.info("No significant existing position found.")
+                    logging.info("No existing position found.")
                     try:
                         logging.info(f"Attempting to set leverage for {args.symbol} to {DEFAULT_LEVERAGE}x.")
                         await client.change_leverage(args.symbol, DEFAULT_LEVERAGE)

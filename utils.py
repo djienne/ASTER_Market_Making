@@ -8,6 +8,7 @@ import numpy as np
 import sys
 
 PARAMS_DIR = os.getenv("PARAMS_DIR", "params")
+QUOTE_SUFFIXES = ("USDT", "USDC", "USDF", "USD1", "USD")
 
 def _finite_nonneg(x) -> bool:
     """Check if a value is a non-negative, finite number."""
@@ -16,6 +17,41 @@ def _finite_nonneg(x) -> bool:
         return math.isfinite(v) and v >= 0.0
     except (ValueError, TypeError):
         return False
+
+
+def _finite_positive(x) -> bool:
+    """Check if a value is a positive, finite number."""
+    try:
+        v = float(x)
+        return math.isfinite(v) and v > 0.0
+    except (ValueError, TypeError):
+        return False
+
+
+def normalize_symbol_base(symbol: str) -> str:
+    """Strip common stablecoin quote suffixes from a symbol."""
+    symbol = (symbol or "").upper()
+    for suffix in QUOTE_SUFFIXES:
+        if symbol.endswith(suffix) and len(symbol) > len(suffix):
+            return symbol[:-len(suffix)]
+    return symbol
+
+
+def _has_valid_runtime_avellaneda_fields(params: dict) -> bool:
+    """Validate the subset of Avellaneda params required by the runtime loader."""
+    optimal_parameters = params.get("optimal_parameters", {})
+    market_data = params.get("market_data", {})
+    legacy_k = market_data.get("k")
+
+    required_positive = (
+        optimal_parameters.get("gamma"),
+        optimal_parameters.get("time_horizon_days"),
+        market_data.get("sigma"),
+        market_data.get("k_buy", legacy_k),
+        market_data.get("k_sell", legacy_k),
+    )
+
+    return all(_finite_positive(value) for value in required_positive)
 
 def save_avellaneda_params_atomic(params: dict, symbol: str) -> bool:
     """
@@ -26,7 +62,7 @@ def save_avellaneda_params_atomic(params: dict, symbol: str) -> bool:
     da = limit_orders.get("delta_a")
     db = limit_orders.get("delta_b")
 
-    if not (_finite_nonneg(da) and _finite_nonneg(db)):
+    if not (_finite_nonneg(da) and _finite_nonneg(db) and _has_valid_runtime_avellaneda_fields(params)):
         return False
 
     final_path = os.path.join(PARAMS_DIR, f"avellaneda_parameters_{symbol}.json")
@@ -42,7 +78,7 @@ def save_avellaneda_params_atomic(params: dict, symbol: str) -> bool:
 def parse_arguments():
     """Parse command-line arguments for the script."""
     parser = argparse.ArgumentParser(description='Calculate Avellaneda-Stoikov market making parameters')
-    default_ticker = os.getenv("SYMBOL", "BTCUSDT").upper().removesuffix("USDT")
+    default_ticker = normalize_symbol_base(os.getenv("SYMBOL", "BTCUSDT"))
     parser.add_argument('ticker', nargs='?', default=default_ticker, help=f'Ticker symbol (default: {default_ticker})')
     parser.add_argument('--minutes', type=int, default=5, help='Frequency in minutes for parameter recalculation (default: 5)')
     return parser.parse_args()
@@ -62,7 +98,37 @@ def load_trades_data(csv_path: str) -> pd.DataFrame:
     df = df.set_index('datetime')
     return df
 
-def load_and_process_orderbook_data(symbol: str, target_volume_usd: float = 1000.0) -> pd.DataFrame:
+
+def select_recent_orderbook_parquet_files(parquet_files, lookback_seconds=None):
+    """Select the most recent parquet snapshots relative to the newest timestamped file."""
+    timestamped_files = []
+    passthrough_files = []
+    latest_files = []
+
+    for file_path in parquet_files:
+        stem = Path(file_path).stem
+        if stem == "_latest":
+            latest_files.append(file_path)
+            continue
+        if stem.isdigit():
+            timestamped_files.append((int(stem), file_path))
+            continue
+        passthrough_files.append(file_path)
+
+    timestamped_files.sort(key=lambda item: item[0])
+    if lookback_seconds is not None and lookback_seconds > 0 and timestamped_files:
+        latest_timestamp_ms = timestamped_files[-1][0]
+        earliest_timestamp_ms = latest_timestamp_ms - int(lookback_seconds * 1000)
+        timestamped_files = [
+            (timestamp_ms, file_path)
+            for timestamp_ms, file_path in timestamped_files
+            if timestamp_ms >= earliest_timestamp_ms
+        ]
+
+    return passthrough_files + [file_path for _, file_path in timestamped_files] + latest_files
+
+
+def load_and_process_orderbook_data(symbol: str, target_volume_usd: float = 1000.0, lookback_seconds=None) -> pd.DataFrame:
     """
     Loads all Parquet order book data for a symbol and calculates the VWAP bid, ask, and mid-price.
     """
@@ -71,6 +137,7 @@ def load_and_process_orderbook_data(symbol: str, target_volume_usd: float = 1000
         raise FileNotFoundError(f"Order book data directory not found for symbol: {symbol}USDT")
 
     parquet_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.parquet')]
+    parquet_files = select_recent_orderbook_parquet_files(parquet_files, lookback_seconds=lookback_seconds)
     if not parquet_files:
         raise ValueError(f"No Parquet files found for symbol: {symbol}")
 
