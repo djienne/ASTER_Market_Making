@@ -84,7 +84,7 @@ USE_AVELLANEDA_SPREADS = True
 DEFAULT_BALANCE_FRACTION = 0.2
 POSITION_THRESHOLD_USD = 15.0
 
-ORDER_REFRESH_INTERVAL = 30
+ORDER_REFRESH_INTERVAL = 60
 PRICE_REPORT_INTERVAL = 60
 BALANCE_REPORT_INTERVAL = 60
 
@@ -102,7 +102,10 @@ Important notes:
 - `POSITION_THRESHOLD_USD` controls when a position is treated as significant for bias/mode logic, but the bot still tries to flatten any non-zero BTC position before opening fresh inventory.
 - Positions that round below exchange `minQty` or `minNotional` cannot be reduced automatically and will block new openings until they are cleared.
 - `DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001` means the bot tries not to refresh an order unless the intended price moves by at least 1 basis point.
-- The fallback spread logic is still `+/-0.6%` if dynamic parameters are unavailable.
+- `ORDER_REFRESH_INTERVAL = 60` is now a safety lifetime for a working order; normal re-quoting is event-driven from best bid/ask WebSocket changes.
+- If `USE_AVELLANEDA_SPREADS = True`, the bot will not place limit orders until a valid Avellaneda params file exists; it stays idle instead of falling back to static spreads when historical data is still insufficient.
+- The static `+/-0.6%` fallback is only used when `USE_AVELLANEDA_SPREADS = False`.
+- Opening quotes are also blocked unless the configured symbol is in `TRADING` status and the tracked wallet balance is large enough for the exchange minimum opening order size with a safety buffer.
 - The bot assumes exclusive ownership of the account and symbol, cancels all open orders for the configured symbol during startup and shutdown, and aborts startup if it cannot confirm the initial cleanup.
 
 ## Available Scripts

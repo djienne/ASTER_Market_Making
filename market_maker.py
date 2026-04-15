@@ -6,6 +6,8 @@ import websockets
 import json
 import signal
 import time
+from collections import deque
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 import numpy as np
 from dotenv import load_dotenv
@@ -24,7 +26,7 @@ DEFAULT_BALANCE_FRACTION = 0.2  # Use a fraction of tracked wallet balance for e
 POSITION_THRESHOLD_USD = 15.0  # USD threshold before a position is treated as significant inventory
 
 # TIMING (in seconds)
-ORDER_REFRESH_INTERVAL = 30     # How long to wait before cancelling an unfilled order, in seconds.
+ORDER_REFRESH_INTERVAL = 60     # Safety lifetime for a working order before a forced refresh, in seconds.
 RETRY_ON_ERROR_INTERVAL = 30    # How long to wait after a major error before retrying.
 PRICE_REPORT_INTERVAL = 60      # How often to report current prices and spread to terminal.
 BALANCE_REPORT_INTERVAL = 60    # How often to report account balance to terminal.
@@ -34,6 +36,10 @@ CANCEL_CONFIRM_TIMEOUT = 5.0    # How long to wait for a terminal update after c
 
 # ORDER REUSE SETTINGS
 DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001  # 1 bp minimum price change to cancel and replace order
+OPENING_CAPITAL_BUFFER_MULTIPLIER = 1.25  # Safety headroom above the exchange minimum for opening orders.
+ORDER_FAILURE_WINDOW_SECONDS = 60.0
+ORDER_FAILURE_LIMIT = 3
+OPENING_CIRCUIT_BREAKER_COOLDOWN = 120.0
 
 # SUPERTREND INTEGRATION
 USE_SUPERTREND_SIGNAL = True  # Toggle to use Supertrend signal for dynamic flip_mode
@@ -57,6 +63,25 @@ SPREAD_MIN_THRESHOLD = 0.00005  # 0.005%
 SPREAD_MAX_THRESHOLD = 0.02     # 2%
 SPREAD_CACHE_TTL_SECONDS = 10
 _SPREAD_CACHE = {}
+
+
+@dataclass(frozen=True)
+class OrderCommand:
+    """The latest desired action for the order manager."""
+    kind: str
+    side: str = ""
+    reduce_only: bool = False
+    price: float = 0.0
+    quantity: float = 0.0
+    formatted_price: str = ""
+    formatted_quantity: str = ""
+    order_notional: float = 0.0
+    trigger: str = ""
+
+
+def get_unavailable_quote_params():
+    """Return a sentinel payload meaning the bot must not quote yet."""
+    return {"source": "unavailable"}
 
 
 def resolve_symbol(cli_symbol=None):
@@ -155,6 +180,14 @@ class StrategyState:
         self.usdc_balance = 0.0
         # Queue for order updates from WebSocket
         self.order_updates = asyncio.Queue()
+        # Latest-wins handoff from quote engine to order manager
+        self.order_commands = asyncio.Queue(maxsize=1)
+        self.quote_refresh_event = asyncio.Event()
+        self.quote_params = (
+            {"buy_spread": DEFAULT_BUY_SPREAD, "sell_spread": DEFAULT_SELL_SPREAD, "source": "default"}
+            if not USE_AVELLANEDA_SPREADS
+            else get_unavailable_quote_params()
+        )
         # WebSocket connection health flags
         self.price_ws_connected = False
         self.user_data_ws_connected = False
@@ -162,6 +195,9 @@ class StrategyState:
         self.supertrend_signal = None # Can be 1 (up) or -1 (down)
         # Position snapshots are the source of truth for inventory state
         self.position_update_seq = 0
+        self.active_order_started_at = None
+        self.order_failure_timestamps = deque()
+        self.opening_circuit_breaker_until = 0.0
 
 
 def get_strategy_modes(flip_mode):
@@ -218,6 +254,7 @@ def clear_order_tracking(state):
     state.last_order_price = None
     state.last_order_side = None
     state.last_order_quantity = None
+    state.active_order_started_at = None
 
 
 def get_position_notional_usd(position_size, reference_price):
@@ -268,6 +305,32 @@ def sync_mode_with_position(state, position_notional=None):
     """Keep the strategy mode aligned with the current bias and inventory threshold."""
     state.mode = get_target_mode(state, position_notional=position_notional)
     return state.mode
+
+
+def request_quote_refresh(state):
+    """Wake the quote engine to recompute the desired working order."""
+    state.quote_refresh_event.set()
+
+
+def publish_latest_order_command(state, command):
+    """Push the latest order-manager command, replacing any stale pending one."""
+    while True:
+        try:
+            state.order_commands.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+    state.order_commands.put_nowait(command)
+
+
+def drain_latest_order_command(state, initial_command):
+    """Collapse queued commands and return only the newest one."""
+    latest_command = initial_command
+    while True:
+        try:
+            latest_command = state.order_commands.get_nowait()
+        except asyncio.QueueEmpty:
+            return latest_command
 
 
 def get_supertrend_params_path(symbol):
@@ -399,10 +462,12 @@ async def websocket_price_updater(state, symbol, runtime):
         try:
             log.info(f"Connecting to WebSocket: {websocket_url}")
             state.price_ws_connected = False # Mark as disconnected while attempting
+            request_quote_refresh(state)
 
             async with websockets.connect(websocket_url, ping_interval=20, ping_timeout=10) as websocket:
                 log.info(f"WebSocket connected for {symbol} depth stream")
                 state.price_ws_connected = True # Mark as connected
+                request_quote_refresh(state)
                 reconnect_delay = 5  # Reset reconnect delay on successful connection
                 last_message_time = runtime.now()
 
@@ -422,14 +487,14 @@ async def websocket_price_updater(state, symbol, runtime):
                                 if bids and asks:
                                     best_bid = float(bids[0][0])
                                     best_ask = float(asks[0][0])
-                                    mid_price = (best_bid + best_ask) / 2
-
-                                    state.bid_price = best_bid
-                                    state.ask_price = best_ask
-                                    state.mid_price = mid_price
                                     runtime.price_last_updated = runtime.now()
-
-                                    log.debug(f"Updated prices for {symbol}: Bid={best_bid}, Ask={best_ask}, Mid={mid_price:.4f}")
+                                    if best_bid != state.bid_price or best_ask != state.ask_price:
+                                        mid_price = (best_bid + best_ask) / 2
+                                        state.bid_price = best_bid
+                                        state.ask_price = best_ask
+                                        state.mid_price = mid_price
+                                        request_quote_refresh(state)
+                                        log.debug(f"Updated prices for {symbol}: Bid={best_bid}, Ask={best_ask}, Mid={mid_price:.4f}")
 
                         except json.JSONDecodeError:
                             log.warning("Failed to decode WebSocket message")
@@ -452,6 +517,7 @@ async def websocket_price_updater(state, symbol, runtime):
             log.error(f"Price WebSocket error: {e}")
         finally:
             state.price_ws_connected = False # Mark as disconnected on any error/exit
+            request_quote_refresh(state)
 
         if not runtime.shutdown_requested:
             log.info(f"Reconnecting to price WebSocket in {reconnect_delay:.1f}s...")
@@ -525,6 +591,7 @@ async def websocket_user_data_updater(state, client, symbol, runtime):
         try:
             log.info("Getting listen key for user data stream...")
             state.user_data_ws_connected = False # Mark as disconnected
+            request_quote_refresh(state)
             apiv1_public = os.getenv('APIV1_PUBLIC_KEY')
             apiv1_private = os.getenv('APIV1_PRIVATE_KEY')
 
@@ -555,6 +622,7 @@ async def websocket_user_data_updater(state, client, symbol, runtime):
             ) as websocket:
                 log.info("User data WebSocket connected!")
                 state.user_data_ws_connected = True # Mark as connected
+                request_quote_refresh(state)
                 reconnect_delay = 5  # Reset reconnect delay on successful connection
 
                 while not runtime.shutdown_requested:
@@ -580,6 +648,7 @@ async def websocket_user_data_updater(state, client, symbol, runtime):
                                 state.account_balance = state.usdf_balance + state.usdt_balance + state.usdc_balance
                                 state.balance_last_updated = runtime.now()
                                 log.info(f"Balance updated: USDF={state.usdf_balance:.4f}, USDT={state.usdt_balance:.4f}, USDC={state.usdc_balance:.4f}, Total=${state.account_balance:.4f}")
+                                request_quote_refresh(state)
 
                                 # Also check for position updates in the same event
                                 positions = account_data.get('P', [])
@@ -602,6 +671,7 @@ async def websocket_user_data_updater(state, client, symbol, runtime):
                                                 f"Position notional from WS (${notional_value:.2f}) changed mode: "
                                                 f"{previous_mode} -> {state.mode}."
                                             )
+                                        request_quote_refresh(state)
 
                             
                             elif event_type == 'ORDER_TRADE_UPDATE':
@@ -628,6 +698,7 @@ async def websocket_user_data_updater(state, client, symbol, runtime):
             log.error(f"An unexpected error occurred in user data updater: {e}", exc_info=True)
         finally:
             state.user_data_ws_connected = False # Mark as disconnected on any error/exit
+            request_quote_refresh(state)
             if keepalive_task and not keepalive_task.done():
                 keepalive_task.cancel()
                 try:
@@ -724,6 +795,7 @@ async def supertrend_signal_updater(state, symbol, runtime):
             if state.supertrend_signal != new_signal:
                 state.supertrend_signal = new_signal
                 log.info(f"Supertrend signal updated to: {'UPTREND (+1)' if new_signal == 1 else 'DOWNTREND (-1)'}")
+                request_quote_refresh(state)
 
             await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
 
@@ -768,6 +840,74 @@ def should_reuse_order(state, new_price, new_side, new_quantity, threshold=DEFAU
 
     # Reuse if price change is below threshold
     return price_change_pct < threshold
+
+
+def apply_supertrend_bias(state):
+    """Update flip_mode from the cached signal when inventory is below the significance threshold."""
+    if not USE_SUPERTREND_SIGNAL or state.supertrend_signal is None:
+        return False, None
+
+    current_notional = get_position_notional_usd(state.position_size, state.mid_price)
+    if current_notional >= POSITION_THRESHOLD_USD:
+        return False, current_notional
+
+    new_flip_mode = (state.supertrend_signal == -1)
+    if state.flip_mode == new_flip_mode:
+        return False, current_notional
+
+    state.flip_mode = new_flip_mode
+    sync_mode_with_position(state, position_notional=current_notional)
+    return True, current_notional
+
+
+def get_runtime_quote_params(state):
+    """Return the latest cached quoting parameters."""
+    if state.quote_params:
+        return state.quote_params
+
+    if not USE_AVELLANEDA_SPREADS:
+        return {"buy_spread": DEFAULT_BUY_SPREAD, "sell_spread": DEFAULT_SELL_SPREAD, "source": "default"}
+
+    return get_unavailable_quote_params()
+
+
+def record_opening_order_failure(state, runtime):
+    """Track exchange-side opening-order failures and trip a cooldown breaker when they cluster."""
+    now = runtime.now()
+    state.order_failure_timestamps.append(now)
+    while state.order_failure_timestamps and now - state.order_failure_timestamps[0] > ORDER_FAILURE_WINDOW_SECONDS:
+        state.order_failure_timestamps.popleft()
+
+    if len(state.order_failure_timestamps) >= ORDER_FAILURE_LIMIT:
+        state.opening_circuit_breaker_until = now + OPENING_CIRCUIT_BREAKER_COOLDOWN
+
+
+def reset_opening_order_failures(state):
+    """Clear the recent opening-order failure window after a healthy opening-order lifecycle event."""
+    state.order_failure_timestamps.clear()
+    state.opening_circuit_breaker_until = 0.0
+
+
+def is_opening_circuit_breaker_active(state, runtime):
+    """Return True while new opening quotes are paused due to repeated recent failures."""
+    return runtime.now() < state.opening_circuit_breaker_until
+
+
+def get_min_open_order_notional(symbol_filters, reference_price):
+    """Estimate the minimum viable opening-order notional from exchange filters and price."""
+    min_notional = float(symbol_filters.get('min_notional', 0.0) or 0.0)
+    min_qty = float(symbol_filters.get('min_qty', 0.0) or 0.0)
+    price = max(float(reference_price or 0.0), 0.0)
+    return max(min_notional, min_qty * price)
+
+
+def get_required_opening_balance(symbol_filters, reference_price):
+    """Compute the minimum tracked wallet balance needed for an opening quote to clear exchange limits."""
+    min_open_order_notional = get_min_open_order_notional(symbol_filters, reference_price)
+    safe_min_open_notional = min_open_order_notional * OPENING_CAPITAL_BUFFER_MULTIPLIER
+    if DEFAULT_BALANCE_FRACTION <= 0:
+        return float("inf")
+    return safe_min_open_notional / DEFAULT_BALANCE_FRACTION
 
 
 def build_order_plan(state, opening_mode, params):
@@ -889,6 +1029,55 @@ def prepare_order_candidate(symbol_filters, side, reduce_only, limit_price, quan
     }
 
 
+def build_quote_command(state, symbol_filters):
+    """Build the current desired order command from in-memory state only."""
+    params = get_runtime_quote_params(state)
+    if params.get("source") == "unavailable":
+        return None, {"reason": "missing_quote_params"}
+
+    if params.get("source") != "default":
+        required_positive = ("gamma", "time_horizon_days", "sigma", "k_buy", "k_sell")
+        if not all(params.get(key) is not None and params.get(key) > 0 for key in required_positive):
+            return None, {"reason": "invalid_quote_params"}
+    else:
+        if not all(params.get(key) is not None and params.get(key) > 0 for key in ("buy_spread", "sell_spread")):
+            return None, {"reason": "invalid_quote_params"}
+
+    opening_mode, _ = get_strategy_modes(state.flip_mode)
+    order_plan = build_order_plan(state, opening_mode, params)
+    if not order_plan["reduce_only"]:
+        required_balance = get_required_opening_balance(symbol_filters, order_plan["limit_price"])
+        if state.account_balance is None or state.account_balance + POSITION_SIZE_EPSILON < required_balance:
+            return None, {
+                "reason": "insufficient_opening_capital",
+                "required_balance": required_balance,
+                "current_balance": state.account_balance,
+            }
+
+    order_candidate = prepare_order_candidate(
+        symbol_filters,
+        order_plan["side"],
+        order_plan["reduce_only"],
+        order_plan["limit_price"],
+        order_plan["quantity_to_trade"],
+    )
+    if not order_candidate["ok"]:
+        return None, order_candidate
+
+    command = OrderCommand(
+        kind="quote",
+        side=order_plan["side"],
+        reduce_only=order_plan["reduce_only"],
+        price=float(order_candidate["formatted_price"]),
+        quantity=float(order_candidate["formatted_quantity"]),
+        formatted_price=order_candidate["formatted_price"],
+        formatted_quantity=order_candidate["formatted_quantity"],
+        order_notional=order_candidate["order_notional"],
+        trigger="price",
+    )
+    return command, order_candidate
+
+
 def classify_order_update(order_data, fill_notional_threshold=POSITION_THRESHOLD_USD):
     """Classify an order update into terminal/non-terminal and fill/non-fill outcomes."""
     del fill_notional_threshold  # Retained for compatibility with older callers/tests.
@@ -926,6 +1115,14 @@ def classify_order_update(order_data, fill_notional_threshold=POSITION_THRESHOLD
         "status": status,
         "filled_qty": filled_qty,
     }
+
+
+def is_order_reduce_only(order_data):
+    """Normalize the exchange reduce-only flag to a boolean."""
+    raw_value = order_data.get('R', order_data.get('reduceOnly', False))
+    if isinstance(raw_value, str):
+        return raw_value.lower() == 'true'
+    return bool(raw_value)
 
 
 async def wait_for_terminal_order_update(order_updates, order_id, timeout, log, context):
@@ -1065,6 +1262,215 @@ async def handle_terminal_order_update(
     await asyncio.sleep(0.01)
 
 
+async def place_order_from_command(state, client, symbol, runtime, log, command):
+    """Submit the desired order command and update local tracking."""
+    current_time = runtime.now()
+    time_since_last_order = current_time - runtime.last_order_time
+    if time_since_last_order < MIN_ORDER_INTERVAL:
+        wait_time = MIN_ORDER_INTERVAL - time_since_last_order
+        log.info(f"Rate limiting: waiting {wait_time:.3f}s before placing order")
+        await asyncio.sleep(wait_time)
+        if not state.active_order_id and command.kind == "quote":
+            command = drain_latest_order_command(state, command)
+            if command.kind != "quote":
+                return None
+
+    percentage_diff = 0.0
+    if state.mid_price:
+        percentage_diff = (command.price - state.mid_price) / state.mid_price * 100
+
+    log.info(
+        f"Placing {command.side} order: {command.formatted_quantity} {symbol} @ {command.formatted_price} "
+        f"({percentage_diff:+.4f}% from mid-price)"
+    )
+
+    active_order = await client.place_order(
+        symbol,
+        command.formatted_price,
+        command.formatted_quantity,
+        command.side,
+        command.reduce_only,
+    )
+    runtime.last_order_time = runtime.now()
+    state.active_order_id = active_order.get('orderId')
+    state.active_order_started_at = runtime.last_order_time
+    state.last_order_price = command.price
+    state.last_order_side = command.side
+    state.last_order_quantity = command.quantity
+    if not command.reduce_only:
+        reset_opening_order_failures(state)
+    log.info(f"Order placed successfully: ID={state.active_order_id}")
+    return active_order
+
+
+async def avellaneda_params_updater(state, symbol, runtime):
+    """Refresh quote parameters out of band so the quote engine stays memory-only."""
+    log = logging.getLogger('AvellanedaParamsUpdater')
+
+    while not runtime.shutdown_requested:
+        try:
+            params = get_avellaneda_params(symbol)
+            if params != state.quote_params:
+                state.quote_params = params
+                log.info(f"Updated quoting parameters for {symbol} from {params['source']}")
+                request_quote_refresh(state)
+        except Exception as exc:
+            log.error(f"Failed to refresh quoting parameters for {symbol}: {exc}")
+
+        await asyncio.sleep(SPREAD_CACHE_TTL_SECONDS)
+
+
+async def order_manager_loop(state, client, symbol, runtime):
+    """Own the active exchange order and react to quote intents immediately."""
+    log = logging.getLogger('OrderManager')
+
+    while not runtime.shutdown_requested:
+        try:
+            if not state.active_order_id:
+                command = await state.order_commands.get()
+                command = drain_latest_order_command(state, command)
+                if command.kind != "quote":
+                    continue
+
+                try:
+                    placed = await place_order_from_command(state, client, symbol, runtime, log, command)
+                except Exception:
+                    if not command.reduce_only:
+                        record_opening_order_failure(state, runtime)
+                    raise
+
+                if placed is None:
+                    continue
+                continue
+
+            order_age = runtime.now() - (state.active_order_started_at or runtime.now())
+            remaining_timeout = max(0.0, ORDER_REFRESH_INTERVAL - order_age)
+
+            order_update_task = asyncio.create_task(state.order_updates.get())
+            command_task = asyncio.create_task(state.order_commands.get())
+            timeout_task = asyncio.create_task(asyncio.sleep(remaining_timeout))
+
+            done, pending = await asyncio.wait(
+                {order_update_task, command_task, timeout_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            received_update = order_update_task.result() if order_update_task in done else None
+            received_command = command_task.result() if command_task in done else None
+            timed_out = timeout_task in done
+            action_taken = False
+
+            if received_update is not None:
+                order_data = received_update.get('o', {})
+                if received_update.get('e') == 'ORDER_TRADE_UPDATE' and order_data.get('i') == state.active_order_id:
+                    terminal_update = classify_order_update(order_data)
+                    if terminal_update["is_terminal"]:
+                        order_was_opening = not is_order_reduce_only(order_data)
+                        if terminal_update["status"] == "REJECTED" and order_was_opening:
+                            record_opening_order_failure(state, runtime)
+                        elif terminal_update["status"] == "FILLED" and order_was_opening:
+                            reset_opening_order_failures(state)
+
+                        order_id = state.active_order_id
+                        position_update_seq_before_fill = state.position_update_seq
+                        await handle_terminal_order_update(
+                            state,
+                            client,
+                            symbol,
+                            log,
+                            state.last_order_side,
+                            order_id,
+                            terminal_update,
+                            position_update_seq_before_fill,
+                            "Order",
+                        )
+                        request_quote_refresh(state)
+                        action_taken = True
+
+            if not action_taken and timed_out:
+                log.info(
+                    f"Order {state.active_order_id} reached the {ORDER_REFRESH_INTERVAL:.1f}s safety lifetime. "
+                    "Refreshing the quote."
+                )
+                if not await cancel_and_finalize_active_order(
+                    state,
+                    client,
+                    symbol,
+                    log,
+                    "Timed-out order refresh",
+                    "Timed-out order",
+                ):
+                    await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+                    continue
+
+                request_quote_refresh(state)
+                action_taken = True
+
+            if not action_taken and received_command is not None:
+                command = drain_latest_order_command(state, received_command)
+                if command.kind == "cancel":
+                    if not await cancel_and_finalize_active_order(
+                        state,
+                        client,
+                        symbol,
+                        log,
+                        command.trigger or "Quote engine cancel",
+                        "Active order",
+                    ):
+                        await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+                        continue
+                    request_quote_refresh(state)
+                    action_taken = True
+                elif should_reuse_order(state, command.price, command.side, command.quantity):
+                    action_taken = True
+                else:
+                    if not await cancel_and_finalize_active_order(
+                        state,
+                        client,
+                        symbol,
+                        log,
+                        command.trigger or "Requote replacement",
+                        "Requote order",
+                    ):
+                        await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+                        continue
+
+                    if runtime.shutdown_requested:
+                        break
+
+                    command = drain_latest_order_command(state, command)
+                    if command.kind == "quote":
+                        try:
+                            placed = await place_order_from_command(state, client, symbol, runtime, log, command)
+                        except Exception:
+                            if not command.reduce_only:
+                                record_opening_order_failure(state, runtime)
+                            raise
+
+                        if placed is None:
+                            continue
+                    else:
+                        request_quote_refresh(state)
+                    action_taken = True
+
+            if not action_taken and received_update is not None:
+                continue
+
+        except asyncio.CancelledError:
+            log.info("Order manager cancelled.")
+            break
+        except Exception as exc:
+            log.error(f"An error occurred in the order manager: {exc}", exc_info=True)
+            if state.active_order_id:
+                await cancel_active_order(state, client, symbol, log, "Order manager error")
+            await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+
+
 def _safe_float(value):
     try:
         return float(value)
@@ -1132,7 +1538,7 @@ def _load_avellaneda_params(symbol):
 def get_avellaneda_params(symbol):
     """
     Abstracted function to retrieve Avellaneda-Stoikov parameters.
-    Handles caching and falls back to default spreads if needed.
+    Handles caching and blocks quoting until valid params exist when dynamic spreads are enabled.
     :return: A dictionary of parameters.
     """
     if not USE_AVELLANEDA_SPREADS:
@@ -1154,264 +1560,89 @@ def get_avellaneda_params(symbol):
         log.info(f"Loaded Avellaneda parameters for {symbol_key} from {params['source']}")
         return params
     else:
-        # Fallback to default spreads if file not found or invalid
-        default_params = {"buy_spread": DEFAULT_BUY_SPREAD, "sell_spread": DEFAULT_SELL_SPREAD, "source": "default"}
-        _SPREAD_CACHE[symbol_key] = {"params": default_params, "expires_at": now + SPREAD_CACHE_TTL_SECONDS}
-        log.info(f"No Avellaneda parameter file found for {symbol_key}; using default spreads.")
-        return default_params
+        unavailable_params = get_unavailable_quote_params()
+        _SPREAD_CACHE[symbol_key] = {"params": unavailable_params, "expires_at": now + SPREAD_CACHE_TTL_SECONDS}
+        log.warning(
+            f"No valid Avellaneda parameter file found for {symbol_key}. "
+            "Quoting is disabled until enough historical data has been processed."
+        )
+        return unavailable_params
 
 
 async def market_making_loop(state, client, symbol, runtime):
-    """The main market making logic loop."""
+    """Event-driven quote engine: turn the latest state snapshot into a desired order command."""
     log = logging.getLogger('MarketMakerLoop')
     log.info(f"Fetching trading rules for {symbol}...")
     symbol_filters = await client.get_symbol_filters(symbol)
     log.info(f"Filters loaded: {symbol_filters}")
+    request_quote_refresh(state)
 
     while not runtime.shutdown_requested:
         try:
-            opening_mode, _ = get_strategy_modes(state.flip_mode)
+            await state.quote_refresh_event.wait()
+            state.quote_refresh_event.clear()
 
-            # We do not trade without both WebSockets because price freshness and order-state
-            # monitoring are both safety-critical.
-            if not state.price_ws_connected or not state.user_data_ws_connected:
-                ws_status = f"Price_WS_Connected={state.price_ws_connected}, User_Data_WS_Connected={state.user_data_ws_connected}"
-                log.warning(f"A WebSocket is disconnected ({ws_status}). Pausing trading logic.")
+            while True:
+                if runtime.shutdown_requested:
+                    break
 
-                if state.active_order_id:
-                    await cancel_active_order(state, client, symbol, log, "WebSocket disconnection")
-                 
-                await asyncio.sleep(1) # Wait before checking again
-                continue
+                if symbol_filters.get("status", "TRADING") != "TRADING":
+                    if state.active_order_id:
+                        publish_latest_order_command(
+                            state,
+                            OrderCommand(kind="cancel", trigger=f"Symbol status {symbol_filters.get('status', 'UNKNOWN')}"),
+                        )
+                    break
 
-            # --- Supertrend Signal Integration ---
-            if USE_SUPERTREND_SIGNAL and state.supertrend_signal is not None:
-                # Check if there is no significant open position
-                current_notional = abs(state.position_size * state.mid_price) if state.mid_price else 0
-                if current_notional < POSITION_THRESHOLD_USD:
-                    # Downtrend signal (-1) means we should be short-biased (SELL first) -> flip_mode = True
-                    # Uptrend signal (+1) means we should be long-biased (BUY first) -> flip_mode = False
-                    new_flip_mode = (state.supertrend_signal == -1)
-                    
-                    if state.flip_mode != new_flip_mode:
-                        log.info(f"Supertrend signal changed to {'DOWNTREND' if new_flip_mode else 'UPTREND'}.")
-                        log.info(f"Position is flat. Adjusting strategy bias: FLIP_MODE -> {new_flip_mode}")
-                        state.flip_mode = new_flip_mode
-                        opening_mode, _ = get_strategy_modes(state.flip_mode)
-                        sync_mode_with_position(state, position_notional=current_notional)
-                else:
-                    log.debug(f"Supertrend signal is {'DOWNTREND' if state.supertrend_signal == -1 else 'UPTREND'}, but position is open (${current_notional:.2f}). Holding current strategy bias.")
-            log.debug(f"Relying on WebSocket for position state. Current size: {state.position_size:.6f}, Mode: {state.mode}")
+                if not state.price_ws_connected or not state.user_data_ws_connected:
+                    if state.active_order_id:
+                        publish_latest_order_command(
+                            state,
+                            OrderCommand(kind="cancel", trigger="WebSocket disconnection"),
+                        )
+                    break
 
-            # --- Secondary checks for fresh data ---
-            if not is_price_data_valid(state, runtime):
-                log.info("Waiting for valid price data from WebSocket...")
-                await asyncio.sleep(2)
-                continue
+                if not is_price_data_valid(state, runtime) or not is_balance_data_valid(state):
+                    break
 
-            if not is_balance_data_valid(state):
-                log.info("Waiting for valid balance data from WebSocket...")
-                await asyncio.sleep(2)
-                continue
+                if is_opening_circuit_breaker_active(state, runtime) and not has_open_position(state):
+                    break
 
-            current_position_notional = get_position_notional_usd(state.position_size, state.mid_price)
-            close_side = get_close_side_for_trading(state)
-            if close_side and not has_significant_position(state, current_position_notional):
-                log.debug(
-                    f"Residual position detected ({state.position_size:.8f}, ${current_position_notional:.2f}). "
-                    "Flattening it before opening new inventory."
-                )
+                bias_changed, current_notional = apply_supertrend_bias(state)
+                if bias_changed:
+                    trend_name = "DOWNTREND" if state.flip_mode else "UPTREND"
+                    log.info(f"Supertrend switched strategy bias to {trend_name} while inventory was below ${current_notional:.2f}.")
 
-            # --- Determine Strategy and Parameters ---
-            params = get_avellaneda_params(symbol)
-            order_plan = build_order_plan(state, opening_mode, params)
-            side = order_plan["side"]
-            reduce_only = order_plan["reduce_only"]
-            quantity_to_trade = order_plan["quantity_to_trade"]
-            limit_price = order_plan["limit_price"]
-            used_spread = order_plan["used_spread"]
+                quote_command, order_candidate = build_quote_command(state, symbol_filters)
+                if quote_command is None:
+                    reason = order_candidate["reason"]
+                    if reason in {"missing_quote_params", "invalid_quote_params"}:
+                        if state.active_order_id:
+                            publish_latest_order_command(
+                                state,
+                                OrderCommand(kind="cancel", trigger=f"Quotes unavailable: {reason}"),
+                            )
+                        break
 
-            if params["source"] != "default":
-                log.info(
-                    f"Avellaneda quotes: r={order_plan['reservation_price']:.4f}, "
-                    f"bid={order_plan['bid_price']:.4f}, ask={order_plan['ask_price']:.4f}, "
-                    f"k_buy={params['k_buy']:.6f}, k_sell={params['k_sell']:.6f}"
-                )
-            else:
-                log.info(f"Using default spreads: buy={params['buy_spread']:.4%}, sell={params['sell_spread']:.4%}")
+                    if reason in {"non_positive_quantity", "min_qty", "min_notional"} and state.active_order_id:
+                        publish_latest_order_command(
+                            state,
+                            OrderCommand(kind="cancel", trigger=f"Quote invalid: {reason}"),
+                        )
+                    break
 
-            log.info(f"Calculated order parameters: side={side}, quantity={quantity_to_trade:.8f}, price={limit_price:.8f}, reduce_only={reduce_only}")
-            log.debug(f"Market data: mid_price={state.mid_price:.8f}, bid={state.bid_price:.8f}, ask={state.ask_price:.8f}, using_spread={used_spread:.6f}")
+                if not should_reuse_order(state, quote_command.price, quote_command.side, quote_command.quantity):
+                    publish_latest_order_command(state, quote_command)
 
-            # --- Adjust order to conform to exchange filters ---
-            log.debug(f"Symbol filters: {symbol_filters}")
-            order_candidate = prepare_order_candidate(
-                symbol_filters,
-                side,
-                reduce_only,
-                limit_price,
-                quantity_to_trade,
-            )
-            formatted_price = order_candidate["formatted_price"]
-            formatted_quantity = order_candidate["formatted_quantity"]
-            rounded_price = order_candidate["rounded_price"]
-            rounded_quantity = order_candidate["rounded_quantity"]
+                if not state.quote_refresh_event.is_set():
+                    break
+                state.quote_refresh_event.clear()
 
-            log.debug(f"Price adjustment: {limit_price:.8f} -> {rounded_price:.8f} -> {formatted_price}")
-            log.info(f"Adjusted order: price={formatted_price}, quantity={formatted_quantity}")
-            log.debug(f"Quantity adjustment: {quantity_to_trade:.8f} -> {rounded_quantity:.8f} -> {formatted_quantity}")
-
-            if not order_candidate["ok"] and order_candidate["reason"] == "non_positive_quantity":
-                log.warning(f"Calculated quantity is zero or negative: {formatted_quantity}. Skipping cycle.")
-                await asyncio.sleep(ORDER_REFRESH_INTERVAL)
-                continue
-
-            if not order_candidate["ok"] and order_candidate["reason"] == "min_qty":
-                log.warning(
-                    f"Order quantity too small: {formatted_quantity} < "
-                    f"{order_candidate['min_qty']:.{symbol_filters['quantity_precision']}f} "
-                    f"(minQty) for {order_candidate['order_kind']} order. Skipping cycle."
-                )
-                await asyncio.sleep(ORDER_REFRESH_INTERVAL)
-                continue
-
-            if not order_candidate["ok"] and order_candidate["reason"] == "min_notional":
-                order_notional = order_candidate["order_notional"]
-                min_notional = order_candidate["min_notional"]
-                log.warning(f"Order notional too small: ${order_notional:.2f} < ${min_notional:.2f} (min required). Skipping cycle.")
-                log.debug(f"Notional calculation: {formatted_price} * {formatted_quantity} = ${order_notional:.2f}")
-                await asyncio.sleep(ORDER_REFRESH_INTERVAL)
-                continue
-
-            order_notional = order_candidate["order_notional"]
-            min_notional = symbol_filters['min_notional']
-            log.debug(f"Order validation passed: notional=${order_notional:.2f} >= ${min_notional:.2f}")
-
-            # --- Check if we can reuse existing order ---
-            if should_reuse_order(state, float(formatted_price), side, float(formatted_quantity)):
-                price_change_pct = abs(float(formatted_price) - state.last_order_price) / state.last_order_price * 100
-                log.info(f"Reusing existing order {state.active_order_id}: price change {price_change_pct:.4f}% < {DEFAULT_PRICE_CHANGE_THRESHOLD*100:.2f}% threshold")
-
-                # Continue monitoring the existing order
-                try:
-                    log.debug(f"Continuing to monitor existing order {state.active_order_id} via WebSocket with timeout {ORDER_REFRESH_INTERVAL}s")
-                    order_id = state.active_order_id
-                    position_update_seq_before_fill = state.position_update_seq
-                    terminal_update = await wait_for_terminal_order_update(
-                        state.order_updates,
-                        order_id,
-                        ORDER_REFRESH_INTERVAL,
-                        log,
-                        "Monitored",
-                    )
-                    await handle_terminal_order_update(
-                        state,
-                        client,
-                        symbol,
-                        log,
-                        side,
-                        order_id,
-                        terminal_update,
-                        position_update_seq_before_fill,
-                        "Reused order",
-                    )
-
-                except asyncio.TimeoutError:
-                    log.info(f"Reused order {state.active_order_id} not filled within {ORDER_REFRESH_INTERVAL}s. Will evaluate for replacement in next cycle.")
-                    await asyncio.sleep(0.01)
-
-                continue  # Skip to next iteration
-
-            # --- Rate Limiting Protection ---
-            current_time = runtime.now()
-            time_since_last_order = current_time - runtime.last_order_time
-
-            if time_since_last_order < MIN_ORDER_INTERVAL:
-                wait_time = MIN_ORDER_INTERVAL - time_since_last_order
-                log.info(f"Rate limiting: waiting {wait_time:.1f}s before placing order")
-                await asyncio.sleep(wait_time)
-
-            # --- Cancel existing order if we're placing a new one ---
-            if state.active_order_id:
-                log.info(f"Cancelling existing order {state.active_order_id} to place new order")
-                if not await cancel_active_order(state, client, symbol, log, "Order replacement"):
-                    await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
-                    continue
-
-            # --- Place and Monitor Order ---
-            percentage_diff = (float(formatted_price) - state.mid_price) / state.mid_price * 100
-            log.info(f"Placing {side} order: {formatted_quantity} {symbol} @ {formatted_price} ({percentage_diff:+.4f}% from mid-price)")
-            log.info(f"Order details: symbol={symbol}, price={formatted_price}, quantity={formatted_quantity}, side={side}, reduceOnly={reduce_only}")
-
-            try:
-                active_order = await client.place_order(symbol, formatted_price, formatted_quantity, side, reduce_only)
-                runtime.last_order_time = runtime.now()
-                state.active_order_id = active_order.get('orderId')
-
-                # Track order details for reuse logic
-                state.last_order_price = float(formatted_price)
-                state.last_order_side = side
-                state.last_order_quantity = float(formatted_quantity)
-
-                log.info(f"Order placed successfully: ID={state.active_order_id}")
-                log.debug(f"Full order response: {active_order}")
-            except Exception as order_error:
-                log.error(f"Failed to place order: {order_error}")
-                log.error(f"Order parameters: symbol={symbol}, price={formatted_price}, quantity={formatted_quantity}, side={side}, reduceOnly={reduce_only}")
-                raise
-
-            try:
-                log.debug(f"Waiting for WebSocket update for order {state.active_order_id} with timeout {ORDER_REFRESH_INTERVAL}s")
-                order_id = state.active_order_id
-                position_update_seq_before_fill = state.position_update_seq
-                terminal_update = await wait_for_terminal_order_update(
-                    state.order_updates,
-                    order_id,
-                    ORDER_REFRESH_INTERVAL,
-                    log,
-                    "Placed",
-                )
-                await handle_terminal_order_update(
-                    state,
-                    client,
-                    symbol,
-                    log,
-                    side,
-                    order_id,
-                    terminal_update,
-                    position_update_seq_before_fill,
-                    "Order",
-                )
-
-            except asyncio.TimeoutError:
-                log.info(f"Order {state.active_order_id} not filled within {ORDER_REFRESH_INTERVAL}s. Cancelling and refreshing.")
-                if not await cancel_and_finalize_active_order(
-                    state,
-                    client,
-                    symbol,
-                    log,
-                    "Timed-out order refresh",
-                    "Timed-out order",
-                ):
-                    await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
-                    continue
-
-                log.debug("Adding 0.01s delay after order timeout to avoid API rate limits")
-                await asyncio.sleep(0.01)
-
-        except asyncio.TimeoutError:
-            log.warning("Timeout in main loop. Continuing...")
-            await asyncio.sleep(0.01)
-        except Exception as e:
-            log.error(f"An error occurred in the main loop: {e}", exc_info=True)
-            log.error(f"Current state: mode={state.mode}, position_size={state.position_size}, active_order_id={state.active_order_id}")
-            log.error(f"Market data: mid_price={state.mid_price}, bid={state.bid_price}, ask={state.ask_price}")
-
-            # Try to cancel any outstanding orders
-            if state.active_order_id:
-                await cancel_active_order(state, client, symbol, log, "Error handling")
-
-            log.info(f"Waiting for {RETRY_ON_ERROR_INTERVAL} seconds before retrying...")
+        except asyncio.CancelledError:
+            log.info("Quote engine cancelled.")
+            break
+        except Exception as exc:
+            log.error(f"An error occurred in the quote engine: {exc}", exc_info=True)
             await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
 
 
@@ -1522,6 +1753,7 @@ async def main():
 
     client = None
     tasks = []
+    core_tasks = []
 
     try:
         client = ApiClient(API_USER, API_SIGNER, API_PRIVATE_KEY, RELEASE_MODE)
@@ -1585,19 +1817,26 @@ async def main():
                 logging.warning(f"Could not check for existing position or set leverage, starting in default {state.mode} mode: {e}", exc_info=True)
 
             # Start all async tasks
-            mm_task = asyncio.create_task(market_making_loop(state, client, args.symbol, runtime))
+            quote_task = asyncio.create_task(market_making_loop(state, client, args.symbol, runtime))
+            order_task = asyncio.create_task(order_manager_loop(state, client, args.symbol, runtime))
+            params_task = asyncio.create_task(avellaneda_params_updater(state, args.symbol, runtime))
+            core_tasks = [quote_task, order_task]
             tasks = [
                 asyncio.create_task(websocket_price_updater(state, args.symbol, runtime)),
                 asyncio.create_task(websocket_user_data_updater(state, client, args.symbol, runtime)),
                 asyncio.create_task(balance_reporter(state, runtime)),
-                mm_task,
+                quote_task,
+                order_task,
+                params_task,
                 asyncio.create_task(price_reporter(state, args.symbol, runtime)),
             ]
             if USE_SUPERTREND_SIGNAL:
                 tasks.append(asyncio.create_task(supertrend_signal_updater(state, args.symbol, runtime)))
 
-            # Wait for either the market making task to complete or shutdown signal
-            while not runtime.shutdown_requested and not mm_task.done():
+            request_quote_refresh(state)
+
+            # Wait for either a core trading task to complete or a shutdown signal
+            while not runtime.shutdown_requested and not any(task.done() for task in core_tasks):
                 await asyncio.sleep(0.01)
 
     except asyncio.CancelledError:

@@ -135,6 +135,229 @@ def test_prepare_order_candidate_rejects_quantity_below_min_qty():
     assert candidate["formatted_quantity"] == "0.010"
 
 
+def test_quote_engine_emits_requote_command_on_price_move_above_threshold(monkeypatch):
+    class DummyClient:
+        async def get_symbol_filters(self, symbol):
+            return {
+                "tick_size": 0.1,
+                "price_precision": 1,
+                "step_size": 0.001,
+                "quantity_precision": 3,
+                "min_qty": 0.001,
+                "min_notional": 5.0,
+            }
+
+    async def runner():
+        state = market_maker.StrategyState(flip_mode=False)
+        state.price_ws_connected = True
+        state.user_data_ws_connected = True
+        state.account_balance = 1000.0
+        state.balance_last_updated = 1.0
+        state.mid_price = 100.0
+        state.bid_price = 99.9
+        state.ask_price = 100.1
+        state.quote_params = {"buy_spread": 0.006, "sell_spread": 0.006, "source": "default"}
+        state.active_order_id = 42
+        state.last_order_side = "BUY"
+        state.last_order_quantity = 2.0
+        state.last_order_price = 98.0
+        runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 10.0)
+        runtime.price_last_updated = 10.0
+
+        task = asyncio.create_task(market_maker.market_making_loop(state, DummyClient(), "BTCUSDT", runtime))
+        market_maker.request_quote_refresh(state)
+
+        for _ in range(20):
+            if not state.order_commands.empty():
+                break
+            await asyncio.sleep(0.01)
+
+        runtime.request_shutdown()
+        market_maker.request_quote_refresh(state)
+        await task
+
+        command = state.order_commands.get_nowait()
+        assert command.kind == "quote"
+        assert command.side == "BUY"
+        assert command.price == 99.4
+
+    asyncio.run(runner())
+
+
+def test_quote_engine_does_not_emit_limit_order_without_valid_quotes():
+    class DummyClient:
+        async def get_symbol_filters(self, symbol):
+            return {
+                "tick_size": 0.1,
+                "price_precision": 1,
+                "step_size": 0.001,
+                "quantity_precision": 3,
+                "min_qty": 0.001,
+                "min_notional": 5.0,
+            }
+
+    async def runner():
+        state = market_maker.StrategyState(flip_mode=False)
+        state.price_ws_connected = True
+        state.user_data_ws_connected = True
+        state.account_balance = 1000.0
+        state.balance_last_updated = 1.0
+        state.mid_price = 100.0
+        state.bid_price = 99.9
+        state.ask_price = 100.1
+        state.quote_params = {"source": "unavailable"}
+        runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 10.0)
+        runtime.price_last_updated = 10.0
+
+        task = asyncio.create_task(market_maker.market_making_loop(state, DummyClient(), "BTCUSDT", runtime))
+        market_maker.request_quote_refresh(state)
+        await asyncio.sleep(0.05)
+
+        runtime.request_shutdown()
+        market_maker.request_quote_refresh(state)
+        await task
+
+        assert state.order_commands.empty()
+
+    asyncio.run(runner())
+
+
+def test_quote_engine_does_not_emit_opening_quote_without_enough_capital():
+    class DummyClient:
+        async def get_symbol_filters(self, symbol):
+            return {
+                "status": "TRADING",
+                "tick_size": 0.1,
+                "price_precision": 1,
+                "step_size": 0.001,
+                "quantity_precision": 3,
+                "min_qty": 0.001,
+                "min_notional": 10.0,
+            }
+
+    async def runner():
+        state = market_maker.StrategyState(flip_mode=False)
+        state.price_ws_connected = True
+        state.user_data_ws_connected = True
+        state.account_balance = 20.0
+        state.balance_last_updated = 1.0
+        state.mid_price = 100.0
+        state.bid_price = 99.9
+        state.ask_price = 100.1
+        state.quote_params = {"buy_spread": 0.006, "sell_spread": 0.006, "source": "default"}
+        runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 10.0)
+        runtime.price_last_updated = 10.0
+
+        task = asyncio.create_task(market_maker.market_making_loop(state, DummyClient(), "BTCUSDT", runtime))
+        market_maker.request_quote_refresh(state)
+        await asyncio.sleep(0.05)
+
+        runtime.request_shutdown()
+        market_maker.request_quote_refresh(state)
+        await task
+
+        assert state.order_commands.empty()
+
+    asyncio.run(runner())
+
+
+def test_quote_engine_cancels_active_order_when_quotes_become_unavailable():
+    class DummyClient:
+        async def get_symbol_filters(self, symbol):
+            return {
+                "tick_size": 0.1,
+                "price_precision": 1,
+                "step_size": 0.001,
+                "quantity_precision": 3,
+                "min_qty": 0.001,
+                "min_notional": 5.0,
+            }
+
+    async def runner():
+        state = market_maker.StrategyState(flip_mode=False)
+        state.price_ws_connected = True
+        state.user_data_ws_connected = True
+        state.account_balance = 1000.0
+        state.balance_last_updated = 1.0
+        state.mid_price = 100.0
+        state.bid_price = 99.9
+        state.ask_price = 100.1
+        state.active_order_id = 42
+        state.last_order_side = "BUY"
+        state.last_order_quantity = 2.0
+        state.last_order_price = 99.0
+        state.quote_params = {"source": "unavailable"}
+        runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 10.0)
+        runtime.price_last_updated = 10.0
+
+        task = asyncio.create_task(market_maker.market_making_loop(state, DummyClient(), "BTCUSDT", runtime))
+        market_maker.request_quote_refresh(state)
+
+        for _ in range(20):
+            if not state.order_commands.empty():
+                break
+            await asyncio.sleep(0.01)
+
+        runtime.request_shutdown()
+        market_maker.request_quote_refresh(state)
+        await task
+
+        command = state.order_commands.get_nowait()
+        assert command.kind == "cancel"
+        assert "Quotes unavailable" in command.trigger
+
+    asyncio.run(runner())
+
+
+def test_quote_engine_cancels_active_order_when_symbol_is_not_trading():
+    class DummyClient:
+        async def get_symbol_filters(self, symbol):
+            return {
+                "status": "HALT",
+                "tick_size": 0.1,
+                "price_precision": 1,
+                "step_size": 0.001,
+                "quantity_precision": 3,
+                "min_qty": 0.001,
+                "min_notional": 5.0,
+            }
+
+    async def runner():
+        state = market_maker.StrategyState(flip_mode=False)
+        state.price_ws_connected = True
+        state.user_data_ws_connected = True
+        state.account_balance = 1000.0
+        state.balance_last_updated = 1.0
+        state.mid_price = 100.0
+        state.bid_price = 99.9
+        state.ask_price = 100.1
+        state.active_order_id = 42
+        state.last_order_side = "BUY"
+        state.last_order_quantity = 2.0
+        state.last_order_price = 99.0
+        state.quote_params = {"buy_spread": 0.006, "sell_spread": 0.006, "source": "default"}
+        runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 10.0)
+        runtime.price_last_updated = 10.0
+
+        task = asyncio.create_task(market_maker.market_making_loop(state, DummyClient(), "BTCUSDT", runtime))
+        market_maker.request_quote_refresh(state)
+
+        for _ in range(20):
+            if not state.order_commands.empty():
+                break
+            await asyncio.sleep(0.01)
+
+        runtime.request_shutdown()
+        market_maker.request_quote_refresh(state)
+        await task
+
+        command = state.order_commands.get_nowait()
+        assert command.kind == "cancel"
+        assert "Symbol status HALT" in command.trigger
+
+    asyncio.run(runner())
+
+
 def test_wait_for_terminal_order_update_ignores_non_terminal_events():
     async def runner():
         queue = asyncio.Queue()
@@ -223,6 +446,126 @@ def test_cancel_and_finalize_active_order_reconciles_via_rest_after_cancel_timeo
         assert state.active_order_id is None
         assert state.position_size == 0.2
         assert state.mode == "SELL"
+
+    asyncio.run(runner())
+
+
+def test_order_manager_requotes_active_order_before_timeout(monkeypatch):
+    class DummyClient:
+        def __init__(self, state, runtime):
+            self.state = state
+            self.runtime = runtime
+            self.placed = []
+            self.canceled = []
+
+        async def place_order(self, symbol, price, quantity, side, reduce_only=False):
+            self.placed.append((price, quantity, side, reduce_only))
+            order_id = 100 + len(self.placed)
+
+            if len(self.placed) == 1:
+                async def push_requote():
+                    await asyncio.sleep(0.01)
+                    market_maker.publish_latest_order_command(
+                        self.state,
+                        market_maker.OrderCommand(
+                            kind="quote",
+                            side="BUY",
+                            reduce_only=False,
+                            price=99.4,
+                            quantity=2.0,
+                            formatted_price="99.4",
+                            formatted_quantity="2.000",
+                            order_notional=198.8,
+                            trigger="price",
+                        ),
+                    )
+
+                asyncio.create_task(push_requote())
+            else:
+                self.runtime.request_shutdown()
+
+            return {"orderId": order_id}
+
+        async def cancel_order(self, symbol, order_id):
+            self.canceled.append(order_id)
+
+            async def push_terminal():
+                await asyncio.sleep(0.01)
+                await self.state.order_updates.put(
+                    {"e": "ORDER_TRADE_UPDATE", "o": {"i": order_id, "X": "CANCELED", "z": "0"}}
+                )
+
+            asyncio.create_task(push_terminal())
+            return {"orderId": order_id}
+
+    async def runner():
+        monkeypatch.setattr(market_maker, "MIN_ORDER_INTERVAL", 0.0)
+        state = market_maker.StrategyState()
+        state.mid_price = 100.0
+        runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 10.0)
+        client = DummyClient(state, runtime)
+
+        market_maker.publish_latest_order_command(
+            state,
+            market_maker.OrderCommand(
+                kind="quote",
+                side="BUY",
+                reduce_only=False,
+                price=99.0,
+                quantity=2.0,
+                formatted_price="99.0",
+                formatted_quantity="2.000",
+                order_notional=198.0,
+                trigger="startup",
+            ),
+        )
+
+        await market_maker.order_manager_loop(state, client, "BTCUSDT", runtime)
+
+        assert len(client.placed) == 2
+        assert client.canceled == [101]
+        assert state.active_order_id == 102
+        assert state.last_order_price == 99.4
+
+    asyncio.run(runner())
+
+
+def test_opening_circuit_breaker_blocks_new_opening_quotes():
+    class DummyClient:
+        async def get_symbol_filters(self, symbol):
+            return {
+                "status": "TRADING",
+                "tick_size": 0.1,
+                "price_precision": 1,
+                "step_size": 0.001,
+                "quantity_precision": 3,
+                "min_qty": 0.001,
+                "min_notional": 5.0,
+            }
+
+    async def runner():
+        state = market_maker.StrategyState(flip_mode=False)
+        state.price_ws_connected = True
+        state.user_data_ws_connected = True
+        state.account_balance = 1000.0
+        state.balance_last_updated = 1.0
+        state.mid_price = 100.0
+        state.bid_price = 99.9
+        state.ask_price = 100.1
+        runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 10.0)
+        runtime.price_last_updated = 10.0
+        state.opening_circuit_breaker_until = 20.0
+        state.quote_params = {"buy_spread": 0.006, "sell_spread": 0.006, "source": "default"}
+
+        task = asyncio.create_task(market_maker.market_making_loop(state, DummyClient(), "BTCUSDT", runtime))
+        market_maker.request_quote_refresh(state)
+        await asyncio.sleep(0.05)
+
+        runtime.request_shutdown()
+        market_maker.request_quote_refresh(state)
+        await task
+
+        assert state.order_commands.empty()
 
     asyncio.run(runner())
 

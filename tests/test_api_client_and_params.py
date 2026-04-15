@@ -50,6 +50,7 @@ def test_get_symbol_filters_exposes_min_qty():
             "symbols": [
                 {
                     "symbol": "BTCUSDT",
+                    "status": "TRADING",
                     "filters": [
                         {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
                         {"filterType": "LOT_SIZE", "stepSize": "0.005", "minQty": "0.015"},
@@ -64,6 +65,7 @@ def test_get_symbol_filters_exposes_min_qty():
 
     assert filters["step_size"] == 0.005
     assert filters["min_qty"] == 0.015
+    assert filters["status"] == "TRADING"
 
 
 def test_resolve_symbol_prefers_cli_then_env(monkeypatch):
@@ -167,6 +169,19 @@ def test_market_maker_loads_generated_avellaneda_params(monkeypatch, tmp_path):
     assert params["source"] == "avellaneda_parameters_BTC.json"
     assert params["k_buy"] == 2.0
     assert params["k_sell"] == 3.0
+
+
+def test_market_maker_disables_quoting_when_dynamic_params_are_missing(monkeypatch, tmp_path):
+    params_dir = tmp_path / "params"
+    params_dir.mkdir()
+
+    monkeypatch.setattr(market_maker, "PARAMS_DIR", str(params_dir))
+    monkeypatch.setattr(market_maker, "USE_AVELLANEDA_SPREADS", True)
+    market_maker._SPREAD_CACHE.clear()
+
+    params = market_maker.get_avellaneda_params("BTCUSDT")
+
+    assert params["source"] == "unavailable"
 
 
 def test_calculate_vwap_uses_true_execution_price():

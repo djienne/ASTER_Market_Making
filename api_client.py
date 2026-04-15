@@ -153,6 +153,7 @@ class ApiClient:
                 min_qty_str = lot_size_filter.get('minQty', step_size_str)
                 quantity_precision = len(step_size_str.split('.')[1].rstrip('0')) if '.' in step_size_str else 0
                 return {
+                    'status': sym_data.get('status', 'UNKNOWN'),
                     'price_precision': price_precision,
                     'tick_size': float(tick_size_str),
                     'quantity_precision': quantity_precision,
