@@ -21,8 +21,6 @@ load_dotenv()
 API_USER = os.getenv('API_USER')
 API_SIGNER = os.getenv('API_SIGNER')
 API_PRIVATE_KEY = os.getenv('API_PRIVATE_KEY')
-APIV1_PUBLIC_KEY = os.getenv('APIV1_PUBLIC_KEY')
-APIV1_PRIVATE_KEY = os.getenv('APIV1_PRIVATE_KEY')
 
 async def test_listen_key():
     """Test getting a listen key."""
@@ -30,11 +28,11 @@ async def test_listen_key():
 
     # Check environment variables
     print(f"API_USER: {API_USER[:10] if API_USER else 'None'}...")
-    print(f"APIV1_PUBLIC_KEY: {APIV1_PUBLIC_KEY[:10] if APIV1_PUBLIC_KEY else 'None'}...")
-    print(f"APIV1_PRIVATE_KEY: {APIV1_PRIVATE_KEY[:10] if APIV1_PRIVATE_KEY else 'None'}...")
+    print(f"API_SIGNER: {API_SIGNER[:10] if API_SIGNER else 'None'}...")
+    print(f"API_PRIVATE_KEY: {API_PRIVATE_KEY[:10] if API_PRIVATE_KEY else 'None'}...")
 
-    if not all([APIV1_PUBLIC_KEY, APIV1_PRIVATE_KEY]):
-        print("❌ Missing APIV1 keys!")
+    if not all([API_USER, API_SIGNER, API_PRIVATE_KEY]):
+        print("❌ Missing Pro API V3 credentials!")
         return
 
     try:
@@ -42,14 +40,7 @@ async def test_listen_key():
 
         async with client:
             print("📡 Attempting to get listen key...")
-            response = await client.signed_request(
-                "POST",
-                "/fapi/v1/listenKey",
-                {},
-                use_binance_auth=True,
-                api_key=APIV1_PUBLIC_KEY,
-                api_secret=APIV1_PRIVATE_KEY
-            )
+            response = await client.create_listen_key()
 
             listen_key = response.get('listenKey')
             if listen_key:
@@ -64,3 +55,4 @@ async def test_listen_key():
 
 if __name__ == "__main__":
     asyncio.run(test_listen_key())
+

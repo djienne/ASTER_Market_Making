@@ -18,8 +18,6 @@ load_dotenv()
 API_USER = os.getenv('API_USER')
 API_SIGNER = os.getenv('API_SIGNER')
 API_PRIVATE_KEY = os.getenv('API_PRIVATE_KEY')
-APIV1_PUBLIC_KEY = os.getenv('APIV1_PUBLIC_KEY')
-APIV1_PRIVATE_KEY = os.getenv('APIV1_PRIVATE_KEY')
 
 class UserDataStream:
     def __init__(self):
@@ -33,12 +31,7 @@ class UserDataStream:
         try:
             async with self.api_client as client:
                 response = await client.signed_request(
-                    "POST",
-                    "/fapi/v1/listenKey",
-                    {},
-                    use_binance_auth=True,
-                    api_key=APIV1_PUBLIC_KEY,
-                    api_secret=APIV1_PRIVATE_KEY
+                    "POST", "/fapi/v3/listenKey", {}
                 )
                 self.listen_key = response.get('listenKey')
                 print(f"[INFO] Listen key obtained: {self.listen_key[:20]}...")
@@ -119,8 +112,8 @@ async def main():
     print("="*50)
 
     # Validate credentials
-    if not all([APIV1_PUBLIC_KEY, APIV1_PRIVATE_KEY]):
-        print("[ERROR] Missing APIV1_PUBLIC_KEY or APIV1_PRIVATE_KEY in .env file")
+    if not all([API_USER, API_SIGNER, API_PRIVATE_KEY]):
+        print("[ERROR] Missing API_USER, API_SIGNER, or API_PRIVATE_KEY in .env file")
         return
 
     print("[INFO] Credentials found")
@@ -135,3 +128,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

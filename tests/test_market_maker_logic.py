@@ -575,7 +575,7 @@ def test_user_data_idle_timeout_does_not_reconnect(monkeypatch):
         def __init__(self):
             self.listen_key_requests = 0
 
-        async def signed_request(self, method, endpoint, params, use_binance_auth=False, api_key=None, api_secret=None):
+        async def create_listen_key(self):
             self.listen_key_requests += 1
             return {"listenKey": "dummy-listen-key"}
 
@@ -609,8 +609,6 @@ def test_user_data_idle_timeout_does_not_reconnect(monkeypatch):
     client = DummyClient()
     runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 61.0)
 
-    monkeypatch.setenv("APIV1_PUBLIC_KEY", "public")
-    monkeypatch.setenv("APIV1_PRIVATE_KEY", "private")
     monkeypatch.setattr(market_maker, "keepalive_balance_listen_key", fake_keepalive)
     monkeypatch.setattr(market_maker.websockets, "connect", lambda *args, **kwargs: DummyConnection(DummyWebSocket()))
     monkeypatch.setattr(market_maker.asyncio, "wait_for", fake_wait_for)

@@ -1204,12 +1204,12 @@ async def run_dashboard(args: argparse.Namespace) -> None:
     api_user = os.getenv("API_USER")
     api_signer = os.getenv("API_SIGNER")
     api_private_key = os.getenv("API_PRIVATE_KEY")
-    apiv1_public = os.getenv("APIV1_PUBLIC_KEY")
-    apiv1_private = os.getenv("APIV1_PRIVATE_KEY")
+    spot_api_key = os.getenv("SPOT_API_KEY")
+    spot_api_secret = os.getenv("SPOT_API_SECRET")
 
-    if not all([api_user, api_signer, api_private_key, apiv1_public, apiv1_private]):
+    if not all([api_user, api_signer, api_private_key]):
         print("ERROR: Missing required environment variables")
-        print("Required: API_USER, API_SIGNER, API_PRIVATE_KEY, APIV1_PUBLIC_KEY, APIV1_PRIVATE_KEY")
+        print("Required: API_USER, API_SIGNER, API_PRIVATE_KEY")
         return
 
     credentials = {
@@ -1218,14 +1218,16 @@ async def run_dashboard(args: argparse.Namespace) -> None:
         "api_private_key": api_private_key,
     }
 
-    spot_fetcher = SpotBalanceFetcher(
-        apiv1_public,
-        apiv1_private,
-        base_asset=SPOT_BASE_ASSET,
-        usd_rate=SPOT_USD_RATE,
-        min_total=SPOT_MIN_TOTAL,
-        show_zero=False,
-    )
+    spot_fetcher = None
+    if spot_api_key and spot_api_secret:
+        spot_fetcher = SpotBalanceFetcher(
+            spot_api_key,
+            spot_api_secret,
+            base_asset=SPOT_BASE_ASSET,
+            usd_rate=SPOT_USD_RATE,
+            min_total=SPOT_MIN_TOTAL,
+            show_zero=False,
+        )
 
     dashboard = TerminalDashboard(
         credentials,
@@ -1237,14 +1239,7 @@ async def run_dashboard(args: argparse.Namespace) -> None:
     async with ApiClient(api_user, api_signer, api_private_key) as client:
         snapshot = await client.signed_request("GET", "/fapi/v3/account", {})
         dashboard.update_from_snapshot(snapshot)
-        response = await client.signed_request(
-            "POST",
-            "/fapi/v1/listenKey",
-            {},
-            use_binance_auth=True,
-            api_key=apiv1_public,
-            api_secret=apiv1_private,
-        )
+        response = await client.create_listen_key()
         listen_key = response.get("listenKey")
         if not listen_key:
             print("ERROR: Failed to retrieve listenKey from API response")

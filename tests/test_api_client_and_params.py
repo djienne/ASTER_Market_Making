@@ -14,7 +14,7 @@ def make_client():
     return ApiClient(
         "0x0000000000000000000000000000000000000001",
         "0x0000000000000000000000000000000000000002",
-        "0xdeadbeef",
+        "0x" + ("11" * 32),
     )
 
 
@@ -22,17 +22,15 @@ def test_prepare_request_does_not_mutate_input_params():
     client = make_client()
     params = {"symbol": "BTCUSDT"}
 
-    request_params, headers = client._prepare_request(
-        params,
-        use_binance_auth=True,
-        api_key="public",
-        api_secret="secret",
-    )
+    request_params, headers = client._prepare_request(params)
 
     assert params == {"symbol": "BTCUSDT"}
     assert request_params["symbol"] == "BTCUSDT"
-    assert "timestamp" in request_params
-    assert headers["X-MBX-APIKEY"] == "public"
+    assert "nonce" in request_params
+    assert request_params["user"] == client.api_user
+    assert request_params["signer"] == client.api_signer
+    assert "signature" in request_params
+    assert headers["Content-Type"] == "application/x-www-form-urlencoded"
 
 
 def test_api_client_has_default_http_timeout():

@@ -33,6 +33,7 @@ BALANCE_REPORT_INTERVAL = 60    # How often to report account balance to termina
 POSITION_SYNC_TIMEOUT = 2.0     # How long to wait for a position snapshot after a fill.
 STARTUP_CLEANUP_TIMEOUT = 20.0  # How long to wait for the initial cancel-all cleanup.
 CANCEL_CONFIRM_TIMEOUT = 5.0    # How long to wait for a terminal update after canceling a timed-out order.
+WEBSOCKET_MAX_CONNECTION_AGE = 23 * 60 * 60  # Rotate websocket connections before the documented 24h server limit.
 
 # ORDER REUSE SETTINGS
 DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001  # 1 bp minimum price change to cancel and replace order
@@ -469,10 +470,15 @@ async def websocket_price_updater(state, symbol, runtime):
                 state.price_ws_connected = True # Mark as connected
                 request_quote_refresh(state)
                 reconnect_delay = 5  # Reset reconnect delay on successful connection
+                connected_at = runtime.now()
                 last_message_time = runtime.now()
 
                 while not runtime.shutdown_requested:
                     try:
+                        if runtime.now() - connected_at >= WEBSOCKET_MAX_CONNECTION_AGE:
+                            log.info("Price WebSocket reached its max safe lifetime. Reconnecting proactively.")
+                            break
+
                         # [MODIFIED] Wait for a message with a timeout to detect stale connections
                         message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
                         last_message_time = runtime.now()
@@ -551,8 +557,6 @@ def is_balance_data_valid(state):
 async def keepalive_balance_listen_key(state, client, runtime):
     """Periodically send keepalive for balance listen key."""
     log = logging.getLogger('BalanceKeepalive')
-    apiv1_public = os.getenv('APIV1_PUBLIC_KEY')
-    apiv1_private = os.getenv('APIV1_PRIVATE_KEY')
 
     while not runtime.shutdown_requested and state.balance_listen_key:
         try:
@@ -563,12 +567,7 @@ async def keepalive_balance_listen_key(state, client, runtime):
                 break
 
             log.info("Sending keepalive for balance listen key...")
-            await client.signed_request(
-                "PUT", "/fapi/v1/listenKey", {},
-                use_binance_auth=True,
-                api_key=apiv1_public,
-                api_secret=apiv1_private
-            )
+            await client.keepalive_listen_key()
             log.info("Balance listen key keepalive sent successfully")
 
         except asyncio.CancelledError:
@@ -592,20 +591,8 @@ async def websocket_user_data_updater(state, client, symbol, runtime):
             log.info("Getting listen key for user data stream...")
             state.user_data_ws_connected = False # Mark as disconnected
             request_quote_refresh(state)
-            apiv1_public = os.getenv('APIV1_PUBLIC_KEY')
-            apiv1_private = os.getenv('APIV1_PRIVATE_KEY')
 
-            if not all([apiv1_public, apiv1_private]):
-                log.error("Missing APIV1_PUBLIC_KEY or APIV1_PRIVATE_KEY for user data stream.")
-                await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
-                continue
-
-            response = await client.signed_request(
-                "POST", "/fapi/v1/listenKey", {},
-                use_binance_auth=True,
-                api_key=apiv1_public,
-                api_secret=apiv1_private
-            )
+            response = await client.create_listen_key()
             state.balance_listen_key = response['listenKey']
             log.info(f"User data listen key obtained: {state.balance_listen_key[:20]}...")
 
@@ -624,9 +611,14 @@ async def websocket_user_data_updater(state, client, symbol, runtime):
                 state.user_data_ws_connected = True # Mark as connected
                 request_quote_refresh(state)
                 reconnect_delay = 5  # Reset reconnect delay on successful connection
+                connected_at = runtime.now()
 
                 while not runtime.shutdown_requested:
                     try:
+                        if runtime.now() - connected_at >= WEBSOCKET_MAX_CONNECTION_AGE:
+                            log.info("User data WebSocket reached its max safe lifetime. Reconnecting proactively.")
+                            break
+
                         # Wait for a message with a timeout to detect stale connections
                         message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
 

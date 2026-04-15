@@ -1,14 +1,14 @@
-import hashlib
-import hmac
 import json
 import math
 import time
 import urllib.parse
 
 import aiohttp
-from eth_abi import encode
 from eth_account import Account
-from eth_account.messages import encode_defunct
+try:
+    from eth_account.messages import encode_typed_data as _encode_typed_message
+except ImportError:  # pragma: no cover - compatibility path
+    from eth_account.messages import encode_structured_data as _encode_typed_message
 from web3 import Web3
 
 
@@ -57,57 +57,55 @@ class ApiClient:
             await self.session.close()
 
     def _sign(self, params):
-        """Sign request params using the Ethereum signature method."""
+        """Sign request params using the official Pro API V3 typed-data signature flow."""
         nonce = math.trunc(time.time() * 1000000)
         my_dict = {k: v for k, v in params.items() if v is not None}
-        my_dict["recvWindow"] = 50000
-        my_dict["timestamp"] = int(round(time.time() * 1000))
-
+        my_dict["nonce"] = str(nonce)
+        my_dict["user"] = self.api_user
+        my_dict["signer"] = self.api_signer
         _trim_dict(my_dict)
-        json_str = json.dumps(my_dict, sort_keys=True).replace(' ', '').replace("'", '"')
+        payload = urllib.parse.urlencode(my_dict)
 
-        encoded = encode(['string', 'address', 'address', 'uint256'], [json_str, self.api_user, self.api_signer, nonce])
-        keccak_hex = Web3.keccak(encoded).hex()
+        typed_data = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "Message": [
+                    {"name": "msg", "type": "string"},
+                ],
+            },
+            "primaryType": "Message",
+            "domain": {
+                "name": "AsterSignTransaction",
+                "version": "1",
+                "chainId": 1666,
+                "verifyingContract": "0x0000000000000000000000000000000000000000",
+            },
+            "message": {"msg": payload},
+        }
+        try:
+            signable_msg = _encode_typed_message(full_message=typed_data)
+        except TypeError:
+            signable_msg = _encode_typed_message(typed_data)
+        signed_message = Account.sign_message(signable_msg, private_key=self.api_private_key)
 
-        signable_msg = encode_defunct(hexstr=keccak_hex)
-        signed_message = Account.sign_message(signable_message=signable_msg, private_key=self.api_private_key)
-
-        my_dict['nonce'] = nonce
-        my_dict['user'] = self.api_user
-        my_dict['signer'] = self.api_signer
-        my_dict['signature'] = '0x' + signed_message.signature.hex()
+        my_dict['signature'] = signed_message.signature.hex()
         return my_dict
 
-    def _build_headers(self, api_key=None):
-        headers = {
+    def _build_headers(self):
+        return {
             'Content-Type': 'application/x-www-form-urlencoded',
             'User-Agent': 'PythonApp/1.0',
         }
-        if api_key:
-            headers['X-MBX-APIKEY'] = api_key
-        return headers
 
-    def _build_hmac_request_params(self, params: dict, api_secret: str) -> dict:
-        request_params = dict(params)
-        request_params['timestamp'] = int(time.time() * 1000)
-        request_params['recvWindow'] = 5000
-
-        query_string = urllib.parse.urlencode(sorted(request_params.items()))
-        request_params['signature'] = hmac.new(
-            api_secret.encode('utf-8'),
-            query_string.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        return request_params
-
-    def _prepare_request(self, params: dict = None, use_binance_auth=False, api_key=None, api_secret=None):
+    def _prepare_request(self, params: dict = None):
         clean_params = dict(params or {})
-        if use_binance_auth and api_key and api_secret:
-            request_params = self._build_hmac_request_params(clean_params, api_secret)
-            headers = self._build_headers(api_key=api_key)
-        else:
-            request_params = self._sign(clean_params)
-            headers = self._build_headers()
+        request_params = self._sign(clean_params)
+        headers = self._build_headers()
         return request_params, headers
 
     async def _request_json(self, method: str, url: str, request_params: dict, headers: dict):
@@ -163,15 +161,10 @@ class ApiClient:
                 }
         raise ValueError(f"Could not find filters for symbol '{symbol}'.")
 
-    async def signed_request(self, method: str, endpoint: str, params: dict = None, use_binance_auth=False, api_key=None, api_secret=None):
-        """Generic method for making signed requests to the API."""
+    async def signed_request(self, method: str, endpoint: str, params: dict = None):
+        """Generic method for making signed requests to the Pro API V3."""
         url = f"{self.base_url}{endpoint}"
-        request_params, headers = self._prepare_request(
-            params,
-            use_binance_auth=use_binance_auth,
-            api_key=api_key,
-            api_secret=api_secret,
-        )
+        request_params, headers = self._prepare_request(params)
         return await self._request_json(method, url, request_params, headers)
 
     async def place_order(self, symbol, price, quantity, side, reduce_only=False):
@@ -215,3 +208,15 @@ class ApiClient:
         """Change the initial leverage for a symbol."""
         params = {"symbol": symbol, "leverage": leverage}
         return await self.signed_request("POST", "/fapi/v3/leverage", params)
+
+    async def create_listen_key(self):
+        """Create or extend a Pro API V3 user-data listen key."""
+        return await self.signed_request("POST", "/fapi/v3/listenKey", {})
+
+    async def keepalive_listen_key(self):
+        """Keep a Pro API V3 user-data listen key alive."""
+        return await self.signed_request("PUT", "/fapi/v3/listenKey", {})
+
+    async def close_listen_key(self):
+        """Close a Pro API V3 user-data listen key."""
+        return await self.signed_request("DELETE", "/fapi/v3/listenKey", {})

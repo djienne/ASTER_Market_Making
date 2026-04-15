@@ -33,10 +33,6 @@ API_USER = os.getenv('API_USER')
 API_SIGNER = os.getenv('API_SIGNER')
 API_PRIVATE_KEY = os.getenv('API_PRIVATE_KEY')
 
-# Binance-style API keys for USER_STREAM endpoints
-APIV1_PUBLIC_KEY = os.getenv('APIV1_PUBLIC_KEY')
-APIV1_PRIVATE_KEY = os.getenv('APIV1_PRIVATE_KEY')
-
 class UserDataStream:
     def __init__(self):
         self.api_client = ApiClient(API_USER, API_SIGNER, API_PRIVATE_KEY)
@@ -48,17 +44,8 @@ class UserDataStream:
         """Get a listen key for the user data stream."""
         try:
             async with self.api_client as client:
-                # Enable debug mode to see detailed error
                 client.release_mode = False
-                # Use Binance-style HMAC authentication for USER_STREAM endpoints
-                response = await client.signed_request(
-                    "POST",
-                    "/fapi/v1/listenKey",
-                    {},
-                    use_binance_auth=True,
-                    api_key=APIV1_PUBLIC_KEY,
-                    api_secret=APIV1_PRIVATE_KEY
-                )
+                response = await client.create_listen_key()
                 self.listen_key = response.get('listenKey')
                 print(f"🔑 Listen key obtained: {self.listen_key[:20]}...")
                 return self.listen_key
@@ -79,14 +66,7 @@ class UserDataStream:
         """Extend the listen key validity by 60 minutes."""
         try:
             async with self.api_client as client:
-                await client.signed_request(
-                    "PUT",
-                    "/fapi/v1/listenKey",
-                    {},
-                    use_binance_auth=True,
-                    api_key=APIV1_PUBLIC_KEY,
-                    api_secret=APIV1_PRIVATE_KEY
-                )
+                await client.keepalive_listen_key()
                 print(f"🔄 Listen key keepalive sent at {datetime.now().strftime('%H:%M:%S')}")
         except Exception as e:
             print(f"❌ Error keeping listen key alive: {e}")
@@ -95,14 +75,7 @@ class UserDataStream:
         """Close the user data stream."""
         try:
             async with self.api_client as client:
-                await client.signed_request(
-                    "DELETE",
-                    "/fapi/v1/listenKey",
-                    {},
-                    use_binance_auth=True,
-                    api_key=APIV1_PUBLIC_KEY,
-                    api_secret=APIV1_PRIVATE_KEY
-                )
+                await client.close_listen_key()
                 print("🔒 Listen key closed")
         except Exception as e:
             print(f"❌ Error closing listen key: {e}")
@@ -365,9 +338,9 @@ async def main():
         print("Please ensure API_USER, API_SIGNER, and API_PRIVATE_KEY are set in your .env file")
         return
 
-    if not all([APIV1_PUBLIC_KEY, APIV1_PRIVATE_KEY]):
-        print("❌ Missing required Binance-style API keys!")
-        print("Please ensure APIV1_PUBLIC_KEY and APIV1_PRIVATE_KEY are set in your .env file")
+    if not all([API_USER, API_SIGNER, API_PRIVATE_KEY]):
+        print("❌ Missing required Pro API V3 credentials!")
+        print("Please ensure API_USER, API_SIGNER, and API_PRIVATE_KEY are set in your .env file")
         return
 
     print("✅ All credentials found")
@@ -379,3 +352,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+

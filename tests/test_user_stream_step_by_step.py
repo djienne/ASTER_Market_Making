@@ -23,8 +23,6 @@ load_dotenv()
 API_USER = os.getenv('API_USER')
 API_SIGNER = os.getenv('API_SIGNER')
 API_PRIVATE_KEY = os.getenv('API_PRIVATE_KEY')
-APIV1_PUBLIC_KEY = os.getenv('APIV1_PUBLIC_KEY')
-APIV1_PRIVATE_KEY = os.getenv('APIV1_PRIVATE_KEY')
 
 async def step_by_step_test():
     """Test each step individually."""
@@ -37,12 +35,7 @@ async def step_by_step_test():
         client = ApiClient(API_USER, API_SIGNER, API_PRIVATE_KEY, release_mode=False)
         async with client:
             response = await client.signed_request(
-                "POST",
-                "/fapi/v1/listenKey",
-                {},
-                use_binance_auth=True,
-                api_key=APIV1_PUBLIC_KEY,
-                api_secret=APIV1_PRIVATE_KEY
+                "POST", "/fapi/v3/listenKey", {}
             )
             listen_key = response.get('listenKey')
             print(f"✅ Listen key: {listen_key[:20]}...")

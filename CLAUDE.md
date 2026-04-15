@@ -133,9 +133,7 @@ API_USER=0x...           # Main wallet address
 API_SIGNER=0x...         # API wallet address
 API_PRIVATE_KEY=0x...    # API wallet private key
 
-# API v1 (HMAC-style) - for user data streams
-APIV1_PUBLIC_KEY=...
-APIV1_PRIVATE_KEY=...
+# Pro API V3 user data streams use the same credentials above
 
 # Trading configuration
 SYMBOL=BNBUSDT          # Primary trading pair
@@ -284,3 +282,5 @@ All services share the `.env` file and automatically use the `SYMBOL` environmen
 4. **Insufficient data for GARCH**: Volatility estimation needs substantial historical data (hours to days)
 5. **Shared account interference**: Bot assumes exclusive control of account; manual trading creates position tracking issues
 6. **Parameter file timing**: Market maker reads parameter files on startup and every 10 minutes, not on every order
+
+

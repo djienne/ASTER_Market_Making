@@ -176,11 +176,9 @@ async def extended_demo():
     api_user = os.getenv('API_USER')
     api_signer = os.getenv('API_SIGNER')
     api_private_key = os.getenv('API_PRIVATE_KEY')
-    apiv1_public = os.getenv('APIV1_PUBLIC_KEY')
-    apiv1_private = os.getenv('APIV1_PRIVATE_KEY')
 
     if not all([apiv1_public, apiv1_private]):
-        print("ERROR: Missing APIV1_PUBLIC_KEY or APIV1_PRIVATE_KEY")
+        print("ERROR: Missing API_USER, API_SIGNER, or API_PRIVATE_KEY")
         return
 
     monitor = UserStreamMonitor()
@@ -191,10 +189,7 @@ async def extended_demo():
 
     async with client:
         response = await client.signed_request(
-            "POST", "/fapi/v1/listenKey", {},
-            use_binance_auth=True,
-            api_key=apiv1_public,
-            api_secret=apiv1_private
+            "POST", "/fapi/v3/listenKey", {}
         )
         listen_key = response['listenKey']
         print(f"   Listen key: {listen_key[:20]}...")

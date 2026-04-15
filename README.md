@@ -42,22 +42,22 @@ python market_maker.py --symbol BTCUSDT
 
 ### `.env`
 
-You need both Aster **Pro API** credentials for trading and Aster **API** credentials for user-data streams:
+You now only need Aster **Pro API V3** credentials. The same credential set is used for trading, account/user-data REST calls, and user-data listen-key management.
 
 ![API Management](APIs.png)
 
 ```bash
-# API V3 (Ethereum-style) - trading operations
+# Pro API V3
 API_USER=0x...
 API_SIGNER=0x...
 API_PRIVATE_KEY=0x...
 
-# API V1 (HMAC-style) - user data streams
-APIV1_PUBLIC_KEY=...
-APIV1_PRIVATE_KEY=...
-
 # Default symbol used when CLI args do not override it
 SYMBOL=BTCUSDT
+
+# Optional: only for the terminal dashboard's spot balance widget
+# SPOT_API_KEY=...
+# SPOT_API_SECRET=...
 ```
 
 <img src="infos_API_p1.png" alt="Info API 1" width="600"/>
@@ -70,6 +70,7 @@ SYMBOL=BTCUSDT
 - `calculate_avellaneda_parameters.py` defaults to the base ticker derived from `.env` `SYMBOL` after stripping common stablecoin quotes like `USDT`, `USDC`, `USDF`, `USD1`, and `USD`.
 - The local analytics loader accepts either a base ticker like `BTC` or a full symbol like `BTCUSDT`, then resolves the matching local trades/orderbook data using the available quote-suffix files.
 - `find_trend.py` defaults to `.env` `SYMBOL`, or `BTCUSDT`, and writes its params file using the same base-symbol normalization.
+- The live trading bot and user-data stream both use Pro API V3 signer-based auth; there is no longer a separate `APIV1_*` credential requirement in this repo.
 
 ## Main Strategy Parameters
 
