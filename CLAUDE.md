@@ -199,7 +199,7 @@ Use scripts in `tests/` directory:
    filters = await client.get_symbol_filters('ETHUSDT')
    print(filters)  # Shows price_precision, quantity_precision, tick_size, etc.
    ```
-4. Monitor order reuse logic: orders are reused if price change < `DEFAULT_PRICE_CHANGE_THRESHOLD` (0.1%)
+4. Monitor order reuse logic: orders are reused if price change < `DEFAULT_PRICE_CHANGE_THRESHOLD`
 
 ## Data Storage Structure
 

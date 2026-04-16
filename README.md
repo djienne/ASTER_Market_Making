@@ -106,7 +106,7 @@ BALANCE_REPORT_INTERVAL = 60
 USE_SUPERTREND_SIGNAL = True
 SUPERTREND_CHECK_INTERVAL = 600
 
-DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001  # 1 bp
+DEFAULT_PRICE_CHANGE_THRESHOLD_BPS = 5.0
 CANCEL_SPECIFIC_ORDER = True
 
 RELEASE_MODE = env_flag("RELEASE_MODE", True)
@@ -116,7 +116,7 @@ Important notes:
 - `DEFAULT_BALANCE_FRACTION` currently sizes from tracked wallet balances (`walletBalance` from account snapshots / user stream), not `availableBalance`.
 - `POSITION_THRESHOLD_USD` controls when a position is treated as significant for bias/mode logic, but the bot still tries to flatten any non-zero BTC position before opening fresh inventory.
 - Positions that round below exchange `minQty` or `minNotional` cannot be reduced automatically and will block new openings until they are cleared.
-- `DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001` means the bot tries not to refresh an order unless the intended price moves by at least 1 basis point.
+- `DEFAULT_PRICE_CHANGE_THRESHOLD_BPS` is the single source of truth for the minimum price move required before an order is canceled and replaced.
 - `ORDER_REFRESH_INTERVAL = 60` is now a safety lifetime for a working order; normal re-quoting is event-driven from best bid/ask WebSocket changes.
 - If `USE_AVELLANEDA_SPREADS = True`, the bot will not place limit orders until a valid Avellaneda params file exists; it stays idle instead of falling back to static spreads when historical data is still insufficient.
 - The Avellaneda calculator clamps each side's computed spread to configurable guardrails in `config.json -> avellaneda_calculation.spread_limits_bps` (default `5` to `200` bps), prints warnings when clamping happens, and the live bot enforces the same saved limits when building dynamic quotes.

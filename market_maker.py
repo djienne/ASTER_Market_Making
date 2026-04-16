@@ -47,7 +47,8 @@ CANCEL_CONFIRM_TIMEOUT = 5.0    # How long to wait for a terminal update after c
 WEBSOCKET_MAX_CONNECTION_AGE = 23 * 60 * 60  # Rotate websocket connections before the documented 24h server limit.
 
 # ORDER REUSE SETTINGS
-DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001  # 1 bp minimum price change to cancel and replace order
+DEFAULT_PRICE_CHANGE_THRESHOLD_BPS = 5.0  # Minimum price move required before replacing an order
+DEFAULT_PRICE_CHANGE_THRESHOLD = DEFAULT_PRICE_CHANGE_THRESHOLD_BPS / 10000.0
 OPENING_CAPITAL_BUFFER_MULTIPLIER = 1.25  # Safety headroom above the exchange minimum for opening orders.
 ORDER_FAILURE_WINDOW_SECONDS = 60.0
 ORDER_FAILURE_LIMIT = 3
