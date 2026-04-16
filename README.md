@@ -7,6 +7,10 @@ The main strategy combines:
 - SuperTrend directional bias
 - WebSocket-based price, balance, and order monitoring
 
+This is not a conventional two-sided market maker quoting bid and ask simultaneously. The current trading logic is one-sided at a time:
+- when flat, it quotes only on the current bias side to open inventory
+- once inventory exists, it quotes only the reducing side until that inventory is flattened
+
 Referral link: [https://www.asterdex.com/en/referral/164f81](https://www.asterdex.com/en/referral/164f81)
 
 ## Operating Assumptions
@@ -71,6 +75,7 @@ SYMBOL=BTCUSDT
 - The local analytics loader accepts either a base ticker like `BTC` or a full symbol like `BTCUSDT`, then resolves the matching local trades/orderbook data using the available quote-suffix files.
 - `find_trend.py` defaults to `.env` `SYMBOL`, or `BTCUSDT`, and writes its params file using the same base-symbol normalization.
 - The live trading bot and user-data stream both use Pro API V3 signer-based auth; there is no longer a separate `APIV1_*` credential requirement in this repo.
+- `data_collector.py` currently stores partial order book snapshots from the top `N` levels (`@depth5/@depth10/@depth20` style streams), not a fully reconstructed local order book from diff-depth updates.
 
 ## Main Strategy Parameters
 
@@ -142,22 +147,20 @@ python terminal_dashboard.py
 
 ## Docker
 
-The repository currently ships with only `data-collector` enabled in [docker-compose.yml](docker-compose.yml).
-
-Commented service templates are included for:
-- `avellaneda-params`
-- `market-maker`
-- `trend-finder`
-
-You need to uncomment those service blocks before starting them through Compose.
+The Compose stack now supports the full automated loop in [docker-compose.yml](docker-compose.yml):
+- `data-collector` gathers market data for `.env` `SYMBOL`
+- `avellaneda-params` retries parameter generation every 5 minutes
+- `trend-finder` refreshes the Supertrend file every 5 minutes
+- `market-maker` starts immediately but stays idle until valid Avellaneda quotes become available
 
 ```bash
 docker-compose build
 docker-compose up -d
-docker-compose up -d data-collector
-docker-compose logs -f data-collector
+docker-compose logs -f data-collector avellaneda-params trend-finder market-maker
 docker-compose down
 ```
+
+For `SYMBOL=BTCUSDT`, the automated stack will not quote immediately on a fresh machine. It will first collect BTC data, then `avellaneda-params` will keep retrying until there is enough continuous history to write a valid `params/avellaneda_parameters_BTC.json`. Once that file exists, the running market maker can begin quoting automatically.
 
 ## Testing
 

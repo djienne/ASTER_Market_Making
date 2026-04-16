@@ -13,6 +13,7 @@ from utils import (
     get_fallback_tick_size,
     load_and_process_orderbook_data,
     load_trades_data,
+    normalize_symbol_base,
     parse_arguments,
     resolve_trades_csv_path,
     save_avellaneda_params_atomic,
@@ -273,7 +274,7 @@ def main():
     config_params = config['avellaneda_calculation']
 
     args = parse_arguments()
-    ticker = args.ticker
+    ticker = normalize_symbol_base(args.ticker)
     window_minutes = args.minutes
     ma_window = get_ma_window(window_minutes, config)
     recent_param_periods = config_params['recent_param_periods']

@@ -39,7 +39,7 @@ class WebSocketDataCollector:
 
         # Data buffers
         self.prices_buffer = {}  # symbol -> deque of price records (bid/ask/mid)
-        self.orderbook_buffer = {}  # symbol -> deque of full order book records
+        self.orderbook_buffer = {}  # symbol -> deque of partial order book snapshots
         self.trades_buffer = {}  # symbol -> deque of trade records
         self.seen_trade_ids = {}  # symbol -> set of seen trade IDs
 
@@ -115,7 +115,7 @@ class WebSocketDataCollector:
             return None
 
     def get_initial_orderbook_api(self, symbol):
-        """Get initial order book data via API to establish baseline."""
+        """Get an initial partial order book snapshot via REST to establish baseline."""
         endpoint = f"{self.api_base_url}/fapi/v1/depth"
         params = {'symbol': symbol, 'limit': self.order_book_levels}
 
@@ -169,7 +169,7 @@ class WebSocketDataCollector:
             return []
 
     def on_depth_message(self, ws, message):
-        """Handle depth (order book) WebSocket messages."""
+        """Handle partial depth WebSocket messages."""
         try:
             data = json.loads(message)
 
@@ -203,12 +203,14 @@ class WebSocketDataCollector:
                             'mid': mid
                         }
 
-                        # Store full order book data
+                        # Store partial order book data from the top N levels only
                         orderbook_record = {
                             'timestamp': timestamp,
                             'bids': processed_bids,
                             'asks': processed_asks,
-                            'lastUpdateId': data.get('u')  # final update ID
+                            'lastUpdateId': data.get('u'),  # final update ID for this partial snapshot
+                            'bookMode': 'partial',
+                            'levels': self.order_book_levels,
                         }
 
                         with self.lock:
@@ -404,7 +406,7 @@ class WebSocketDataCollector:
 
     def flush_orderbook_buffer_to_parquet(self, symbol, force_archive=False):
         """
-        Flushes the order book buffer to a staging Parquet file.
+        Flushes the partial order book buffer to a staging Parquet file.
         If the buffer is full or if forced, archives the staging file.
         """
         if not self.orderbook_buffer[symbol]:
@@ -422,7 +424,7 @@ class WebSocketDataCollector:
         try:
             # Save to Parquet with ZSTD compression using the pyarrow engine
             df.to_parquet(staging_file_path, engine='pyarrow', compression='ZSTD')
-            print(f"Flushed {len(df)} order book records for {symbol} to {staging_file_path}")
+            print(f"Flushed {len(df)} partial order book records for {symbol} to {staging_file_path}")
             
             # Check if it's time to archive the file
             if force_archive or len(self.orderbook_buffer[symbol]) >= self.ORDERBOOK_BUFFER_SIZE_LIMIT:
@@ -432,12 +434,12 @@ class WebSocketDataCollector:
                 
                 # Clear the buffer now that it's been archived
                 self.orderbook_buffer[symbol].clear()
-                print(f"Archived {len(df)} order book records for {symbol} to {archive_file_path}")
+                print(f"Archived {len(df)} partial order book records for {symbol} to {archive_file_path}")
             else:
-                 print(f"Flushed {len(df)} records to staging file for {symbol}")
+                 print(f"Flushed {len(df)} partial order book records to staging file for {symbol}")
 
         except Exception as e:
-            print(f"Error flushing order book for {symbol} to Parquet: {e}")
+            print(f"Error flushing partial order book for {symbol} to Parquet: {e}")
 
     def flush_trades_buffer(self, symbol):
         """Flush trades buffer for a specific symbol."""
@@ -493,12 +495,12 @@ class WebSocketDataCollector:
                     self.prices_buffer[symbol].append(initial_price)
                 print(f"  Initial price: ${initial_price['mid']:.2f}")
 
-            # Get initial order book data
+            # Get initial partial order book data
             initial_orderbook = self.get_initial_orderbook_api(symbol)
             if initial_orderbook:
                 with self.lock:
                     self.orderbook_buffer[symbol].append(initial_orderbook)
-                print(f"  Initial order book: {len(initial_orderbook['bids'])} bids, {len(initial_orderbook['asks'])} asks")
+                print(f"  Initial partial order book: {len(initial_orderbook['bids'])} bids, {len(initial_orderbook['asks'])} asks")
 
             # Get initial trade data
             initial_trades = self.get_initial_trades_api(symbol)

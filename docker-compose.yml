@@ -1,4 +1,3 @@
-version: '3.8'
 networks:
   default:
     driver: bridge
@@ -8,9 +7,8 @@ networks:
 services:
   data-collector:
     build: .
+    image: aster_market_making:latest
     container_name: aster_data_collector
-    environment:
-      - RESTART_MINUTES=2
     env_file:
       - .env
     volumes:
@@ -19,61 +17,59 @@ services:
       # - Native: saves to ./ASTER_data/ relative to script location
       # - Docker: saves to /app/ASTER_data/ which maps back to ./ASTER_data/ on host
       - ./:/app/
-    command: >
-      sh -c "while true; do \
-        python data_collector.py; \
-        sleep ${RESTART_MINUTES}m; \
-      done"
+    command: python data_collector.py
     restart: unless-stopped
 
-  # avellaneda-params:
-  #   build: .
-  #   container_name: aster_avellaneda_params
-  #   environment:
-  #     - PARAM_REFRESH_MINUTES=10
-  #   env_file:
-  #     - .env
-  #   volumes:
-  #     - ./:/app/
-  #   command: >
-  #     sh -c "while true; do
-  #       python calculate_avellaneda_parameters.py $$SYMBOL --minutes $$PARAM_REFRESH_MINUTES;
-  #       sleep $${PARAM_REFRESH_MINUTES}m;
-  #     done"
-  #   restart: unless-stopped
+  avellaneda-params:
+    build: .
+    image: aster_market_making:latest
+    container_name: aster_avellaneda_params
+    environment:
+      - PARAM_REFRESH_MINUTES=5
+      - PARAM_WINDOW_MINUTES=5
+    env_file:
+      - .env
+    volumes:
+      - ./:/app/
+    command: >
+      sh -c "while true; do
+        python calculate_avellaneda_parameters.py ${SYMBOL} --minutes 5 || true;
+        sleep 5m;
+      done"
+    depends_on:
+      - data-collector
+    restart: unless-stopped
 
-  # market-maker:
-  #   build: .
-  #   container_name: aster_market_maker
-  #   environment:
-  #     - RESTART_MINUTES=2
-  #   env_file:
-  #     - .env
-  #   volumes:
-  #     - ./:/app/
-  #   command: >
-  #     sh -c "while true; do
-  #       python market_maker.py --symbol $$SYMBOL;
-  #       sleep $${RESTART_MINUTES}m;
-  #     done"
-  #   depends_on:
-  #     - data-collector
-  #     - avellaneda-params
-  #   restart: unless-stopped
+  market-maker:
+    build: .
+    image: aster_market_making:latest
+    container_name: aster_market_maker
+    env_file:
+      - .env
+    volumes:
+      - ./:/app/
+    command: >
+      sh -c "python market_maker.py --symbol ${SYMBOL}"
+    depends_on:
+      - data-collector
+      - avellaneda-params
+      - trend-finder
+    restart: unless-stopped
 
-  # trend-finder:
-  #   build: .
-  #   container_name: aster_trend_finder
-  #   environment:
-  #     - TREND_REFRESH_MINUTES=5
-  #     - TREND_INTERVAL=5m
-  #   env_file:
-  #     - .env
-  #   volumes:
-  #     - ./:/app/
-  #   command: >
-  #     sh -c "while true; do
-  #       python find_trend.py --symbol $$SYMBOL --interval $$TREND_INTERVAL;
-  #       sleep $${TREND_REFRESH_MINUTES}m;
-  #     done"
-  #   restart: unless-stopped
+  trend-finder:
+    build: .
+    image: aster_market_making:latest
+    container_name: aster_trend_finder
+    environment:
+      - TREND_REFRESH_MINUTES=5
+      - TREND_INTERVAL=5m
+    env_file:
+      - .env
+    volumes:
+      - ./:/app/
+    command: >
+      sh -c "while true; do
+        python find_trend.py --symbol ${SYMBOL} --interval 5m || true;
+        sleep 5m;
+      done"
+    restart: unless-stopped
