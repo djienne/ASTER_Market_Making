@@ -4,6 +4,10 @@
     "recent_param_periods": 10,
     "data_completeness_threshold": 0.90,
     "max_gap_seconds": 60,
+    "spread_limits_bps": {
+      "min": 5,
+      "max": 200
+    },
     "ma_window_config": {
       "short_period_threshold_minutes": 480,
       "medium_period_threshold_minutes": 1200,
@@ -16,6 +20,7 @@
     "recent_param_periods": "Number of recent periods to use for parameter calculation",
     "data_completeness_threshold": "Minimum fraction of data points required in a period (0.90 = 90%)",
     "max_gap_seconds": "Maximum allowed gap in seconds before considering data discontinuous",
+    "spread_limits_bps": "Clamp calculated Avellaneda bid/ask spreads to this basis-point range before saving or trading",
     "ma_window_config": "Moving average window sizes based on analysis period length"
   }
 }

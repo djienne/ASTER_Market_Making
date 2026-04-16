@@ -23,6 +23,43 @@ from volatility import calculate_volatility
 
 logging.getLogger('numba').setLevel(logging.WARNING)
 
+DEFAULT_MIN_SPREAD_BPS = 5.0
+DEFAULT_MAX_SPREAD_BPS = 200.0
+
+
+def normalize_spread_limits_bps(spread_limits) -> dict:
+    """Return validated spread guardrails in basis points."""
+    default_limits = {"min": DEFAULT_MIN_SPREAD_BPS, "max": DEFAULT_MAX_SPREAD_BPS}
+    if not isinstance(spread_limits, dict):
+        return default_limits
+
+    try:
+        min_bps = float(spread_limits.get("min", DEFAULT_MIN_SPREAD_BPS))
+        max_bps = float(spread_limits.get("max", DEFAULT_MAX_SPREAD_BPS))
+    except (TypeError, ValueError):
+        return default_limits
+
+    if not np.isfinite(min_bps) or not np.isfinite(max_bps) or min_bps < 0.0 or max_bps <= 0.0 or min_bps > max_bps:
+        return default_limits
+
+    return {"min": min_bps, "max": max_bps}
+
+
+def clamp_quote_spread_bps(raw_bps: float, side_label: str, spread_limits_bps: dict) -> tuple[float, str | None]:
+    """Clamp a computed quote spread to configured basis-point guardrails."""
+    min_bps = spread_limits_bps["min"]
+    max_bps = spread_limits_bps["max"]
+    clamped_bps = min(max(raw_bps, min_bps), max_bps)
+
+    if np.isclose(clamped_bps, raw_bps, rtol=0.0, atol=1e-12):
+        return clamped_bps, None
+
+    warning = (
+        f"WARNING: {side_label} spread {raw_bps:.2f} bps was outside the configured "
+        f"{min_bps:.2f}-{max_bps:.2f} bps range and was clamped to {clamped_bps:.2f} bps."
+    )
+    return clamped_bps, warning
+
 
 def load_config():
     """Load configuration from config.json."""
@@ -37,6 +74,10 @@ def load_config():
                 "recent_param_periods": 4,
                 "data_completeness_threshold": 0.90,
                 "max_gap_seconds": 60,
+                "spread_limits_bps": {
+                    "min": DEFAULT_MIN_SPREAD_BPS,
+                    "max": DEFAULT_MAX_SPREAD_BPS,
+                },
                 "ma_window_config": {
                     "short_period_threshold_minutes": 480,
                     "medium_period_threshold_minutes": 1200,
@@ -73,6 +114,7 @@ def calculate_final_quotes(
     window_minutes,
     garch_sigma,
     rolling_sigma,
+    spread_limits_bps,
     avg_backtest_pnl=None,
     total_buys=0,
     total_sells=0,
@@ -82,19 +124,31 @@ def calculate_final_quotes(
     """Calculate the final reservation price and quotes for the current state using asymmetric parameters."""
     s = mid_price_df['mid_price'].iloc[-1]
     q = 0
+    spread_limits_bps = normalize_spread_limits_bps(spread_limits_bps)
 
     risk_term = gamma * ((sigma * s) ** 2) * time_horizon
     log_term_buy = (1 / gamma) * np.log(1 + (gamma / k_buy))
-    delta_a = log_term_buy + (0.5 - q) * risk_term
+    raw_delta_a = log_term_buy + (0.5 - q) * risk_term
     log_term_sell = (1 / gamma) * np.log(1 + (gamma / k_sell))
-    delta_b = log_term_sell + (0.5 + q) * risk_term
+    raw_delta_b = log_term_sell + (0.5 + q) * risk_term
+    raw_delta_a_bps = (raw_delta_a / s) * 10000.0
+    raw_delta_b_bps = (raw_delta_b / s) * 10000.0
+    delta_a_bps, ask_warning = clamp_quote_spread_bps(raw_delta_a_bps, "Ask", spread_limits_bps)
+    delta_b_bps, bid_warning = clamp_quote_spread_bps(raw_delta_b_bps, "Bid", spread_limits_bps)
+    delta_a = s * (delta_a_bps / 10000.0)
+    delta_b = s * (delta_b_bps / 10000.0)
     r = s - q * risk_term
     r_a = s + delta_a
     r_b = s - delta_b
+    warnings = [warning for warning in (ask_warning, bid_warning) if warning]
 
     result = {
         "ticker": ticker,
         "timestamp": pd.Timestamp.now().isoformat(),
+        "spread_limits_bps": {
+            "min": float(spread_limits_bps["min"]),
+            "max": float(spread_limits_bps["max"]),
+        },
         "market_data": {
             "mid_price": float(s),
             "sigma": float(sigma),
@@ -113,10 +167,21 @@ def calculate_final_quotes(
             "bid_price": float(r_b),
             "delta_a": float(delta_a),
             "delta_b": float(delta_b),
+            "delta_a_bps": float(delta_a_bps),
+            "delta_b_bps": float(delta_b_bps),
             "delta_a_percent": (delta_a / s) * 100.0,
             "delta_b_percent": (delta_b / s) * 100.0,
+            "raw_ask_price": float(s + raw_delta_a),
+            "raw_bid_price": float(s - raw_delta_b),
+            "raw_delta_a": float(raw_delta_a),
+            "raw_delta_b": float(raw_delta_b),
+            "raw_delta_a_bps": float(raw_delta_a_bps),
+            "raw_delta_b_bps": float(raw_delta_b_bps),
         },
     }
+
+    if warnings:
+        result["warnings"] = warnings
 
     if avg_backtest_pnl is not None:
         result["backtest_performance"] = {
@@ -207,6 +272,10 @@ def build_summary_text(results: dict, periods: list, df=None, minutes_window=Non
     lines.append("")
     lines.append("Calculated Prices (for q=0):")
     lines.append(f"  Reservation Price: ${results['calculated_values']['reservation_price']:.4f}")
+    spread_limits_bps = normalize_spread_limits_bps(results.get("spread_limits_bps"))
+    lines.append(
+        f"  Configured Spread Guardrails: {spread_limits_bps['min']:.2f} to {spread_limits_bps['max']:.2f} bps"
+    )
 
     mid_price = results['market_data']['mid_price']
     ask_price = results['limit_orders']['ask_price']
@@ -215,6 +284,12 @@ def build_summary_text(results: dict, periods: list, df=None, minutes_window=Non
     bid_spread_bps = ((mid_price - bid_price) / mid_price) * 10000
     lines.append(f"  Ask Price: ${ask_price:.4f} ({ask_spread_bps:.2f} bps)")
     lines.append(f"  Bid Price: ${bid_price:.4f} ({bid_spread_bps:.2f} bps)")
+    warnings = results.get("warnings", [])
+    if warnings:
+        lines.append("")
+        lines.append("Warnings:")
+        for warning in warnings:
+            lines.append(f"  {warning}")
     lines.append("")
     lines.append("=" * 80)
     return "\n".join(lines)
@@ -411,6 +486,7 @@ def main():
         window_minutes,
         garch_sigma,
         rolling_sigma,
+        config_params.get("spread_limits_bps"),
         avg_backtest_pnl,
         total_buys,
         total_sells,

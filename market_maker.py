@@ -70,8 +70,8 @@ POSITION_SIZE_EPSILON = 1e-12
 # Spread configuration
 PARAMS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "params")
 AVELLANEDA_FILE_PREFIX = "avellaneda_parameters_"
-SPREAD_MIN_THRESHOLD = 0.00005  # 0.005%
-SPREAD_MAX_THRESHOLD = 0.02     # 2%
+DEFAULT_MIN_AVELLANEDA_SPREAD_BPS = 5.0
+DEFAULT_MAX_AVELLANEDA_SPREAD_BPS = 200.0
 SPREAD_CACHE_TTL_SECONDS = 10
 _SPREAD_CACHE = {}
 
@@ -912,6 +912,34 @@ def get_required_opening_balance(symbol_filters, reference_price):
     return safe_min_open_notional / DEFAULT_BALANCE_FRACTION
 
 
+def resolve_avellaneda_spread_limits_bps(params):
+    """Return validated Avellaneda spread guardrails from params or runtime defaults."""
+    default_limits = {
+        "min": DEFAULT_MIN_AVELLANEDA_SPREAD_BPS,
+        "max": DEFAULT_MAX_AVELLANEDA_SPREAD_BPS,
+    }
+    spread_limits = params.get("spread_limits_bps")
+    if not isinstance(spread_limits, dict):
+        return default_limits
+
+    min_bps = _safe_float(spread_limits.get("min"))
+    max_bps = _safe_float(spread_limits.get("max"))
+    if min_bps is None or max_bps is None or min_bps < 0.0 or max_bps <= 0.0 or min_bps > max_bps:
+        return default_limits
+
+    return {"min": min_bps, "max": max_bps}
+
+
+def clamp_offset_to_spread_limits(offset, mid_price, spread_limits_bps):
+    """Clamp a dynamic Avellaneda quote offset to configured basis-point guardrails."""
+    if mid_price <= 0:
+        return offset
+
+    raw_bps = (float(offset) / float(mid_price)) * 10000.0
+    clamped_bps = min(max(raw_bps, spread_limits_bps["min"]), spread_limits_bps["max"])
+    return float(mid_price) * (clamped_bps / 10000.0)
+
+
 def build_order_plan(state, opening_mode, params):
     """Build the intended side, price, and size for the next quote."""
     close_side = get_close_side_for_trading(state)
@@ -924,11 +952,14 @@ def build_order_plan(state, opening_mode, params):
         time_horizon = params["time_horizon_days"]
         position_size = state.position_size
         mid_price = state.mid_price
+        spread_limits_bps = resolve_avellaneda_spread_limits_bps(params)
 
         risk_term = gamma * ((sigma * mid_price) ** 2) * time_horizon
         reservation_price = mid_price - position_size * risk_term
         ask_offset = (1 / gamma) * np.log(1 + (gamma / k_buy)) + (risk_term / 2.0)
         bid_offset = (1 / gamma) * np.log(1 + (gamma / k_sell)) + (risk_term / 2.0)
+        ask_offset = clamp_offset_to_spread_limits(ask_offset, mid_price, spread_limits_bps)
+        bid_offset = clamp_offset_to_spread_limits(bid_offset, mid_price, spread_limits_bps)
         ask_price = reservation_price + ask_offset
         bid_price = reservation_price - bid_offset
 
@@ -1524,6 +1555,7 @@ def _load_avellaneda_params(symbol):
             "A_sell": _safe_float(market_data.get("A_sell")),
             "k_buy": _safe_float(market_data.get("k_buy")) or legacy_k,
             "k_sell": _safe_float(market_data.get("k_sell")) or legacy_k,
+            "spread_limits_bps": resolve_avellaneda_spread_limits_bps(payload),
             "source_path": file_path
         }
         

@@ -113,6 +113,16 @@ def test_round_quantity_to_step_respects_non_decimal_lot_sizes():
     assert abs(market_maker.round_quantity_to_step(0.0149, 0.005) - 0.01) < 1e-9
 
 
+def test_clamp_offset_to_spread_limits_uses_runtime_guardrails():
+    spread_limits = {"min": 5.0, "max": 200.0}
+
+    low = market_maker.clamp_offset_to_spread_limits(0.000001, 100.0, spread_limits)
+    high = market_maker.clamp_offset_to_spread_limits(10.0, 100.0, spread_limits)
+
+    assert abs(low - 0.05) < 1e-9
+    assert abs(high - 2.0) < 1e-9
+
+
 def test_prepare_order_candidate_rejects_quantity_below_min_qty():
     candidate = market_maker.prepare_order_candidate(
         {

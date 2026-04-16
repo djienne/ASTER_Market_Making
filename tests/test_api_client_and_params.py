@@ -124,9 +124,68 @@ def test_calculate_final_quotes_uses_explicit_ticker():
         5,
         0.02,
         0.02,
+        {"min": 5.0, "max": 200.0},
     )
 
     assert result["ticker"] == "BTC"
+
+
+def test_calculate_final_quotes_clamps_spreads_to_configured_bps_limits():
+    df = pd.DataFrame({"mid_price": [100.0]})
+
+    result = cap.calculate_final_quotes(
+        "BTC",
+        0.1,
+        0.0,
+        1.0,
+        1_000_000.0,
+        1.0,
+        0.0001,
+        0.5,
+        df,
+        3,
+        5,
+        0.0,
+        0.0,
+        {"min": 5.0, "max": 200.0},
+    )
+
+    assert result["spread_limits_bps"] == {"min": 5.0, "max": 200.0}
+    assert abs(result["limit_orders"]["delta_a_bps"] - 5.0) < 1e-9
+    assert abs(result["limit_orders"]["delta_b_bps"] - 200.0) < 1e-9
+    assert result["limit_orders"]["raw_delta_a_bps"] < 5.0
+    assert result["limit_orders"]["raw_delta_b_bps"] > 200.0
+    assert len(result["warnings"]) == 2
+
+
+def test_build_summary_text_reports_spread_clamp_warnings():
+    summary = cap.build_summary_text(
+        {
+            "ticker": "BTC",
+            "spread_limits_bps": {"min": 5.0, "max": 200.0},
+            "market_data": {
+                "mid_price": 100.0,
+                "garch_sigma": 0.02,
+                "rolling_sigma": 0.02,
+                "sigma": 0.02,
+                "A_buy": 1.0,
+                "k_buy": 2.0,
+                "A_sell": 1.0,
+                "k_sell": 2.0,
+            },
+            "optimal_parameters": {"gamma": 0.1, "time_horizon_days": 0.5},
+            "current_state": {"inventory": 0, "minutes_window": 5, "ma_window": 3},
+            "calculated_values": {"reservation_price": 100.0, "gap": 0.0},
+            "limit_orders": {"ask_price": 100.05, "bid_price": 98.0},
+            "warnings": ["WARNING: Ask spread 1.00 bps was outside the configured 5.00-200.00 bps range and was clamped to 5.00 bps."],
+        },
+        [],
+        df=None,
+        minutes_window=5,
+    )
+
+    assert "Configured Spread Guardrails: 5.00 to 200.00 bps" in summary
+    assert "WARNING: Ask spread 1.00 bps" in summary
 
 
 def test_build_summary_text_has_no_file_write_side_effect(monkeypatch, tmp_path):
@@ -156,6 +215,10 @@ def test_market_maker_loads_generated_avellaneda_params(monkeypatch, tmp_path):
             "gamma": 0.1,
             "time_horizon_days": 0.5,
         },
+        "spread_limits_bps": {
+            "min": 5.0,
+            "max": 200.0,
+        },
     }
     (params_dir / "avellaneda_parameters_BTC.json").write_text(json.dumps(payload), encoding="utf-8")
 
@@ -167,6 +230,7 @@ def test_market_maker_loads_generated_avellaneda_params(monkeypatch, tmp_path):
     assert params["source"] == "avellaneda_parameters_BTC.json"
     assert params["k_buy"] == 2.0
     assert params["k_sell"] == 3.0
+    assert params["spread_limits_bps"] == {"min": 5.0, "max": 200.0}
 
 
 def test_market_maker_disables_quoting_when_dynamic_params_are_missing(monkeypatch, tmp_path):
