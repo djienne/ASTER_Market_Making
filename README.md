@@ -59,6 +59,9 @@ API_PRIVATE_KEY=0x...
 # Default symbol used when CLI args do not override it
 SYMBOL=BTCUSDT
 
+# Optional: set to 0/false to show normal info logs from the bot
+# RELEASE_MODE=0
+
 # Optional: only for the terminal dashboard's spot balance widget
 # SPOT_API_KEY=...
 # SPOT_API_SECRET=...
@@ -100,7 +103,7 @@ SUPERTREND_CHECK_INTERVAL = 600
 DEFAULT_PRICE_CHANGE_THRESHOLD = 0.0001  # 1 bp
 CANCEL_SPECIFIC_ORDER = True
 
-RELEASE_MODE = True
+RELEASE_MODE = env_flag("RELEASE_MODE", True)
 ```
 
 Important notes:
@@ -113,6 +116,7 @@ Important notes:
 - The static `+/-0.6%` fallback is only used when `USE_AVELLANEDA_SPREADS = False`.
 - Opening quotes are also blocked unless the configured symbol is in `TRADING` status and the tracked wallet balance is large enough for the exchange minimum opening order size with a safety buffer.
 - The bot assumes exclusive ownership of the account and symbol, cancels all open orders for the configured symbol during startup and shutdown, and aborts startup if it cannot confirm the initial cleanup.
+- `RELEASE_MODE=0` enables normal info-level logs; `RELEASE_MODE=1` keeps the quieter error-only behavior.
 
 ## Available Scripts
 

@@ -14,6 +14,16 @@ from dotenv import load_dotenv
 from api_client import ApiClient
 from utils import normalize_symbol_base
 
+load_dotenv()
+
+
+def env_flag(name, default):
+    """Parse a boolean environment flag with a sane default."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
 # --- Configuration ---
 # STRATEGY
 DEFAULT_SYMBOL = "BTCUSDT"
@@ -52,7 +62,7 @@ CANCEL_SPECIFIC_ORDER = True # If True, cancel specific order ID. If False, canc
 
 # LOGGING
 LOG_FILE = 'market_maker.log'
-RELEASE_MODE = True  # When True, suppress all non-error logs and prints
+RELEASE_MODE = env_flag("RELEASE_MODE", True)  # When True, suppress all non-error logs and prints
 
 MIN_ORDER_INTERVAL = 1.0  # Minimum seconds between order placements
 POSITION_SIZE_EPSILON = 1e-12

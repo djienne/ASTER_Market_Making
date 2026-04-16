@@ -11,6 +11,8 @@ services:
     container_name: aster_data_collector
     env_file:
       - .env
+    environment:
+      - PYTHONUNBUFFERED=1
     volumes:
       # Mount entire directory so ASTER_data/ files are accessible both inside and outside container
       # This ensures data collector works identically whether run natively or with Docker
@@ -27,6 +29,7 @@ services:
     environment:
       - PARAM_REFRESH_MINUTES=5
       - PARAM_WINDOW_MINUTES=5
+      - PYTHONUNBUFFERED=1
     env_file:
       - .env
     volumes:
@@ -46,6 +49,9 @@ services:
     container_name: aster_market_maker
     env_file:
       - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - RELEASE_MODE=0
     volumes:
       - ./:/app/
     command: >
@@ -63,6 +69,7 @@ services:
     environment:
       - TREND_REFRESH_MINUTES=5
       - TREND_INTERVAL=5m
+      - PYTHONUNBUFFERED=1
     env_file:
       - .env
     volumes:
