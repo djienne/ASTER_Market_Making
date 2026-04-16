@@ -67,10 +67,6 @@ API_PRIVATE_KEY=0x...
 
 # Optional: set to 0/false to show normal info logs from the bot
 # RELEASE_MODE=0
-
-# Optional: only for the terminal dashboard's spot balance widget
-# SPOT_API_KEY=...
-# SPOT_API_SECRET=...
 ```
 
 ### `runtime.env`
@@ -149,25 +145,7 @@ python market_maker.py --symbol ETHUSDT
 python data_collector.py
 python calculate_avellaneda_parameters.py ETH
 python find_trend.py --symbol ETHUSDT --interval 5m
-
-# Monitoring / utilities
-python terminal_dashboard.py
-python get_my_trading_volume.py --symbol ETHUSDT --days 7
-python get_my_trading_volume.py --days 30
 ```
-
-## Terminal Dashboard
-
-`terminal_dashboard.py` gives a live account view with:
-- balances
-- open positions
-- recent order activity
-
-```bash
-python terminal_dashboard.py
-```
-
-<img src="dashboard.png" alt="dashboard" width="1000"/>
 
 ## Docker
 
