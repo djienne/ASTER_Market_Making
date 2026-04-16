@@ -6,9 +6,27 @@ import pandas as pd
 from pathlib import Path
 import numpy as np
 import sys
+from dotenv import load_dotenv
 
 PARAMS_DIR = os.getenv("PARAMS_DIR", "params")
 QUOTE_SUFFIXES = ("USDT", "USDC", "USDF", "USD1", "USD")
+PROJECT_ROOT = Path(__file__).parent.absolute()
+SECRETS_ENV_PATH = PROJECT_ROOT / ".env"
+RUNTIME_ENV_PATH = PROJECT_ROOT / "runtime.env"
+
+
+def load_project_env():
+    """Load project env files, keeping runtime symbol config in a single dedicated file."""
+    load_dotenv(SECRETS_ENV_PATH)
+    load_dotenv(RUNTIME_ENV_PATH, override=True)
+
+
+def configured_symbol(default: str = "ETHUSDT") -> str:
+    """Return the configured full trading symbol."""
+    return (os.getenv("SYMBOL") or default).upper()
+
+
+load_project_env()
 
 def _finite_nonneg(x) -> bool:
     """Check if a value is a non-negative, finite number."""
@@ -115,7 +133,7 @@ def save_avellaneda_params_atomic(params: dict, symbol: str) -> bool:
 def parse_arguments():
     """Parse command-line arguments for the script."""
     parser = argparse.ArgumentParser(description='Calculate Avellaneda-Stoikov market making parameters')
-    default_ticker = normalize_symbol_base(os.getenv("SYMBOL", "BTCUSDT"))
+    default_ticker = normalize_symbol_base(configured_symbol())
     parser.add_argument('ticker', nargs='?', default=default_ticker, help=f'Ticker symbol (default: {default_ticker})')
     parser.add_argument('--minutes', type=int, default=5, help='Frequency in minutes for parameter recalculation (default: 5)')
     return parser.parse_args()

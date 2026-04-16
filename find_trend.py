@@ -9,7 +9,7 @@ from datetime import datetime
 import time
 from numba import jit, njit
 from api_fetcher import _fetch_with_backoff
-from utils import normalize_symbol_base
+from utils import configured_symbol, normalize_symbol_base
 
 MIN_TRADES_FOR_VALID_RESULT = 6
 
@@ -402,7 +402,7 @@ def perform_grid_search(symbol, interval):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Backtest Supertrend strategy and find best parameters.')
-    default_symbol = os.getenv("SYMBOL", "BTCUSDT").upper()
+    default_symbol = configured_symbol()
     parser.add_argument('--symbol', type=str, default=default_symbol,
                         help=f'The trading symbol to backtest (e.g., BTCUSDT). Defaults to {default_symbol}.')
     parser.add_argument('--interval', type=str, default='1m',

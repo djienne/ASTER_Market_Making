@@ -4,6 +4,13 @@ import logging
 import market_maker
 
 
+def _mark_binance_alpha_ready(state):
+    state.binance_alpha_ws_connected = True
+    state.binance_alpha_ready = True
+    state.binance_alpha_shift_bps = 0.0
+    state.binance_alpha_warmup_seconds = market_maker.BINANCE_OBI_WARMUP_SECONDS
+
+
 def test_classify_order_update_distinguishes_fill_from_cancel():
     canceled = market_maker.classify_order_update({"X": "CANCELED", "z": "0", "ap": "100"})
     assert canceled["is_terminal"] is True
@@ -123,6 +130,73 @@ def test_clamp_offset_to_spread_limits_uses_runtime_guardrails():
     assert abs(high - 2.0) < 1e-9
 
 
+def test_rolling_zscore_buffer_is_bounded_and_evicts_old_samples():
+    buffer = market_maker.RollingZScoreBuffer(3)
+    buffer.append(1000, 1.0)
+    buffer.append(2000, 2.0)
+    buffer.append(3000, 3.0)
+    buffer.append(4000, 4.0)
+
+    assert buffer.count == 3
+    assert abs(buffer.mean() - 3.0) < 1e-9
+
+    buffer.evict_older_than(3500)
+
+    assert buffer.count == 1
+    assert abs(buffer.mean() - 4.0) < 1e-9
+
+
+def test_calculate_binance_orderbook_imbalance_uses_price_band():
+    state = market_maker.StrategyState()
+    state.binance_bid_book = {100.0: 5.0, 99.0: 4.0, 96.0: 100.0}
+    state.binance_ask_book = {101.0: 3.0, 102.0: 2.0, 104.0: 200.0}
+
+    imbalance = market_maker.calculate_binance_orderbook_imbalance(state)
+
+    assert abs(imbalance - ((9.0 - 5.0) / 14.0)) < 1e-9
+
+
+def test_build_order_plan_applies_binance_shift_bps_to_dynamic_quotes():
+    params = {
+        "source": "avellaneda_parameters_ETH.json",
+        "gamma": 0.05,
+        "sigma": 0.01,
+        "k_buy": 0.3,
+        "k_sell": 0.3,
+        "time_horizon_days": 0.005,
+        "spread_limits_bps": {"min": 5.0, "max": 200.0},
+    }
+    state = market_maker.StrategyState(flip_mode=False)
+    state.mid_price = 100.0
+    state.account_balance = 1000.0
+
+    base_plan = market_maker.build_order_plan(state, "BUY", params)
+
+    state.binance_alpha_ready = True
+    state.binance_alpha_shift_bps = 10.0
+    shifted_plan = market_maker.build_order_plan(state, "BUY", params)
+
+    assert abs(shifted_plan["reservation_price"] - base_plan["reservation_price"] - 0.1) < 1e-9
+    assert abs(shifted_plan["bid_price"] - base_plan["bid_price"] - 0.1) < 1e-9
+    assert abs(shifted_plan["ask_price"] - base_plan["ask_price"] - 0.1) < 1e-9
+
+
+def test_wait_for_startup_inputs_waits_for_binance_alpha(monkeypatch):
+    async def fake_sleep(_seconds):
+        state.binance_alpha_ready = True
+
+    state = market_maker.StrategyState()
+    state.quote_params = {"source": "avellaneda_parameters_ETH.json"}
+    state.supertrend_signal = 1
+    runtime = market_maker.RuntimeContext("ETHUSDT")
+
+    monkeypatch.setattr(market_maker.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(market_maker.wait_for_startup_inputs(state, "ETHUSDT", runtime))
+
+    assert result is True
+
+
 def test_prepare_order_candidate_rejects_quantity_below_min_qty():
     candidate = market_maker.prepare_order_candidate(
         {
@@ -161,6 +235,7 @@ def test_quote_engine_emits_requote_command_on_price_move_above_threshold(monkey
         state = market_maker.StrategyState(flip_mode=False)
         state.price_ws_connected = True
         state.user_data_ws_connected = True
+        _mark_binance_alpha_ready(state)
         state.account_balance = 1000.0
         state.balance_last_updated = 1.0
         state.mid_price = 100.0
@@ -210,6 +285,7 @@ def test_quote_engine_does_not_emit_limit_order_without_valid_quotes():
         state = market_maker.StrategyState(flip_mode=False)
         state.price_ws_connected = True
         state.user_data_ws_connected = True
+        _mark_binance_alpha_ready(state)
         state.account_balance = 1000.0
         state.balance_last_updated = 1.0
         state.mid_price = 100.0
@@ -249,6 +325,7 @@ def test_quote_engine_does_not_emit_opening_quote_without_enough_capital():
         state = market_maker.StrategyState(flip_mode=False)
         state.price_ws_connected = True
         state.user_data_ws_connected = True
+        _mark_binance_alpha_ready(state)
         state.account_balance = 20.0
         state.balance_last_updated = 1.0
         state.mid_price = 100.0
@@ -287,6 +364,7 @@ def test_quote_engine_cancels_active_order_when_quotes_become_unavailable():
         state = market_maker.StrategyState(flip_mode=False)
         state.price_ws_connected = True
         state.user_data_ws_connected = True
+        _mark_binance_alpha_ready(state)
         state.account_balance = 1000.0
         state.balance_last_updated = 1.0
         state.mid_price = 100.0
@@ -336,6 +414,7 @@ def test_quote_engine_cancels_active_order_when_symbol_is_not_trading():
         state = market_maker.StrategyState(flip_mode=False)
         state.price_ws_connected = True
         state.user_data_ws_connected = True
+        _mark_binance_alpha_ready(state)
         state.account_balance = 1000.0
         state.balance_last_updated = 1.0
         state.mid_price = 100.0
@@ -557,6 +636,7 @@ def test_opening_circuit_breaker_blocks_new_opening_quotes():
         state = market_maker.StrategyState(flip_mode=False)
         state.price_ws_connected = True
         state.user_data_ws_connected = True
+        _mark_binance_alpha_ready(state)
         state.account_balance = 1000.0
         state.balance_last_updated = 1.0
         state.mid_price = 100.0

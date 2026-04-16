@@ -49,7 +49,8 @@ def calculate_intensity_params(periods: list, window_minutes: int, buy_orders: p
         # Calculate time-decay weights
         # weight = exp(-alpha * (T_end - t_trade))
         # timestamps in seconds
-        trade_times = matched_trades.index.astype(np.int64) // 10**9
+        # Force nanosecond-resolution epoch conversion across pandas versions.
+        trade_times = matched_trades.index.to_numpy(dtype='datetime64[ns]').astype(np.int64) // 10**9
         period_end_ts = period_end.timestamp()
         
         time_diffs = period_end_ts - trade_times

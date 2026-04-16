@@ -13,9 +13,10 @@ services:
     mem_limit: 1g
     mem_reservation: 512m
     pids_limit: 256
+    env_file:
+      - runtime.env
     environment:
       PYTHONUNBUFFERED: "1"
-      SYMBOL: BTCUSDT
     volumes:
       # Mount entire directory so ASTER_data/ files are accessible both inside and outside container
       # This ensures data collector works identically whether run natively or with Docker
@@ -35,11 +36,12 @@ services:
       - PYTHONUNBUFFERED=1
     env_file:
       - .env
+      - runtime.env
     volumes:
       - ./:/app/
     command: >
       sh -c "while true; do
-        python calculate_avellaneda_parameters.py ${SYMBOL:-BTCUSDT} --minutes 5 || true;
+        python calculate_avellaneda_parameters.py --minutes 5 || true;
         sleep 5m;
       done"
     depends_on:
@@ -52,13 +54,13 @@ services:
     container_name: aster_market_maker
     env_file:
       - .env
+      - runtime.env
     environment:
       - PYTHONUNBUFFERED=1
       - RELEASE_MODE=0
     volumes:
       - ./:/app/
-    command: >
-      sh -c "python market_maker.py --symbol ${SYMBOL:-BTCUSDT}"
+    command: python market_maker.py
     depends_on:
       - data-collector
       - avellaneda-params
@@ -75,11 +77,12 @@ services:
       - PYTHONUNBUFFERED=1
     env_file:
       - .env
+      - runtime.env
     volumes:
       - ./:/app/
     command: >
       sh -c "while true; do
-        python find_trend.py --symbol ${SYMBOL:-BTCUSDT} --interval 5m || true;
+        python find_trend.py --interval 5m || true;
         sleep 5m;
       done"
     restart: unless-stopped

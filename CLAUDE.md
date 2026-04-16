@@ -22,16 +22,16 @@ python data_collector.py
 ### Parameter Calculation
 ```bash
 # Calculate Avellaneda-Stoikov parameters (requires collected data)
-python calculate_avellaneda_parameters.py --symbol BNBUSDT --minutes 5
+python calculate_avellaneda_parameters.py ETH --minutes 5
 
 # Calculate SuperTrend directional bias
-python find_trend.py --symbol BNBUSDT --interval 5m
+python find_trend.py --symbol ETHUSDT --interval 5m
 ```
 
 ### Running the Market Maker
 ```bash
 # Requires .env file with API credentials
-python market_maker.py --symbol BNBUSDT
+python market_maker.py --symbol ETHUSDT
 ```
 
 ### Monitoring
@@ -40,7 +40,7 @@ python market_maker.py --symbol BNBUSDT
 python terminal_dashboard.py
 
 # Check trading volume
-python get_my_trading_volume.py --symbol BNBUSDT --days 7
+python get_my_trading_volume.py --symbol ETHUSDT --days 7
 ```
 
 ### Docker Deployment
@@ -135,8 +135,7 @@ API_PRIVATE_KEY=0x...    # API wallet private key
 
 # Pro API V3 user data streams use the same credentials above
 
-# Trading configuration
-SYMBOL=BNBUSDT          # Primary trading pair
+# Trading symbol is configured in runtime.env
 ```
 
 **Market Maker Parameters (market_maker.py)**
@@ -152,9 +151,9 @@ SYMBOL=BNBUSDT          # Primary trading pair
 
 ### Adding a New Trading Symbol
 
-1. Update `LIST_MARKETS` in `data_collector.py`:
-   ```python
-   LIST_MARKETS = ['ETHUSDT', 'BNBUSDT', 'NEWUSDT']
+1. Update `runtime.env`:
+   ```bash
+   SYMBOL=NEWUSDT
    ```
 
 2. Add tick size to `get_fallback_tick_size()` in `utils.py`:
@@ -165,13 +164,11 @@ SYMBOL=BNBUSDT          # Primary trading pair
    }
    ```
 
-3. Update `.env` to set `SYMBOL=NEWUSDT`
+3. Run data collection for sufficient time (1+ hours)
 
-4. Run data collection for sufficient time (1+ hours)
-
-5. Calculate parameters:
+4. Calculate parameters:
    ```bash
-   python calculate_avellaneda_parameters.py --symbol NEWUSDT --minutes 5
+   python calculate_avellaneda_parameters.py NEW --minutes 5
    python find_trend.py --symbol NEWUSDT --interval 5m
    ```
 
@@ -199,7 +196,7 @@ Use scripts in `tests/` directory:
 3. Verify symbol filters with:
    ```python
    # In Python REPL with api_client initialized
-   filters = await client.get_symbol_filters('BNBUSDT')
+   filters = await client.get_symbol_filters('ETHUSDT')
    print(filters)  # Shows price_precision, quantity_precision, tick_size, etc.
    ```
 4. Monitor order reuse logic: orders are reused if price change < `DEFAULT_PRICE_CHANGE_THRESHOLD` (0.1%)
@@ -263,7 +260,7 @@ The `docker-compose.yml` orchestrates 4 services:
 3. **trend-finder**: Updates trend signal every `TREND_REFRESH_MINUTES`
 4. **market-maker**: Depends on data-collector and avellaneda-params, runs trading logic
 
-The trading-related services (`avellaneda-params`, `trend-finder`, `market-maker`) share the repo-root `.env` file and use its `SYMBOL` environment variable. `data-collector` can run without `.env` and is pinned to `BTCUSDT`.
+`runtime.env` is the single source of truth for the active symbol across `data-collector`, `avellaneda-params`, `trend-finder`, and `market-maker`. The trading-related services still use the repo-root `.env` file for credentials.
 
 ## Risk Management Features
 

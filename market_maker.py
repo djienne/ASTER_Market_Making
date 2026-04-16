@@ -6,15 +6,16 @@ import websockets
 import json
 import signal
 import time
+import math
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 import numpy as np
-from dotenv import load_dotenv
+import requests
 from api_client import ApiClient
-from utils import normalize_symbol_base
+from utils import configured_symbol, load_project_env, normalize_symbol_base
 
-load_dotenv()
+load_project_env()
 
 
 def env_flag(name, default):
@@ -26,7 +27,7 @@ def env_flag(name, default):
 
 # --- Configuration ---
 # STRATEGY
-DEFAULT_SYMBOL = "BTCUSDT"
+DEFAULT_SYMBOL = configured_symbol()
 FLIP_MODE = False # True for short-biased (SELL first), False for long-biased (BUY first)
 DEFAULT_BUY_SPREAD = 0.006   # 0.6% below mid-price for buy orders
 DEFAULT_SELL_SPREAD = 0.006  # 0.6% above mid-price for sell orders
@@ -56,6 +57,17 @@ OPENING_CIRCUIT_BREAKER_COOLDOWN = 120.0
 USE_SUPERTREND_SIGNAL = True  # Toggle to use Supertrend signal for dynamic flip_mode
 SUPERTREND_PARAMS_TEMPLATE = "supertrend_params_{}.json"
 SUPERTREND_CHECK_INTERVAL = 600 # Seconds between checking the signal file
+USE_BINANCE_OBI_ALPHA = True
+BINANCE_OBI_LOOKING_DEPTH_PCT = 0.025
+BINANCE_OBI_BOOK_RETAIN_PCT = 0.03
+BINANCE_OBI_ZSCORE_WINDOW_SECONDS = 600
+BINANCE_OBI_WARMUP_SECONDS = 300
+BINANCE_OBI_BUFFER_CAPACITY = 8192
+BINANCE_OBI_MIN_SAMPLES = 100
+BINANCE_OBI_STALE_TIMEOUT_SECONDS = 5.0
+BINANCE_OBI_BPS_PER_SIGMA = 5.0
+BINANCE_OBI_MAX_SHIFT_BPS = 15.0
+BINANCE_OBI_SHIFT_LOG_DELTA_BPS = 1.0
 
 # ORDER CANCELLATION
 CANCEL_SPECIFIC_ORDER = True # If True, cancel specific order ID. If False, cancel all orders for the symbol.
@@ -74,6 +86,73 @@ DEFAULT_MIN_AVELLANEDA_SPREAD_BPS = 5.0
 DEFAULT_MAX_AVELLANEDA_SPREAD_BPS = 200.0
 SPREAD_CACHE_TTL_SECONDS = 10
 _SPREAD_CACHE = {}
+
+
+class BinanceOrderBookSyncError(Exception):
+    """Raised when the Binance local book must be resynchronized."""
+
+
+class RollingZScoreBuffer:
+    """Fixed-capacity, time-evicting ring buffer for rolling z-score stats."""
+
+    def __init__(self, capacity: int):
+        self.capacity = max(int(capacity), 1)
+        self.timestamps_ms = np.zeros(self.capacity, dtype=np.int64)
+        self.values = np.zeros(self.capacity, dtype=np.float64)
+        self.head = 0
+        self.tail = 0
+        self.count = 0
+        self.sum = 0.0
+        self.sum_sq = 0.0
+
+    def clear(self):
+        self.head = 0
+        self.tail = 0
+        self.count = 0
+        self.sum = 0.0
+        self.sum_sq = 0.0
+
+    def _drop_oldest(self):
+        if self.count == 0:
+            return
+        value = float(self.values[self.head])
+        self.sum -= value
+        self.sum_sq -= value * value
+        self.head = (self.head + 1) % self.capacity
+        self.count -= 1
+
+    def evict_older_than(self, cutoff_ms: int):
+        while self.count > 0 and int(self.timestamps_ms[self.head]) < int(cutoff_ms):
+            self._drop_oldest()
+
+    def append(self, timestamp_ms: int, value: float):
+        if self.count == self.capacity:
+            self._drop_oldest()
+
+        self.timestamps_ms[self.tail] = int(timestamp_ms)
+        self.values[self.tail] = float(value)
+        self.tail = (self.tail + 1) % self.capacity
+        self.count += 1
+        self.sum += float(value)
+        self.sum_sq += float(value) * float(value)
+
+    def mean(self):
+        if self.count <= 0:
+            return None
+        return self.sum / self.count
+
+    def std(self):
+        if self.count <= 1:
+            return None
+        mean = self.sum / self.count
+        variance = max((self.sum_sq / self.count) - (mean * mean), 0.0)
+        return math.sqrt(variance)
+
+    def span_seconds(self):
+        if self.count <= 1:
+            return 0.0
+        last_index = (self.tail - 1) % self.capacity
+        return max(0.0, (int(self.timestamps_ms[last_index]) - int(self.timestamps_ms[self.head])) / 1000.0)
 
 
 @dataclass(frozen=True)
@@ -96,8 +175,8 @@ def get_unavailable_quote_params():
 
 
 def resolve_symbol(cli_symbol=None):
-    """Resolve the active symbol from CLI input, env var, or the hardcoded default."""
-    symbol = cli_symbol or os.getenv("SYMBOL") or DEFAULT_SYMBOL
+    """Resolve the active symbol from CLI input or the single runtime config source."""
+    symbol = cli_symbol or configured_symbol(DEFAULT_SYMBOL)
     return symbol.upper()
 
 
@@ -209,6 +288,22 @@ class StrategyState:
         self.active_order_started_at = None
         self.order_failure_timestamps = deque()
         self.opening_circuit_breaker_until = 0.0
+        # Binance order book imbalance alpha state
+        self.binance_bid_book = {}
+        self.binance_ask_book = {}
+        self.binance_last_update_id = None
+        self.binance_alpha_buffer = RollingZScoreBuffer(BINANCE_OBI_BUFFER_CAPACITY)
+        self.binance_alpha_ws_connected = False
+        self.binance_alpha_ready = False
+        self.binance_alpha_last_updated = None
+        self.binance_alpha_raw_imbalance = None
+        self.binance_alpha_zscore = None
+        self.binance_alpha_shift_bps = 0.0
+        self.binance_alpha_warmup_seconds = 0.0
+        self.binance_best_bid = None
+        self.binance_best_ask = None
+        self.binance_last_logged_shift_bps = None
+        self.binance_alpha_last_status = None
 
 
 def get_strategy_modes(flip_mode):
@@ -382,6 +477,126 @@ def round_price_to_tick(price, tick_size, side):
     return rounded
 
 
+def _binance_ws_symbol(symbol):
+    """Return the lowercase Binance websocket symbol."""
+    return (symbol or "").lower()
+
+
+def _binance_depth_stream_url(symbol):
+    """Return the public Binance diff-book stream URL for the symbol."""
+    return f"wss://fstream.binance.com/ws/{_binance_ws_symbol(symbol)}@depth@100ms"
+
+
+def _binance_depth_snapshot_url(symbol):
+    """Return the Binance REST depth snapshot URL for the symbol."""
+    return f"https://fapi.binance.com/fapi/v1/depth?symbol={(symbol or '').upper()}&limit=1000"
+
+
+def clear_binance_alpha_state(state):
+    """Reset all in-memory Binance alpha state to avoid stale reuse or memory growth."""
+    state.binance_bid_book.clear()
+    state.binance_ask_book.clear()
+    state.binance_last_update_id = None
+    state.binance_alpha_buffer.clear()
+    state.binance_alpha_ready = False
+    state.binance_alpha_last_updated = None
+    state.binance_alpha_raw_imbalance = None
+    state.binance_alpha_zscore = None
+    state.binance_alpha_shift_bps = 0.0
+    state.binance_alpha_warmup_seconds = 0.0
+    state.binance_best_bid = None
+    state.binance_best_ask = None
+    state.binance_last_logged_shift_bps = None
+    state.binance_alpha_last_status = None
+
+
+def _apply_book_updates(book, updates):
+    """Apply absolute-quantity Binance depth updates into a local side book."""
+    for price_raw, qty_raw in updates:
+        price = float(price_raw)
+        qty = float(qty_raw)
+        if qty <= 0.0:
+            book.pop(price, None)
+        else:
+            book[price] = qty
+
+
+def _trim_binance_books(state):
+    """Keep the local Binance book bounded around the current mid price."""
+    if not state.binance_bid_book or not state.binance_ask_book:
+        return
+
+    best_bid = max(state.binance_bid_book)
+    best_ask = min(state.binance_ask_book)
+    mid_price = (best_bid + best_ask) / 2.0
+    lower_bound = mid_price * (1.0 - BINANCE_OBI_BOOK_RETAIN_PCT)
+    upper_bound = mid_price * (1.0 + BINANCE_OBI_BOOK_RETAIN_PCT)
+
+    stale_bids = [price for price in state.binance_bid_book if price < lower_bound]
+    stale_asks = [price for price in state.binance_ask_book if price > upper_bound]
+    for price in stale_bids:
+        state.binance_bid_book.pop(price, None)
+    for price in stale_asks:
+        state.binance_ask_book.pop(price, None)
+
+
+def calculate_binance_orderbook_imbalance(state):
+    """Compute normalized Binance book imbalance within +/- looking depth around mid."""
+    if not state.binance_bid_book or not state.binance_ask_book:
+        return None
+
+    best_bid = max(state.binance_bid_book)
+    best_ask = min(state.binance_ask_book)
+    if best_bid <= 0.0 or best_ask <= 0.0 or best_bid >= best_ask:
+        return None
+
+    mid_price = (best_bid + best_ask) / 2.0
+    lower_bound = mid_price * (1.0 - BINANCE_OBI_LOOKING_DEPTH_PCT)
+    upper_bound = mid_price * (1.0 + BINANCE_OBI_LOOKING_DEPTH_PCT)
+
+    bid_qty = sum(qty for price, qty in state.binance_bid_book.items() if price >= lower_bound)
+    ask_qty = sum(qty for price, qty in state.binance_ask_book.items() if price <= upper_bound)
+    total_qty = bid_qty + ask_qty
+    if total_qty <= 0.0:
+        return None
+
+    state.binance_best_bid = best_bid
+    state.binance_best_ask = best_ask
+    return (bid_qty - ask_qty) / total_qty
+
+
+def calculate_binance_alpha_shift_bps(zscore):
+    """Map a z-score to a capped quote shift in basis points."""
+    if zscore is None or not np.isfinite(zscore):
+        return 0.0
+    shift_bps = float(zscore) * BINANCE_OBI_BPS_PER_SIGMA
+    return float(np.clip(shift_bps, -BINANCE_OBI_MAX_SHIFT_BPS, BINANCE_OBI_MAX_SHIFT_BPS))
+
+
+def is_binance_alpha_live(state):
+    """Return True when Binance alpha is warmed up and ready for opening quotes."""
+    if not USE_BINANCE_OBI_ALPHA:
+        return True
+    return bool(state.binance_alpha_ready)
+
+
+def binance_alpha_status_text(state):
+    """Return a compact status string for logs and reporters."""
+    if not USE_BINANCE_OBI_ALPHA:
+        return "Binance OBI disabled"
+    if state.binance_alpha_ready:
+        zscore = state.binance_alpha_zscore if state.binance_alpha_zscore is not None else 0.0
+        return f"Binance OBI z={zscore:+.2f} shift={state.binance_alpha_shift_bps:+.1f}bps"
+    if state.binance_alpha_ws_connected:
+        return (
+            f"Binance OBI warming {state.binance_alpha_warmup_seconds:.0f}s/"
+            f"{BINANCE_OBI_WARMUP_SECONDS}s samples={state.binance_alpha_buffer.count}"
+        )
+    return "Binance OBI unavailable"
+
+    return rounded
+
+
 def round_quantity_to_step(quantity, step_size):
     """Round quantity down to the nearest valid multiple of step_size."""
     if step_size <= 0:
@@ -542,6 +757,208 @@ async def websocket_price_updater(state, symbol, runtime):
             reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
 
     log.info("WebSocket price updater shutting down")
+
+
+def _update_binance_alpha_metrics(state, runtime):
+    """Refresh the bounded rolling Binance alpha state from the latest local book."""
+    raw_imbalance = calculate_binance_orderbook_imbalance(state)
+    if raw_imbalance is None:
+        return
+
+    now_ms = int(runtime.now() * 1000)
+    cutoff_ms = now_ms - (BINANCE_OBI_ZSCORE_WINDOW_SECONDS * 1000)
+    state.binance_alpha_buffer.evict_older_than(cutoff_ms)
+    state.binance_alpha_buffer.append(now_ms, raw_imbalance)
+    state.binance_alpha_buffer.evict_older_than(cutoff_ms)
+
+    state.binance_alpha_last_updated = runtime.now()
+    state.binance_alpha_raw_imbalance = raw_imbalance
+    state.binance_alpha_warmup_seconds = state.binance_alpha_buffer.span_seconds()
+    std = state.binance_alpha_buffer.std()
+    if std is None or std <= 1e-12:
+        state.binance_alpha_zscore = None
+        state.binance_alpha_shift_bps = 0.0
+        state.binance_alpha_ready = False
+        return
+
+    mean = state.binance_alpha_buffer.mean()
+    zscore = (raw_imbalance - mean) / std
+    state.binance_alpha_zscore = zscore
+    state.binance_alpha_shift_bps = calculate_binance_alpha_shift_bps(zscore)
+    state.binance_alpha_ready = (
+        state.binance_alpha_buffer.count >= BINANCE_OBI_MIN_SAMPLES
+        and state.binance_alpha_warmup_seconds >= BINANCE_OBI_WARMUP_SECONDS
+    )
+
+
+async def _fetch_binance_depth_snapshot(symbol):
+    """Fetch a Binance futures REST depth snapshot in a worker thread."""
+    url = _binance_depth_snapshot_url(symbol)
+
+    def _do_request():
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json()
+
+    return await asyncio.to_thread(_do_request)
+
+
+def _initialize_binance_local_book(state, snapshot):
+    """Reset and seed the local Binance book from a REST snapshot."""
+    clear_binance_alpha_state(state)
+    state.binance_last_update_id = int(snapshot["lastUpdateId"])
+    _apply_book_updates(state.binance_bid_book, snapshot.get("bids", []))
+    _apply_book_updates(state.binance_ask_book, snapshot.get("asks", []))
+    _trim_binance_books(state)
+
+
+def _extract_binance_depth_event(message):
+    """Normalize raw or combined Binance websocket payloads into a depth event."""
+    payload = message.get("data", message)
+    if not isinstance(payload, dict):
+        return None
+    if "b" not in payload or "a" not in payload:
+        return None
+    return payload
+
+
+def _apply_binance_depth_event(state, event, require_prev_match=True):
+    """Apply a Binance diff-depth event to the local book, raising on sync errors."""
+    final_update_id = int(event["u"])
+    first_update_id = int(event["U"])
+    previous_final_update_id = event.get("pu")
+
+    if state.binance_last_update_id is None:
+        raise BinanceOrderBookSyncError("Binance local book is not initialized")
+
+    if require_prev_match:
+        if previous_final_update_id is None or int(previous_final_update_id) != int(state.binance_last_update_id):
+            raise BinanceOrderBookSyncError("Binance depth sequence gap detected")
+    elif not (first_update_id <= int(state.binance_last_update_id) <= final_update_id):
+        raise BinanceOrderBookSyncError("Initial Binance buffered event does not overlap the snapshot")
+
+    if final_update_id < int(state.binance_last_update_id):
+        return False
+
+    _apply_book_updates(state.binance_bid_book, event.get("b", []))
+    _apply_book_updates(state.binance_ask_book, event.get("a", []))
+    state.binance_last_update_id = final_update_id
+    _trim_binance_books(state)
+    return True
+
+
+async def binance_orderbook_imbalance_updater(state, symbol, runtime):
+    """Maintain a bounded local Binance futures book and rolling imbalance alpha."""
+    log = logging.getLogger("BinanceOBIUpdater")
+    websocket_url = _binance_depth_stream_url(symbol)
+    reconnect_delay = 5.0
+    max_reconnect_delay = 60.0
+
+    while not runtime.shutdown_requested:
+        try:
+            log.info(f"Connecting to Binance OBI stream: {websocket_url}")
+            state.binance_alpha_ws_connected = False
+            clear_binance_alpha_state(state)
+            request_quote_refresh(state)
+
+            async with websockets.connect(websocket_url, ping_interval=20, ping_timeout=10) as websocket:
+                state.binance_alpha_ws_connected = True
+                request_quote_refresh(state)
+                reconnect_delay = 5.0
+                log.info(f"Binance OBI connected for {symbol} via diff-depth @100ms")
+
+                snapshot_task = asyncio.create_task(_fetch_binance_depth_snapshot(symbol))
+                buffered_events = []
+
+                while not snapshot_task.done() and not runtime.shutdown_requested:
+                    message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
+                    event = _extract_binance_depth_event(json.loads(message))
+                    if event is not None:
+                        buffered_events.append(event)
+
+                snapshot = await snapshot_task
+                _initialize_binance_local_book(state, snapshot)
+
+                buffered_events = [event for event in buffered_events if int(event["u"]) >= int(state.binance_last_update_id)]
+                start_index = None
+                for idx, event in enumerate(buffered_events):
+                    if int(event["U"]) <= int(state.binance_last_update_id) <= int(event["u"]):
+                        start_index = idx
+                        break
+                if start_index is None and buffered_events:
+                    raise BinanceOrderBookSyncError("Could not align Binance buffered events with snapshot")
+
+                for idx, event in enumerate(buffered_events[start_index or 0:]):
+                    _apply_binance_depth_event(state, event, require_prev_match=(idx != 0))
+                    _update_binance_alpha_metrics(state, runtime)
+
+                last_message_time = runtime.now()
+                last_ready = state.binance_alpha_ready
+
+                while not runtime.shutdown_requested:
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=BINANCE_OBI_STALE_TIMEOUT_SECONDS)
+                    except asyncio.TimeoutError:
+                        raise BinanceOrderBookSyncError("Binance OBI stream became stale")
+
+                    last_message_time = runtime.now()
+                    event = _extract_binance_depth_event(json.loads(message))
+                    if event is None:
+                        continue
+
+                    _apply_binance_depth_event(state, event)
+                    previous_ready = state.binance_alpha_ready
+                    previous_shift = state.binance_alpha_shift_bps
+                    _update_binance_alpha_metrics(state, runtime)
+
+                    if state.binance_alpha_ready and not previous_ready:
+                        zscore = state.binance_alpha_zscore if state.binance_alpha_zscore is not None else 0.0
+                        log.info(
+                            f"Binance OBI ready: raw={state.binance_alpha_raw_imbalance:+.4f} "
+                            f"z={zscore:+.2f} shift={state.binance_alpha_shift_bps:+.1f} bps "
+                            f"window={state.binance_alpha_warmup_seconds:.0f}s samples={state.binance_alpha_buffer.count}"
+                        )
+
+                    if state.binance_alpha_ready:
+                        should_log_shift = (
+                            state.binance_last_logged_shift_bps is None
+                            or abs(state.binance_alpha_shift_bps - state.binance_last_logged_shift_bps) >= BINANCE_OBI_SHIFT_LOG_DELTA_BPS
+                        )
+                        if should_log_shift:
+                            zscore = state.binance_alpha_zscore if state.binance_alpha_zscore is not None else 0.0
+                            log.info(
+                                f"Binance OBI shift update: z={zscore:+.2f}, "
+                                f"shift={state.binance_alpha_shift_bps:+.1f} bps"
+                            )
+                            state.binance_last_logged_shift_bps = state.binance_alpha_shift_bps
+
+                    if (
+                        state.binance_alpha_ready != previous_ready
+                        or abs(state.binance_alpha_shift_bps - previous_shift) >= BINANCE_OBI_SHIFT_LOG_DELTA_BPS
+                    ):
+                        request_quote_refresh(state)
+
+                    if runtime.now() - last_message_time > BINANCE_OBI_STALE_TIMEOUT_SECONDS:
+                        raise BinanceOrderBookSyncError("Binance OBI stream stale threshold exceeded")
+
+        except BinanceOrderBookSyncError as exc:
+            log.warning(f"{exc}. Reinitializing Binance local book.")
+        except asyncio.CancelledError:
+            log.info("Binance OBI updater cancelled.")
+            break
+        except Exception as exc:
+            log.error(f"Binance OBI updater error: {exc}", exc_info=True)
+        finally:
+            state.binance_alpha_ws_connected = False
+            clear_binance_alpha_state(state)
+            request_quote_refresh(state)
+
+        if not runtime.shutdown_requested:
+            log.info(f"Reconnecting to Binance OBI in {reconnect_delay:.1f}s...")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
+
+    log.info("Binance OBI updater shutting down")
 
 def is_price_data_valid(state, runtime):
     """Check if the price data is valid and recent."""
@@ -755,7 +1172,11 @@ async def price_reporter(state, symbol, runtime):
                 if is_balance_data_valid(state):
                     balance_info = f" | Balance: ${state.account_balance:.2f}"
 
-                log.info(f"{symbol} | Mid-Price: ${state.mid_price:.4f} | Bid-Ask Spread: {spread_percentage:.3f}% | Bid: ${state.bid_price:.4f} | Ask: ${state.ask_price:.4f}{balance_info}")
+                alpha_info = f" | {binance_alpha_status_text(state)}"
+                log.info(
+                    f"{symbol} | Mid-Price: ${state.mid_price:.4f} | Bid-Ask Spread: {spread_percentage:.3f}% "
+                    f"| Bid: ${state.bid_price:.4f} | Ask: ${state.ask_price:.4f}{balance_info}{alpha_info}"
+                )
 
         except Exception as e:
             log.error(f"Error in price reporter: {e}")
@@ -785,6 +1206,45 @@ async def initialize_supertrend_signal(state, symbol):
         log.warning(f"{exc}. Using default FLIP_MODE={state.flip_mode}.")
     except Exception as e:
         log.error(f"Error initializing Supertrend signal: {e}. Using default FLIP_MODE={state.flip_mode}.")
+
+
+async def wait_for_startup_inputs(state, symbol, runtime):
+    """Block startup until Avellaneda, Supertrend, and Binance alpha are ready."""
+    log = logging.getLogger('StartupInputs')
+    wait_seconds = 5
+    last_status = None
+
+    while not runtime.shutdown_requested:
+        avellaneda_ready = (not USE_AVELLANEDA_SPREADS) or state.quote_params.get("source") != "unavailable"
+        supertrend_ready = (not USE_SUPERTREND_SIGNAL) or state.supertrend_signal in [1, -1]
+        binance_ready = is_binance_alpha_live(state)
+        status = (avellaneda_ready, supertrend_ready, binance_ready)
+        if status != last_status:
+            if avellaneda_ready and supertrend_ready and binance_ready:
+                log.info(
+                    f"Startup inputs ready for {symbol}: Avellaneda params, Supertrend signal, "
+                    "and Binance OBI warmup are all valid."
+                )
+            else:
+                missing = []
+                if not avellaneda_ready:
+                    missing.append("Avellaneda params")
+                if not supertrend_ready:
+                    missing.append("Supertrend signal")
+                if not binance_ready:
+                    missing.append("Binance OBI warmup")
+                log.info(
+                    f"Waiting for startup inputs for {symbol}: missing {', '.join(missing)}. "
+                    f"Retrying every {wait_seconds}s."
+                )
+            last_status = status
+
+        if avellaneda_ready and supertrend_ready and binance_ready:
+            return True
+
+        await asyncio.sleep(wait_seconds)
+
+    return False
 
 
 async def supertrend_signal_updater(state, symbol, runtime):
@@ -940,6 +1400,15 @@ def clamp_offset_to_spread_limits(offset, mid_price, spread_limits_bps):
     return float(mid_price) * (clamped_bps / 10000.0)
 
 
+def get_binance_alpha_shift_abs(state, reference_price):
+    """Convert the current Binance alpha shift in bps into an absolute price offset."""
+    if reference_price is None or reference_price <= 0:
+        return 0.0
+    if not USE_BINANCE_OBI_ALPHA or not state.binance_alpha_ready:
+        return 0.0
+    return float(reference_price) * (state.binance_alpha_shift_bps / 10000.0)
+
+
 def build_order_plan(state, opening_mode, params):
     """Build the intended side, price, and size for the next quote."""
     close_side = get_close_side_for_trading(state)
@@ -956,6 +1425,8 @@ def build_order_plan(state, opening_mode, params):
 
         risk_term = gamma * ((sigma * mid_price) ** 2) * time_horizon
         reservation_price = mid_price - position_size * risk_term
+        alpha_shift_abs = get_binance_alpha_shift_abs(state, mid_price)
+        reservation_price += alpha_shift_abs
         ask_offset = (1 / gamma) * np.log(1 + (gamma / k_buy)) + (risk_term / 2.0)
         bid_offset = (1 / gamma) * np.log(1 + (gamma / k_sell)) + (risk_term / 2.0)
         ask_offset = clamp_offset_to_spread_limits(ask_offset, mid_price, spread_limits_bps)
@@ -982,9 +1453,11 @@ def build_order_plan(state, opening_mode, params):
             "reservation_price": reservation_price,
             "bid_price": bid_price,
             "ask_price": ask_price,
+            "binance_alpha_shift_bps": state.binance_alpha_shift_bps if state.binance_alpha_ready else 0.0,
         }
 
     buy_spread, sell_spread = params["buy_spread"], params["sell_spread"]
+    alpha_shift_abs = get_binance_alpha_shift_abs(state, state.mid_price)
     if close_side:
         side, reduce_only = close_side, True
         quantity_to_trade = abs(state.position_size)
@@ -993,6 +1466,7 @@ def build_order_plan(state, opening_mode, params):
         side, reduce_only = opening_mode, False
         quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
         limit_price = state.mid_price * (1 - buy_spread) if opening_mode == 'BUY' else state.mid_price * (1 + sell_spread)
+    limit_price += alpha_shift_abs
 
     used_spread = sell_spread if side == 'SELL' else buy_spread
     return {
@@ -1001,6 +1475,7 @@ def build_order_plan(state, opening_mode, params):
         "quantity_to_trade": quantity_to_trade,
         "limit_price": limit_price,
         "used_spread": used_spread,
+        "binance_alpha_shift_bps": state.binance_alpha_shift_bps if state.binance_alpha_ready else 0.0,
     }
 
 
@@ -1078,6 +1553,13 @@ def build_quote_command(state, symbol_filters):
 
     opening_mode, _ = get_strategy_modes(state.flip_mode)
     order_plan = build_order_plan(state, opening_mode, params)
+    if not order_plan["reduce_only"] and USE_BINANCE_OBI_ALPHA and not is_binance_alpha_live(state):
+        return None, {
+            "reason": "binance_alpha_unavailable",
+            "warmup_seconds": state.binance_alpha_warmup_seconds,
+            "sample_count": state.binance_alpha_buffer.count,
+        }
+
     if not order_plan["reduce_only"]:
         required_balance = get_required_opening_balance(symbol_filters, order_plan["limit_price"])
         if state.account_balance is None or state.account_balance + POSITION_SIZE_EPSILON < required_balance:
@@ -1314,7 +1796,7 @@ async def place_order_from_command(state, client, symbol, runtime, log, command)
 
     log.info(
         f"Placing {command.side} order: {command.formatted_quantity} {symbol} @ {command.formatted_price} "
-        f"({percentage_diff:+.4f}% from mid-price)"
+        f"({percentage_diff:+.4f}% from mid-price, Binance shift {state.binance_alpha_shift_bps:+.1f} bps)"
     )
 
     active_order = await client.place_order(
@@ -1650,7 +2132,7 @@ async def market_making_loop(state, client, symbol, runtime):
                 quote_command, order_candidate = build_quote_command(state, symbol_filters)
                 if quote_command is None:
                     reason = order_candidate["reason"]
-                    if reason in {"missing_quote_params", "invalid_quote_params"}:
+                    if reason in {"missing_quote_params", "invalid_quote_params", "binance_alpha_unavailable"}:
                         if state.active_order_id:
                             publish_latest_order_command(
                                 state,
@@ -1763,12 +2245,12 @@ async def main():
         "--symbol",
         type=str,
         default=None,
-        help="The symbol to trade. Defaults to SYMBOL in .env or BTCUSDT.",
+        help="The symbol to trade. Defaults to SYMBOL in runtime.env.",
     )
     args = parser.parse_args()
 
     setup_logging("INFO")
-    load_dotenv()
+    load_project_env()
     args.symbol = resolve_symbol(args.symbol)
     runtime = RuntimeContext(args.symbol)
 
@@ -1806,6 +2288,22 @@ async def main():
                     return
             except asyncio.TimeoutError:
                 logging.error("Timed out while fetching initial balance. Cannot proceed.")
+                return
+
+            params_task = asyncio.create_task(avellaneda_params_updater(state, args.symbol, runtime))
+            support_tasks = [
+                asyncio.create_task(websocket_price_updater(state, args.symbol, runtime)),
+                asyncio.create_task(websocket_user_data_updater(state, client, args.symbol, runtime)),
+                params_task,
+            ]
+            if USE_SUPERTREND_SIGNAL:
+                support_tasks.append(asyncio.create_task(supertrend_signal_updater(state, args.symbol, runtime)))
+            if USE_BINANCE_OBI_ALPHA:
+                support_tasks.append(asyncio.create_task(binance_orderbook_imbalance_updater(state, args.symbol, runtime)))
+            tasks.extend(support_tasks)
+
+            if not await wait_for_startup_inputs(state, args.symbol, runtime):
+                logging.info("Shutdown requested before required startup inputs became available.")
                 return
 
             # Initialize Supertrend signal before checking positions or starting loops
@@ -1853,19 +2351,13 @@ async def main():
             # Start all async tasks
             quote_task = asyncio.create_task(market_making_loop(state, client, args.symbol, runtime))
             order_task = asyncio.create_task(order_manager_loop(state, client, args.symbol, runtime))
-            params_task = asyncio.create_task(avellaneda_params_updater(state, args.symbol, runtime))
             core_tasks = [quote_task, order_task]
-            tasks = [
-                asyncio.create_task(websocket_price_updater(state, args.symbol, runtime)),
-                asyncio.create_task(websocket_user_data_updater(state, client, args.symbol, runtime)),
+            tasks.extend([
                 asyncio.create_task(balance_reporter(state, runtime)),
                 quote_task,
                 order_task,
-                params_task,
                 asyncio.create_task(price_reporter(state, args.symbol, runtime)),
-            ]
-            if USE_SUPERTREND_SIGNAL:
-                tasks.append(asyncio.create_task(supertrend_signal_updater(state, args.symbol, runtime)))
+            ])
 
             request_quote_refresh(state)
 

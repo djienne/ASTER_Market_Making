@@ -10,9 +10,12 @@ import requests
 from datetime import datetime
 from collections import deque
 import pandas as pd
+from utils import configured_symbol, load_project_env
+
+load_project_env()
 
 def _default_markets():
-    raw_symbols = os.getenv("SYMBOLS") or os.getenv("SYMBOL") or "BTCUSDT"
+    raw_symbols = os.getenv("SYMBOLS") or configured_symbol()
     return [symbol.strip().upper() for symbol in raw_symbols.split(",") if symbol.strip()]
 
 
