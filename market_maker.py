@@ -10,6 +10,7 @@ import math
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
+from typing import Optional
 import numpy as np
 import requests
 from api_client import ApiClient
@@ -69,9 +70,17 @@ BINANCE_OBI_STALE_TIMEOUT_SECONDS = 5.0
 BINANCE_OBI_BPS_PER_SIGMA = 5.0
 BINANCE_OBI_MAX_SHIFT_BPS = 15.0
 BINANCE_OBI_SHIFT_LOG_DELTA_BPS = 1.0
+BINANCE_OBI_TRIM_INTERVAL_SECONDS = 1.0
+BINANCE_OBI_TRIM_INTERVAL_UPDATES = 10
+BINANCE_OBI_BAND_REBUILD_BPS = 1.0
 
 # ORDER CANCELLATION
 CANCEL_SPECIFIC_ORDER = True # If True, cancel specific order ID. If False, cancel all orders for the symbol.
+ORDER_REPLACE_MODE = os.getenv("ORDER_REPLACE_MODE", "fast").strip().lower()
+FAST_ORDER_REPLACE = ORDER_REPLACE_MODE == "fast"
+OPEN_ORDER_WATCHDOG_INTERVAL = 15.0
+OPEN_ORDER_WATCHDOG_CANCEL_ALL = True
+QUOTE_REFRESH_PREFILTER_BPS = 2.0
 
 # LOGGING
 LOG_FILE = 'market_maker.log'
@@ -157,6 +166,52 @@ class RollingZScoreBuffer:
 
 
 @dataclass(frozen=True)
+class AsterTopOfBookSnapshot:
+    bid_price: float
+    ask_price: float
+    mid_price: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class BinanceAlphaSnapshot:
+    ready: bool = False
+    raw_imbalance: Optional[float] = None
+    zscore: Optional[float] = None
+    shift_bps: float = 0.0
+    warmup_seconds: float = 0.0
+    sample_count: int = 0
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    last_updated: Optional[float] = None
+    ws_connected: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedQuoteParams:
+    kind: str
+    source: str
+    buy_spread: float = 0.0
+    sell_spread: float = 0.0
+    gamma: float = 0.0
+    sigma: float = 0.0
+    k_buy: float = 0.0
+    k_sell: float = 0.0
+    time_horizon_days: float = 0.0
+    spread_limits_min_bps: float = DEFAULT_MIN_AVELLANEDA_SPREAD_BPS
+    spread_limits_max_bps: float = DEFAULT_MAX_AVELLANEDA_SPREAD_BPS
+
+
+@dataclass(frozen=True)
+class PendingTerminalOrder:
+    side: str
+    reduce_only: bool
+    position_update_seq_before_fill: int
+    order_label: str
+    cancel_requested_at: float
+
+
+@dataclass(frozen=True)
 class OrderCommand:
     """The latest desired action for the order manager."""
     kind: str
@@ -173,6 +228,71 @@ class OrderCommand:
 def get_unavailable_quote_params():
     """Return a sentinel payload meaning the bot must not quote yet."""
     return {"source": "unavailable"}
+
+
+def get_unavailable_prepared_quote_params():
+    """Return the immutable unavailable quote snapshot used by the hot path."""
+    return PreparedQuoteParams(kind="unavailable", source="unavailable")
+
+
+def prepare_quote_params_snapshot(params):
+    """Validate and normalize quote params once so the hot path stays memory-only."""
+    if not isinstance(params, dict):
+        return get_unavailable_prepared_quote_params()
+
+    source = str(params.get("source") or "unavailable")
+    if source == "unavailable":
+        return get_unavailable_prepared_quote_params()
+
+    if source == "default":
+        buy_spread = _safe_float(params.get("buy_spread"))
+        sell_spread = _safe_float(params.get("sell_spread"))
+        if buy_spread is None or sell_spread is None or buy_spread <= 0.0 or sell_spread <= 0.0:
+            return get_unavailable_prepared_quote_params()
+        return PreparedQuoteParams(
+            kind="default",
+            source=source,
+            buy_spread=buy_spread,
+            sell_spread=sell_spread,
+        )
+
+    spread_limits = resolve_avellaneda_spread_limits_bps(params)
+    gamma = _safe_float(params.get("gamma"))
+    sigma = _safe_float(params.get("sigma"))
+    k_buy = _safe_float(params.get("k_buy"))
+    k_sell = _safe_float(params.get("k_sell"))
+    time_horizon_days = _safe_float(params.get("time_horizon_days"))
+    required_positive = (gamma, sigma, k_buy, k_sell, time_horizon_days)
+    if any(value is None or value <= 0.0 for value in required_positive):
+        return get_unavailable_prepared_quote_params()
+
+    return PreparedQuoteParams(
+        kind="avellaneda",
+        source=source,
+        gamma=gamma,
+        sigma=sigma,
+        k_buy=k_buy,
+        k_sell=k_sell,
+        time_horizon_days=time_horizon_days,
+        spread_limits_min_bps=spread_limits["min"],
+        spread_limits_max_bps=spread_limits["max"],
+    )
+
+
+def publish_binance_alpha_snapshot(state):
+    """Mirror mutable Binance alpha fields into a single immutable snapshot."""
+    state.binance_alpha_snapshot = BinanceAlphaSnapshot(
+        ready=bool(state.binance_alpha_ready),
+        raw_imbalance=state.binance_alpha_raw_imbalance,
+        zscore=state.binance_alpha_zscore,
+        shift_bps=float(state.binance_alpha_shift_bps or 0.0),
+        warmup_seconds=float(state.binance_alpha_warmup_seconds or 0.0),
+        sample_count=int(state.binance_alpha_buffer.count),
+        best_bid=state.binance_best_bid,
+        best_ask=state.binance_best_ask,
+        last_updated=state.binance_alpha_last_updated,
+        ws_connected=bool(state.binance_alpha_ws_connected),
+    )
 
 
 def resolve_symbol(cli_symbol=None):
@@ -274,14 +394,22 @@ class StrategyState:
         # Latest-wins handoff from quote engine to order manager
         self.order_commands = asyncio.Queue(maxsize=1)
         self.quote_refresh_event = asyncio.Event()
+        self.aster_top_of_book_snapshot = None
         self.quote_params = (
             {"buy_spread": DEFAULT_BUY_SPREAD, "sell_spread": DEFAULT_SELL_SPREAD, "source": "default"}
             if not USE_AVELLANEDA_SPREADS
             else get_unavailable_quote_params()
         )
+        self.prepared_quote_params = PreparedQuoteParams(
+            kind="default",
+            source="default",
+            buy_spread=DEFAULT_BUY_SPREAD,
+            sell_spread=DEFAULT_SELL_SPREAD,
+        ) if not USE_AVELLANEDA_SPREADS else PreparedQuoteParams(kind="unavailable", source="unavailable")
         # WebSocket connection health flags
         self.price_ws_connected = False
         self.user_data_ws_connected = False
+        self.symbol_filters = None
         # Supertrend signal
         self.supertrend_signal = None # Can be 1 (up) or -1 (down)
         # Position snapshots are the source of truth for inventory state
@@ -305,6 +433,15 @@ class StrategyState:
         self.binance_best_ask = None
         self.binance_last_logged_shift_bps = None
         self.binance_alpha_last_status = None
+        self.binance_alpha_snapshot = BinanceAlphaSnapshot()
+        self.binance_book_last_trim_at = 0.0
+        self.binance_book_updates_since_trim = 0
+        self.binance_band_mid_price = None
+        self.binance_band_lower_bound = None
+        self.binance_band_upper_bound = None
+        self.binance_band_bid_qty = 0.0
+        self.binance_band_ask_qty = 0.0
+        self.pending_terminal_orders = {}
 
 
 def get_strategy_modes(flip_mode):
@@ -469,9 +606,9 @@ def round_price_to_tick(price, tick_size, side):
 
     scaled = price / tick_size
     if side == 'BUY':
-        rounded = np.floor(scaled + 1e-12) * tick_size
+        rounded = math.floor(scaled + 1e-12) * tick_size
     elif side == 'SELL':
-        rounded = np.ceil(scaled - 1e-12) * tick_size
+        rounded = math.ceil(scaled - 1e-12) * tick_size
     else:
         raise ValueError(f"Unsupported side for price rounding: {side}")
 
@@ -509,17 +646,63 @@ def clear_binance_alpha_state(state):
     state.binance_best_ask = None
     state.binance_last_logged_shift_bps = None
     state.binance_alpha_last_status = None
+    state.binance_book_last_trim_at = 0.0
+    state.binance_book_updates_since_trim = 0
+    state.binance_band_mid_price = None
+    state.binance_band_lower_bound = None
+    state.binance_band_upper_bound = None
+    state.binance_band_bid_qty = 0.0
+    state.binance_band_ask_qty = 0.0
+    publish_binance_alpha_snapshot(state)
 
 
-def _apply_book_updates(book, updates):
+def _refresh_binance_best_prices(state):
+    """Refresh cached best prices from the current local Binance book."""
+    state.binance_best_bid = max(state.binance_bid_book) if state.binance_bid_book else None
+    state.binance_best_ask = min(state.binance_ask_book) if state.binance_ask_book else None
+
+
+def _price_is_inside_binance_band(price, lower_bound, upper_bound, is_bid):
+    """Return True when a price contributes to the active OBI band for its side."""
+    if lower_bound is None or upper_bound is None:
+        return False
+    if is_bid:
+        return price >= lower_bound
+    return price <= upper_bound
+
+
+def _apply_book_updates(book, updates, current_best_price, is_bid, lower_bound=None, upper_bound=None):
     """Apply absolute-quantity Binance depth updates into a local side book."""
+    best_price = current_best_price
+    best_invalidated = False
+    band_delta = 0.0
     for price_raw, qty_raw in updates:
         price = float(price_raw)
-        qty = float(qty_raw)
+        qty = max(float(qty_raw), 0.0)
+        previous_qty = float(book.get(price, 0.0) or 0.0)
+        if _price_is_inside_binance_band(price, lower_bound, upper_bound, is_bid):
+            band_delta += qty - previous_qty
+
         if qty <= 0.0:
-            book.pop(price, None)
+            removed = book.pop(price, None)
+            if removed is not None and best_price is not None and price == best_price:
+                best_invalidated = True
         else:
             book[price] = qty
+            if best_price is None:
+                best_price = price
+            elif is_bid and price > best_price:
+                best_price = price
+            elif not is_bid and price < best_price:
+                best_price = price
+
+    if best_invalidated:
+        if book:
+            best_price = max(book) if is_bid else min(book)
+        else:
+            best_price = None
+
+    return best_price, band_delta
 
 
 def _trim_binance_books(state):
@@ -527,8 +710,13 @@ def _trim_binance_books(state):
     if not state.binance_bid_book or not state.binance_ask_book:
         return
 
-    best_bid = max(state.binance_bid_book)
-    best_ask = min(state.binance_ask_book)
+    if state.binance_best_bid is None or state.binance_best_ask is None:
+        _refresh_binance_best_prices(state)
+    best_bid = state.binance_best_bid
+    best_ask = state.binance_best_ask
+    if best_bid is None or best_ask is None:
+        return
+
     mid_price = (best_bid + best_ask) / 2.0
     lower_bound = mid_price * (1.0 - BINANCE_OBI_BOOK_RETAIN_PCT)
     upper_bound = mid_price * (1.0 + BINANCE_OBI_BOOK_RETAIN_PCT)
@@ -541,29 +729,72 @@ def _trim_binance_books(state):
         state.binance_ask_book.pop(price, None)
 
 
-def calculate_binance_orderbook_imbalance(state):
-    """Compute normalized Binance book imbalance within +/- looking depth around mid."""
-    if not state.binance_bid_book or not state.binance_ask_book:
-        return None
-
-    best_bid = max(state.binance_bid_book)
-    best_ask = min(state.binance_ask_book)
-    if best_bid <= 0.0 or best_ask <= 0.0 or best_bid >= best_ask:
-        return None
+def _rebuild_binance_band_totals(state):
+    """Rebuild the cached OBI depth totals from the bounded local book."""
+    if state.binance_best_bid is None or state.binance_best_ask is None:
+        _refresh_binance_best_prices(state)
+    best_bid = state.binance_best_bid
+    best_ask = state.binance_best_ask
+    if best_bid is None or best_ask is None or best_bid <= 0.0 or best_ask <= 0.0 or best_bid >= best_ask:
+        state.binance_band_mid_price = None
+        state.binance_band_lower_bound = None
+        state.binance_band_upper_bound = None
+        state.binance_band_bid_qty = 0.0
+        state.binance_band_ask_qty = 0.0
+        return
 
     mid_price = (best_bid + best_ask) / 2.0
     lower_bound = mid_price * (1.0 - BINANCE_OBI_LOOKING_DEPTH_PCT)
     upper_bound = mid_price * (1.0 + BINANCE_OBI_LOOKING_DEPTH_PCT)
 
-    bid_qty = sum(qty for price, qty in state.binance_bid_book.items() if price >= lower_bound)
-    ask_qty = sum(qty for price, qty in state.binance_ask_book.items() if price <= upper_bound)
-    total_qty = bid_qty + ask_qty
+    bid_qty = 0.0
+    for price, qty in state.binance_bid_book.items():
+        if price >= lower_bound:
+            bid_qty += qty
+
+    ask_qty = 0.0
+    for price, qty in state.binance_ask_book.items():
+        if price <= upper_bound:
+            ask_qty += qty
+
+    state.binance_band_mid_price = mid_price
+    state.binance_band_lower_bound = lower_bound
+    state.binance_band_upper_bound = upper_bound
+    state.binance_band_bid_qty = bid_qty
+    state.binance_band_ask_qty = ask_qty
+
+
+def _binance_band_requires_rebuild(state):
+    """Return True when the current OBI totals must be rebuilt from the local book."""
+    if state.binance_best_bid is None or state.binance_best_ask is None:
+        return True
+    if state.binance_band_mid_price is None:
+        return True
+
+    current_mid = (state.binance_best_bid + state.binance_best_ask) / 2.0
+    if current_mid <= 0.0:
+        return True
+
+    drift_bps = abs(current_mid - state.binance_band_mid_price) / current_mid * 10000.0
+    return drift_bps >= BINANCE_OBI_BAND_REBUILD_BPS
+
+
+def calculate_binance_orderbook_imbalance(state):
+    """Compute normalized Binance book imbalance within +/- looking depth around mid."""
+    if not state.binance_bid_book or not state.binance_ask_book:
+        return None
+
+    if _binance_band_requires_rebuild(state):
+        _rebuild_binance_band_totals(state)
+
+    if state.binance_band_mid_price is None:
+        return None
+
+    total_qty = state.binance_band_bid_qty + state.binance_band_ask_qty
     if total_qty <= 0.0:
         return None
 
-    state.binance_best_bid = best_bid
-    state.binance_best_ask = best_ask
-    return (bid_qty - ask_qty) / total_qty
+    return (state.binance_band_bid_qty - state.binance_band_ask_qty) / total_qty
 
 
 def calculate_binance_alpha_shift_bps(zscore):
@@ -571,27 +802,40 @@ def calculate_binance_alpha_shift_bps(zscore):
     if zscore is None or not np.isfinite(zscore):
         return 0.0
     shift_bps = float(zscore) * BINANCE_OBI_BPS_PER_SIGMA
-    return float(np.clip(shift_bps, -BINANCE_OBI_MAX_SHIFT_BPS, BINANCE_OBI_MAX_SHIFT_BPS))
+    return max(-BINANCE_OBI_MAX_SHIFT_BPS, min(BINANCE_OBI_MAX_SHIFT_BPS, shift_bps))
 
 
 def is_binance_alpha_live(state):
     """Return True when Binance alpha is warmed up and ready for opening quotes."""
     if not USE_BINANCE_OBI_ALPHA:
         return True
-    return bool(state.binance_alpha_ready)
+    return bool(state.binance_alpha_snapshot.ready or state.binance_alpha_ready)
 
 
 def binance_alpha_status_text(state):
     """Return a compact status string for logs and reporters."""
+    snapshot = state.binance_alpha_snapshot
     if not USE_BINANCE_OBI_ALPHA:
         return "Binance OBI disabled"
-    if state.binance_alpha_ready:
-        zscore = state.binance_alpha_zscore if state.binance_alpha_zscore is not None else 0.0
-        return f"Binance OBI z={zscore:+.2f} shift={state.binance_alpha_shift_bps:+.1f}bps"
-    if state.binance_alpha_ws_connected:
+    if snapshot.ready is False and state.binance_alpha_ready:
+        snapshot = BinanceAlphaSnapshot(
+            ready=True,
+            zscore=state.binance_alpha_zscore,
+            shift_bps=state.binance_alpha_shift_bps,
+            warmup_seconds=state.binance_alpha_warmup_seconds,
+            sample_count=state.binance_alpha_buffer.count,
+            best_bid=state.binance_best_bid,
+            best_ask=state.binance_best_ask,
+            last_updated=state.binance_alpha_last_updated,
+            ws_connected=state.binance_alpha_ws_connected,
+        )
+    if snapshot.ready:
+        zscore = snapshot.zscore if snapshot.zscore is not None else 0.0
+        return f"Binance OBI z={zscore:+.2f} shift={snapshot.shift_bps:+.1f}bps"
+    if snapshot.ws_connected:
         return (
-            f"Binance OBI warming {state.binance_alpha_warmup_seconds:.0f}s/"
-            f"{BINANCE_OBI_WARMUP_SECONDS}s samples={state.binance_alpha_buffer.count}"
+            f"Binance OBI warming {snapshot.warmup_seconds:.0f}s/"
+            f"{BINANCE_OBI_WARMUP_SECONDS}s samples={snapshot.sample_count}"
         )
     return "Binance OBI unavailable"
 
@@ -612,6 +856,222 @@ def round_quantity_to_step(quantity, step_size):
     rounded = steps * step_dec
     return float(rounded)
 
+
+class AsterTopOfBookFeed:
+    """Publish immutable Aster top-of-book snapshots and prefilter quote refreshes."""
+
+    def publish(self, state, runtime, quote_engine, best_bid, best_ask):
+        mid_price = (best_bid + best_ask) / 2.0
+        snapshot = AsterTopOfBookSnapshot(
+            bid_price=best_bid,
+            ask_price=best_ask,
+            mid_price=mid_price,
+            updated_at=runtime.now(),
+        )
+        previous_snapshot = state.aster_top_of_book_snapshot
+        state.aster_top_of_book_snapshot = snapshot
+        state.bid_price = best_bid
+        state.ask_price = best_ask
+        state.mid_price = mid_price
+        runtime.price_last_updated = snapshot.updated_at
+        return quote_engine.should_refresh_from_top_of_book(state, previous_snapshot, snapshot)
+
+
+class BinanceAlphaEngine:
+    """Maintain Binance order book state and publish immutable alpha snapshots."""
+
+    def clear(self, state):
+        clear_binance_alpha_state(state)
+
+    def initialize_local_book(self, state, snapshot):
+        _initialize_binance_local_book(state, snapshot)
+        publish_binance_alpha_snapshot(state)
+
+    def apply_depth_event(self, state, event, require_prev_match=True):
+        return _apply_binance_depth_event(state, event, require_prev_match=require_prev_match)
+
+    def update_metrics(self, state, runtime):
+        _update_binance_alpha_metrics(state, runtime)
+
+
+class QuoteEngine:
+    """Own all quote decisions off immutable feed snapshots and prepared params."""
+
+    def prepare_quote_params(self, params):
+        return prepare_quote_params_snapshot(params)
+
+    def get_prepared_params(self, state):
+        return state.prepared_quote_params or get_unavailable_prepared_quote_params()
+
+    def estimate_quote_center(self, state, book_snapshot=None, prepared_params=None):
+        snapshot = book_snapshot or state.aster_top_of_book_snapshot
+        if snapshot is None:
+            return None
+
+        params = prepared_params or self.get_prepared_params(state)
+        mid_price = snapshot.mid_price
+        alpha_snapshot = state.binance_alpha_snapshot
+        alpha_shift_abs = 0.0
+        if alpha_snapshot.ready and mid_price and mid_price > 0.0:
+            alpha_shift_abs = mid_price * (alpha_snapshot.shift_bps / 10000.0)
+
+        if params.kind == "avellaneda":
+            risk_term = params.gamma * ((params.sigma * mid_price) ** 2) * params.time_horizon_days
+            return mid_price - state.position_size * risk_term + alpha_shift_abs
+
+        return mid_price + alpha_shift_abs
+
+    def should_refresh_from_top_of_book(self, state, previous_snapshot, new_snapshot):
+        if previous_snapshot is None or new_snapshot is None:
+            return True
+
+        previous_center = self.estimate_quote_center(state, book_snapshot=previous_snapshot)
+        new_center = self.estimate_quote_center(state, book_snapshot=new_snapshot)
+        if previous_center is None or new_center is None:
+            return True
+
+        tick_size = float((state.symbol_filters or {}).get("tick_size", 0.0) or 0.0)
+        center_threshold = new_center * (QUOTE_REFRESH_PREFILTER_BPS / 10000.0)
+        if tick_size > 0.0:
+            center_threshold = max(center_threshold, tick_size)
+        return abs(new_center - previous_center) >= center_threshold
+
+    def build_quote_command(self, state, symbol_filters):
+        return build_quote_command(state, symbol_filters)
+
+    async def run(self, state, client, symbol, runtime):
+        log = logging.getLogger('MarketMakerLoop')
+        log.info(f"Fetching trading rules for {symbol}...")
+        symbol_filters = await client.get_symbol_filters(symbol)
+        state.symbol_filters = symbol_filters
+        log.info(f"Filters loaded: {symbol_filters}")
+        request_quote_refresh(state)
+
+        while not runtime.shutdown_requested:
+            try:
+                await state.quote_refresh_event.wait()
+                state.quote_refresh_event.clear()
+
+                while True:
+                    if runtime.shutdown_requested:
+                        break
+
+                    if symbol_filters.get("status", "TRADING") != "TRADING":
+                        if state.active_order_id:
+                            publish_latest_order_command(
+                                state,
+                                OrderCommand(kind="cancel", trigger=f"Symbol status {symbol_filters.get('status', 'UNKNOWN')}"),
+                            )
+                        break
+
+                    if not state.price_ws_connected or not state.user_data_ws_connected:
+                        if state.active_order_id:
+                            publish_latest_order_command(
+                                state,
+                                OrderCommand(kind="cancel", trigger="WebSocket disconnection"),
+                            )
+                        break
+
+                    if not is_price_data_valid(state, runtime) or not is_balance_data_valid(state):
+                        break
+
+                    if is_opening_circuit_breaker_active(state, runtime) and not has_open_position(state):
+                        break
+
+                    bias_changed, current_notional = apply_supertrend_bias(state)
+                    if bias_changed:
+                        trend_name = "DOWNTREND" if state.flip_mode else "UPTREND"
+                        log.info(f"Supertrend switched strategy bias to {trend_name} while inventory was below ${current_notional:.2f}.")
+
+                    quote_command, order_candidate = self.build_quote_command(state, symbol_filters)
+                    if quote_command is None:
+                        reason = order_candidate["reason"]
+                        if reason in {"missing_quote_params", "invalid_quote_params", "binance_alpha_unavailable"}:
+                            if state.active_order_id:
+                                publish_latest_order_command(
+                                    state,
+                                    OrderCommand(kind="cancel", trigger=f"Quotes unavailable: {reason}"),
+                                )
+                            break
+
+                        if reason in {"non_positive_quantity", "min_qty", "min_notional"} and state.active_order_id:
+                            publish_latest_order_command(
+                                state,
+                                OrderCommand(kind="cancel", trigger=f"Quote invalid: {reason}"),
+                            )
+                        break
+
+                    if not should_reuse_order(state, quote_command.price, quote_command.side, quote_command.quantity):
+                        publish_latest_order_command(state, quote_command)
+
+                    if not state.quote_refresh_event.is_set():
+                        break
+                    state.quote_refresh_event.clear()
+
+            except asyncio.CancelledError:
+                log.info("Quote engine cancelled.")
+                break
+            except Exception as exc:
+                log.error(f"An error occurred in the quote engine: {exc}", exc_info=True)
+                await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+
+
+class OrderExecutor:
+    """Own exchange-side actions, including replace policy and cold-path watchdogs."""
+
+    def __init__(self, fast_replace=FAST_ORDER_REPLACE):
+        self.fast_replace = bool(fast_replace)
+
+    async def place_order(self, state, client, symbol, runtime, log, command):
+        return await place_order_from_command(
+            state,
+            client,
+            symbol,
+            runtime,
+            log,
+            command,
+            symbol_filters=state.symbol_filters,
+        )
+
+    async def run(self, state, client, symbol, runtime):
+        return await order_manager_loop_impl(state, client, symbol, runtime, executor=self)
+
+    async def watch_open_orders(self, state, client, symbol, runtime):
+        log = logging.getLogger("OrderWatchdog")
+
+        while not runtime.shutdown_requested:
+            try:
+                await asyncio.sleep(OPEN_ORDER_WATCHDOG_INTERVAL)
+                if runtime.shutdown_requested:
+                    break
+
+                open_orders = await client.get_open_orders(symbol)
+                if len(open_orders) <= 1:
+                    continue
+
+                order_ids = [order.get("orderId") for order in open_orders]
+                log.error(f"Detected multiple open orders for {symbol}: {order_ids}")
+                if OPEN_ORDER_WATCHDOG_CANCEL_ALL:
+                    await client.cancel_all_orders(symbol)
+                    log.error(f"Cancelled all open orders for {symbol} after watchdog detected duplicates.")
+                else:
+                    active_order_id = state.active_order_id
+                    for order in open_orders:
+                        order_id = order.get("orderId")
+                        if active_order_id is not None and order_id == active_order_id:
+                            continue
+                        await client.cancel_order(symbol, order_id)
+                    log.error(f"Cancelled duplicate open orders for {symbol}; keeping tracked order {active_order_id}.")
+
+                clear_order_tracking(state)
+                state.pending_terminal_orders.clear()
+                request_quote_refresh(state)
+
+            except asyncio.CancelledError:
+                log.info("Order watchdog cancelled.")
+                break
+            except Exception as exc:
+                log.error(f"Order watchdog error: {exc}", exc_info=True)
 
 async def cancel_active_order(state, client, symbol, log, reason, clear_tracking_on_success=True):
     """Cancel the currently tracked order and optionally clear local tracking on success."""
@@ -677,9 +1137,11 @@ async def reconcile_fill_with_position(state, client, symbol, log, previous_posi
     return False, previous_mode, new_mode
 
 
-async def websocket_price_updater(state, symbol, runtime):
+async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None, quote_engine=None):
     """[MODIFIED] WebSocket-based price updater with exponential backoff and stale connection detection."""
     log = logging.getLogger('WebSocketPriceUpdater')
+    top_of_book_feed = top_of_book_feed or AsterTopOfBookFeed()
+    quote_engine = quote_engine or QuoteEngine()
 
     websocket_url = f"wss://fstream.asterdex.com/ws/{symbol.lower()}@depth5"
     reconnect_delay = 5  # Initial delay
@@ -719,14 +1181,17 @@ async def websocket_price_updater(state, symbol, runtime):
                                 if bids and asks:
                                     best_bid = float(bids[0][0])
                                     best_ask = float(asks[0][0])
-                                    runtime.price_last_updated = runtime.now()
                                     if best_bid != state.bid_price or best_ask != state.ask_price:
-                                        mid_price = (best_bid + best_ask) / 2
-                                        state.bid_price = best_bid
-                                        state.ask_price = best_ask
-                                        state.mid_price = mid_price
-                                        request_quote_refresh(state)
-                                        log.debug(f"Updated prices for {symbol}: Bid={best_bid}, Ask={best_ask}, Mid={mid_price:.4f}")
+                                        should_refresh = top_of_book_feed.publish(
+                                            state,
+                                            runtime,
+                                            quote_engine,
+                                            best_bid,
+                                            best_ask,
+                                        )
+                                        if should_refresh:
+                                            request_quote_refresh(state)
+                                        log.debug(f"Updated prices for {symbol}: Bid={best_bid}, Ask={best_ask}, Mid={state.mid_price:.4f}")
 
                         except json.JSONDecodeError:
                             log.warning("Failed to decode WebSocket message")
@@ -762,17 +1227,27 @@ async def websocket_price_updater(state, symbol, runtime):
 
 def _update_binance_alpha_metrics(state, runtime):
     """Refresh the bounded rolling Binance alpha state from the latest local book."""
+    now = runtime.now()
+    should_trim = (
+        state.binance_book_updates_since_trim >= BINANCE_OBI_TRIM_INTERVAL_UPDATES
+        or (now - state.binance_book_last_trim_at) >= BINANCE_OBI_TRIM_INTERVAL_SECONDS
+    )
+    if should_trim:
+        _trim_binance_books(state)
+        state.binance_book_last_trim_at = now
+        state.binance_book_updates_since_trim = 0
+
     raw_imbalance = calculate_binance_orderbook_imbalance(state)
     if raw_imbalance is None:
+        publish_binance_alpha_snapshot(state)
         return
 
-    now_ms = int(runtime.now() * 1000)
+    now_ms = int(now * 1000)
     cutoff_ms = now_ms - (BINANCE_OBI_ZSCORE_WINDOW_SECONDS * 1000)
     state.binance_alpha_buffer.evict_older_than(cutoff_ms)
     state.binance_alpha_buffer.append(now_ms, raw_imbalance)
-    state.binance_alpha_buffer.evict_older_than(cutoff_ms)
 
-    state.binance_alpha_last_updated = runtime.now()
+    state.binance_alpha_last_updated = now
     state.binance_alpha_raw_imbalance = raw_imbalance
     state.binance_alpha_warmup_seconds = state.binance_alpha_buffer.span_seconds()
     std = state.binance_alpha_buffer.std()
@@ -780,6 +1255,7 @@ def _update_binance_alpha_metrics(state, runtime):
         state.binance_alpha_zscore = None
         state.binance_alpha_shift_bps = 0.0
         state.binance_alpha_ready = False
+        publish_binance_alpha_snapshot(state)
         return
 
     mean = state.binance_alpha_buffer.mean()
@@ -790,6 +1266,7 @@ def _update_binance_alpha_metrics(state, runtime):
         state.binance_alpha_buffer.count >= BINANCE_OBI_MIN_SAMPLES
         and state.binance_alpha_warmup_seconds >= BINANCE_OBI_WARMUP_SECONDS
     )
+    publish_binance_alpha_snapshot(state)
 
 
 async def _fetch_binance_depth_snapshot(symbol):
@@ -808,9 +1285,20 @@ def _initialize_binance_local_book(state, snapshot):
     """Reset and seed the local Binance book from a REST snapshot."""
     clear_binance_alpha_state(state)
     state.binance_last_update_id = int(snapshot["lastUpdateId"])
-    _apply_book_updates(state.binance_bid_book, snapshot.get("bids", []))
-    _apply_book_updates(state.binance_ask_book, snapshot.get("asks", []))
+    state.binance_best_bid, _ = _apply_book_updates(
+        state.binance_bid_book,
+        snapshot.get("bids", []),
+        current_best_price=None,
+        is_bid=True,
+    )
+    state.binance_best_ask, _ = _apply_book_updates(
+        state.binance_ask_book,
+        snapshot.get("asks", []),
+        current_best_price=None,
+        is_bid=False,
+    )
     _trim_binance_books(state)
+    _rebuild_binance_band_totals(state)
 
 
 def _extract_binance_depth_event(message):
@@ -841,16 +1329,55 @@ def _apply_binance_depth_event(state, event, require_prev_match=True):
     if final_update_id < int(state.binance_last_update_id):
         return False
 
-    _apply_book_updates(state.binance_bid_book, event.get("b", []))
-    _apply_book_updates(state.binance_ask_book, event.get("a", []))
+    previous_band_mid = state.binance_band_mid_price
+    previous_band_lower = state.binance_band_lower_bound
+    previous_band_upper = state.binance_band_upper_bound
+
+    state.binance_best_bid, bid_band_delta = _apply_book_updates(
+        state.binance_bid_book,
+        event.get("b", []),
+        current_best_price=state.binance_best_bid,
+        is_bid=True,
+        lower_bound=previous_band_lower,
+        upper_bound=previous_band_upper,
+    )
+    state.binance_best_ask, ask_band_delta = _apply_book_updates(
+        state.binance_ask_book,
+        event.get("a", []),
+        current_best_price=state.binance_best_ask,
+        is_bid=False,
+        lower_bound=previous_band_lower,
+        upper_bound=previous_band_upper,
+    )
     state.binance_last_update_id = final_update_id
-    _trim_binance_books(state)
+    state.binance_book_updates_since_trim += 1
+
+    if (
+        state.binance_best_bid is None
+        or state.binance_best_ask is None
+        or state.binance_best_bid >= state.binance_best_ask
+    ):
+        _refresh_binance_best_prices(state)
+        if (
+            state.binance_best_bid is None
+            or state.binance_best_ask is None
+            or state.binance_best_bid >= state.binance_best_ask
+        ):
+            raise BinanceOrderBookSyncError("Binance local book became crossed or empty")
+
+    if previous_band_mid is not None and not _binance_band_requires_rebuild(state):
+        state.binance_band_bid_qty += bid_band_delta
+        state.binance_band_ask_qty += ask_band_delta
+    else:
+        _rebuild_binance_band_totals(state)
+
     return True
 
 
-async def binance_orderbook_imbalance_updater(state, symbol, runtime):
+async def binance_orderbook_imbalance_updater(state, symbol, runtime, alpha_engine=None):
     """Maintain a bounded local Binance futures book and rolling imbalance alpha."""
     log = logging.getLogger("BinanceOBIUpdater")
+    alpha_engine = alpha_engine or BinanceAlphaEngine()
     websocket_url = _binance_depth_stream_url(symbol)
     reconnect_delay = 5.0
     max_reconnect_delay = 60.0
@@ -859,11 +1386,12 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime):
         try:
             log.info(f"Connecting to Binance OBI stream: {websocket_url}")
             state.binance_alpha_ws_connected = False
-            clear_binance_alpha_state(state)
+            alpha_engine.clear(state)
             request_quote_refresh(state)
 
             async with websockets.connect(websocket_url, ping_interval=20, ping_timeout=10) as websocket:
                 state.binance_alpha_ws_connected = True
+                publish_binance_alpha_snapshot(state)
                 request_quote_refresh(state)
                 reconnect_delay = 5.0
                 log.info(f"Binance OBI connected for {symbol} via diff-depth @100ms")
@@ -878,7 +1406,7 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime):
                         buffered_events.append(event)
 
                 snapshot = await snapshot_task
-                _initialize_binance_local_book(state, snapshot)
+                alpha_engine.initialize_local_book(state, snapshot)
 
                 buffered_events = [event for event in buffered_events if int(event["u"]) >= int(state.binance_last_update_id)]
                 start_index = None
@@ -890,8 +1418,8 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime):
                     raise BinanceOrderBookSyncError("Could not align Binance buffered events with snapshot")
 
                 for idx, event in enumerate(buffered_events[start_index or 0:]):
-                    _apply_binance_depth_event(state, event, require_prev_match=(idx != 0))
-                    _update_binance_alpha_metrics(state, runtime)
+                    alpha_engine.apply_depth_event(state, event, require_prev_match=(idx != 0))
+                    alpha_engine.update_metrics(state, runtime)
 
                 last_message_time = runtime.now()
                 last_ready = state.binance_alpha_ready
@@ -907,10 +1435,10 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime):
                     if event is None:
                         continue
 
-                    _apply_binance_depth_event(state, event)
+                    alpha_engine.apply_depth_event(state, event)
                     previous_ready = state.binance_alpha_ready
                     previous_shift = state.binance_alpha_shift_bps
-                    _update_binance_alpha_metrics(state, runtime)
+                    alpha_engine.update_metrics(state, runtime)
 
                     if state.binance_alpha_ready and not previous_ready:
                         zscore = state.binance_alpha_zscore if state.binance_alpha_zscore is not None else 0.0
@@ -951,7 +1479,7 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime):
             log.error(f"Binance OBI updater error: {exc}", exc_info=True)
         finally:
             state.binance_alpha_ws_connected = False
-            clear_binance_alpha_state(state)
+            alpha_engine.clear(state)
             request_quote_refresh(state)
 
         if not runtime.shutdown_requested:
@@ -1334,6 +1862,19 @@ def get_runtime_quote_params(state):
     return get_unavailable_quote_params()
 
 
+def get_runtime_prepared_quote_params(state):
+    """Return the prevalidated quote snapshot used by the quote hot path."""
+    raw_params = get_runtime_quote_params(state)
+    prepared = state.prepared_quote_params
+    if prepared is None:
+        return prepare_quote_params_snapshot(raw_params)
+    if prepared.kind == "unavailable" and raw_params.get("source") != "unavailable":
+        return prepare_quote_params_snapshot(raw_params)
+    if prepared.source != str(raw_params.get("source") or "unavailable"):
+        return prepare_quote_params_snapshot(raw_params)
+    return prepared
+
+
 def record_opening_order_failure(state, runtime):
     """Track exchange-side opening-order failures and trip a cooldown breaker when they cluster."""
     now = runtime.now()
@@ -1405,31 +1946,40 @@ def get_binance_alpha_shift_abs(state, reference_price):
     """Convert the current Binance alpha shift in bps into an absolute price offset."""
     if reference_price is None or reference_price <= 0:
         return 0.0
-    if not USE_BINANCE_OBI_ALPHA or not state.binance_alpha_ready:
+    alpha_snapshot = state.binance_alpha_snapshot
+    alpha_ready = alpha_snapshot.ready or state.binance_alpha_ready
+    shift_bps = alpha_snapshot.shift_bps if alpha_snapshot.ready else state.binance_alpha_shift_bps
+    if not USE_BINANCE_OBI_ALPHA or not alpha_ready:
         return 0.0
-    return float(reference_price) * (state.binance_alpha_shift_bps / 10000.0)
+    return float(reference_price) * (shift_bps / 10000.0)
 
 
 def build_order_plan(state, opening_mode, params):
     """Build the intended side, price, and size for the next quote."""
+    if isinstance(params, dict):
+        params = prepare_quote_params_snapshot(params)
+
     close_side = get_close_side_for_trading(state)
 
-    if params["source"] != "default":
-        gamma = params["gamma"]
-        sigma = params["sigma"]
-        k_buy = params["k_buy"]
-        k_sell = params["k_sell"]
-        time_horizon = params["time_horizon_days"]
+    if params.kind == "avellaneda":
+        gamma = params.gamma
+        sigma = params.sigma
+        k_buy = params.k_buy
+        k_sell = params.k_sell
+        time_horizon = params.time_horizon_days
         position_size = state.position_size
         mid_price = state.mid_price
-        spread_limits_bps = resolve_avellaneda_spread_limits_bps(params)
+        spread_limits_bps = {
+            "min": params.spread_limits_min_bps,
+            "max": params.spread_limits_max_bps,
+        }
 
         risk_term = gamma * ((sigma * mid_price) ** 2) * time_horizon
         reservation_price = mid_price - position_size * risk_term
         alpha_shift_abs = get_binance_alpha_shift_abs(state, mid_price)
         reservation_price += alpha_shift_abs
-        ask_offset = (1 / gamma) * np.log(1 + (gamma / k_buy)) + (risk_term / 2.0)
-        bid_offset = (1 / gamma) * np.log(1 + (gamma / k_sell)) + (risk_term / 2.0)
+        ask_offset = (1 / gamma) * math.log1p(gamma / k_buy) + (risk_term / 2.0)
+        bid_offset = (1 / gamma) * math.log1p(gamma / k_sell) + (risk_term / 2.0)
         ask_offset = clamp_offset_to_spread_limits(ask_offset, mid_price, spread_limits_bps)
         bid_offset = clamp_offset_to_spread_limits(bid_offset, mid_price, spread_limits_bps)
         ask_price = reservation_price + ask_offset
@@ -1454,10 +2004,13 @@ def build_order_plan(state, opening_mode, params):
             "reservation_price": reservation_price,
             "bid_price": bid_price,
             "ask_price": ask_price,
-            "binance_alpha_shift_bps": state.binance_alpha_shift_bps if state.binance_alpha_ready else 0.0,
+            "binance_alpha_shift_bps": state.binance_alpha_snapshot.shift_bps if state.binance_alpha_snapshot.ready else 0.0,
         }
 
-    buy_spread, sell_spread = params["buy_spread"], params["sell_spread"]
+    if params.kind == "unavailable":
+        return None
+
+    buy_spread, sell_spread = params.buy_spread, params.sell_spread
     alpha_shift_abs = get_binance_alpha_shift_abs(state, state.mid_price)
     if close_side:
         side, reduce_only = close_side, True
@@ -1476,20 +2029,16 @@ def build_order_plan(state, opening_mode, params):
         "quantity_to_trade": quantity_to_trade,
         "limit_price": limit_price,
         "used_spread": used_spread,
-        "binance_alpha_shift_bps": state.binance_alpha_shift_bps if state.binance_alpha_ready else 0.0,
+        "binance_alpha_shift_bps": state.binance_alpha_snapshot.shift_bps if state.binance_alpha_snapshot.ready else 0.0,
     }
 
 
 def prepare_order_candidate(symbol_filters, side, reduce_only, limit_price, quantity_to_trade):
     """Round and validate an order candidate against exchange filters."""
     rounded_price = round_price_to_tick(limit_price, symbol_filters['tick_size'], side)
-    formatted_price = f"{rounded_price:.{symbol_filters['price_precision']}f}"
-
     rounded_quantity = round_quantity_to_step(quantity_to_trade, symbol_filters['step_size'])
-    formatted_quantity = f"{rounded_quantity:.{symbol_filters['quantity_precision']}f}"
-
-    quantity_value = float(formatted_quantity)
-    price_value = float(formatted_price)
+    quantity_value = float(rounded_quantity)
+    price_value = float(rounded_price)
     min_qty = symbol_filters['min_qty']
     min_notional = symbol_filters['min_notional']
     order_notional = price_value * quantity_value
@@ -1498,8 +2047,6 @@ def prepare_order_candidate(symbol_filters, side, reduce_only, limit_price, quan
         return {
             "ok": False,
             "reason": "non_positive_quantity",
-            "formatted_price": formatted_price,
-            "formatted_quantity": formatted_quantity,
             "rounded_price": rounded_price,
             "rounded_quantity": rounded_quantity,
         }
@@ -1508,8 +2055,6 @@ def prepare_order_candidate(symbol_filters, side, reduce_only, limit_price, quan
         return {
             "ok": False,
             "reason": "min_qty",
-            "formatted_price": formatted_price,
-            "formatted_quantity": formatted_quantity,
             "rounded_price": rounded_price,
             "rounded_quantity": rounded_quantity,
             "min_qty": min_qty,
@@ -1520,8 +2065,6 @@ def prepare_order_candidate(symbol_filters, side, reduce_only, limit_price, quan
         return {
             "ok": False,
             "reason": "min_notional",
-            "formatted_price": formatted_price,
-            "formatted_quantity": formatted_quantity,
             "rounded_price": rounded_price,
             "rounded_quantity": rounded_quantity,
             "order_notional": order_notional,
@@ -1530,8 +2073,6 @@ def prepare_order_candidate(symbol_filters, side, reduce_only, limit_price, quan
 
     return {
         "ok": True,
-        "formatted_price": formatted_price,
-        "formatted_quantity": formatted_quantity,
         "rounded_price": rounded_price,
         "rounded_quantity": rounded_quantity,
         "order_notional": order_notional,
@@ -1540,25 +2081,19 @@ def prepare_order_candidate(symbol_filters, side, reduce_only, limit_price, quan
 
 def build_quote_command(state, symbol_filters):
     """Build the current desired order command from in-memory state only."""
-    params = get_runtime_quote_params(state)
-    if params.get("source") == "unavailable":
+    params = get_runtime_prepared_quote_params(state)
+    if params.kind == "unavailable":
         return None, {"reason": "missing_quote_params"}
-
-    if params.get("source") != "default":
-        required_positive = ("gamma", "time_horizon_days", "sigma", "k_buy", "k_sell")
-        if not all(params.get(key) is not None and params.get(key) > 0 for key in required_positive):
-            return None, {"reason": "invalid_quote_params"}
-    else:
-        if not all(params.get(key) is not None and params.get(key) > 0 for key in ("buy_spread", "sell_spread")):
-            return None, {"reason": "invalid_quote_params"}
 
     opening_mode, _ = get_strategy_modes(state.flip_mode)
     order_plan = build_order_plan(state, opening_mode, params)
+    if order_plan is None:
+        return None, {"reason": "invalid_quote_params"}
     if not order_plan["reduce_only"] and USE_BINANCE_OBI_ALPHA and not is_binance_alpha_live(state):
         return None, {
             "reason": "binance_alpha_unavailable",
-            "warmup_seconds": state.binance_alpha_warmup_seconds,
-            "sample_count": state.binance_alpha_buffer.count,
+            "warmup_seconds": state.binance_alpha_snapshot.warmup_seconds,
+            "sample_count": state.binance_alpha_snapshot.sample_count,
         }
 
     if not order_plan["reduce_only"]:
@@ -1584,10 +2119,8 @@ def build_quote_command(state, symbol_filters):
         kind="quote",
         side=order_plan["side"],
         reduce_only=order_plan["reduce_only"],
-        price=float(order_candidate["formatted_price"]),
-        quantity=float(order_candidate["formatted_quantity"]),
-        formatted_price=order_candidate["formatted_price"],
-        formatted_quantity=order_candidate["formatted_quantity"],
+        price=float(order_candidate["rounded_price"]),
+        quantity=float(order_candidate["rounded_quantity"]),
         order_notional=order_candidate["order_notional"],
         trigger="price",
     )
@@ -1773,12 +2306,54 @@ async def handle_terminal_order_update(
     else:
         log.info(f"{order_label} {order_id} ended as {terminal_update['status']} without an executed fill.")
 
-    clear_order_tracking(state)
+    if state.active_order_id == order_id:
+        clear_order_tracking(state)
     log.debug(f"Adding 0.01s delay after {order_label.lower()} terminal update")
     await asyncio.sleep(0.01)
 
 
-async def place_order_from_command(state, client, symbol, runtime, log, command):
+async def reconcile_stale_pending_terminal_orders(state, client, symbol, runtime, log):
+    """Resolve old canceled/replaced orders asynchronously so fast replace stays off the hot path."""
+    stale_order_ids = [
+        order_id
+        for order_id, pending in state.pending_terminal_orders.items()
+        if runtime.now() - pending.cancel_requested_at >= CANCEL_CONFIRM_TIMEOUT
+    ]
+    for order_id in stale_order_ids:
+        pending = state.pending_terminal_orders.get(order_id)
+        if pending is None:
+            continue
+
+        try:
+            order_data = await client.get_order_status(symbol, order_id)
+        except Exception as rest_error:
+            log.error(f"{pending.order_label} {order_id}: failed to confirm terminal state via REST: {rest_error}")
+            continue
+
+        terminal_update = classify_order_update(order_data)
+        if not terminal_update["is_terminal"]:
+            log.warning(
+                f"{pending.order_label} {order_id}: still non-terminal after async REST confirmation "
+                f"({terminal_update['status']}). Leaving it for the watchdog."
+            )
+            continue
+
+        await handle_terminal_order_update(
+            state,
+            client,
+            symbol,
+            log,
+            pending.side,
+            order_id,
+            terminal_update,
+            pending.position_update_seq_before_fill,
+            pending.order_label,
+        )
+        state.pending_terminal_orders.pop(order_id, None)
+        request_quote_refresh(state)
+
+
+async def place_order_from_command(state, client, symbol, runtime, log, command, symbol_filters=None):
     """Submit the desired order command and update local tracking."""
     current_time = runtime.now()
     time_since_last_order = current_time - runtime.last_order_time
@@ -1795,15 +2370,21 @@ async def place_order_from_command(state, client, symbol, runtime, log, command)
     if state.mid_price:
         percentage_diff = (command.price - state.mid_price) / state.mid_price * 100
 
+    filters = symbol_filters or state.symbol_filters or {}
+    price_precision = int(filters.get("price_precision", 8))
+    quantity_precision = int(filters.get("quantity_precision", 8))
+    formatted_price = f"{command.price:.{price_precision}f}"
+    formatted_quantity = f"{command.quantity:.{quantity_precision}f}"
+
     log.info(
-        f"Placing {command.side} order: {command.formatted_quantity} {symbol} @ {command.formatted_price} "
-        f"({percentage_diff:+.4f}% from mid-price, Binance shift {state.binance_alpha_shift_bps:+.1f} bps)"
+        f"Placing {command.side} order: {formatted_quantity} {symbol} @ {formatted_price} "
+        f"({percentage_diff:+.4f}% from mid-price, Binance shift {state.binance_alpha_snapshot.shift_bps:+.1f} bps)"
     )
 
     active_order = await client.place_order(
         symbol,
-        command.formatted_price,
-        command.formatted_quantity,
+        formatted_price,
+        formatted_quantity,
         command.side,
         command.reduce_only,
     )
@@ -1822,12 +2403,15 @@ async def place_order_from_command(state, client, symbol, runtime, log, command)
 async def avellaneda_params_updater(state, symbol, runtime):
     """Refresh quote parameters out of band so the quote engine stays memory-only."""
     log = logging.getLogger('AvellanedaParamsUpdater')
+    quote_engine = QuoteEngine()
 
     while not runtime.shutdown_requested:
         try:
             params = get_avellaneda_params(symbol)
-            if params != state.quote_params:
+            prepared_params = quote_engine.prepare_quote_params(params)
+            if params != state.quote_params or prepared_params != state.prepared_quote_params:
                 state.quote_params = params
+                state.prepared_quote_params = prepared_params
                 log.info(f"Updated quoting parameters for {symbol} from {params['source']}")
                 request_quote_refresh(state)
         except Exception as exc:
@@ -1836,20 +2420,63 @@ async def avellaneda_params_updater(state, symbol, runtime):
         await asyncio.sleep(SPREAD_CACHE_TTL_SECONDS)
 
 
-async def order_manager_loop(state, client, symbol, runtime):
+async def order_manager_loop_impl(state, client, symbol, runtime, executor):
     """Own the active exchange order and react to quote intents immediately."""
     log = logging.getLogger('OrderManager')
 
     while not runtime.shutdown_requested:
         try:
+            await reconcile_stale_pending_terminal_orders(state, client, symbol, runtime, log)
+
             if not state.active_order_id:
-                command = await state.order_commands.get()
+                if state.pending_terminal_orders:
+                    order_update_task = asyncio.create_task(state.order_updates.get())
+                    command_task = asyncio.create_task(state.order_commands.get())
+                    done, pending = await asyncio.wait(
+                        {order_update_task, command_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+
+                    if order_update_task in done:
+                        received_update = order_update_task.result()
+                        order_data = received_update.get('o', {})
+                        order_id = order_data.get('i')
+                        if received_update.get('e') == 'ORDER_TRADE_UPDATE' and order_id in state.pending_terminal_orders:
+                            terminal_update = classify_order_update(order_data)
+                            if terminal_update["is_terminal"]:
+                                pending_order = state.pending_terminal_orders.pop(order_id)
+                                order_was_opening = not is_order_reduce_only(order_data)
+                                if terminal_update["status"] == "REJECTED" and order_was_opening:
+                                    record_opening_order_failure(state, runtime)
+                                elif terminal_update["status"] == "FILLED" and order_was_opening:
+                                    reset_opening_order_failures(state)
+                                await handle_terminal_order_update(
+                                    state,
+                                    client,
+                                    symbol,
+                                    log,
+                                    pending_order.side,
+                                    order_id,
+                                    terminal_update,
+                                    pending_order.position_update_seq_before_fill,
+                                    pending_order.order_label,
+                                )
+                                request_quote_refresh(state)
+                        continue
+
+                    command = command_task.result()
+                else:
+                    command = await state.order_commands.get()
                 command = drain_latest_order_command(state, command)
                 if command.kind != "quote":
                     continue
 
                 try:
-                    placed = await place_order_from_command(state, client, symbol, runtime, log, command)
+                    placed = await executor.place_order(state, client, symbol, runtime, log, command)
                 except Exception:
                     if not command.reduce_only:
                         record_opening_order_failure(state, runtime)
@@ -1883,7 +2510,8 @@ async def order_manager_loop(state, client, symbol, runtime):
 
             if received_update is not None:
                 order_data = received_update.get('o', {})
-                if received_update.get('e') == 'ORDER_TRADE_UPDATE' and order_data.get('i') == state.active_order_id:
+                order_id = order_data.get('i')
+                if received_update.get('e') == 'ORDER_TRADE_UPDATE' and order_id == state.active_order_id:
                     terminal_update = classify_order_update(order_data)
                     if terminal_update["is_terminal"]:
                         order_was_opening = not is_order_reduce_only(order_data)
@@ -1904,6 +2532,29 @@ async def order_manager_loop(state, client, symbol, runtime):
                             terminal_update,
                             position_update_seq_before_fill,
                             "Order",
+                        )
+                        request_quote_refresh(state)
+                        action_taken = True
+                elif received_update.get('e') == 'ORDER_TRADE_UPDATE' and order_id in state.pending_terminal_orders:
+                    terminal_update = classify_order_update(order_data)
+                    if terminal_update["is_terminal"]:
+                        pending = state.pending_terminal_orders.pop(order_id)
+                        order_was_opening = not is_order_reduce_only(order_data)
+                        if terminal_update["status"] == "REJECTED" and order_was_opening:
+                            record_opening_order_failure(state, runtime)
+                        elif terminal_update["status"] == "FILLED" and order_was_opening:
+                            reset_opening_order_failures(state)
+
+                        await handle_terminal_order_update(
+                            state,
+                            client,
+                            symbol,
+                            log,
+                            pending.side,
+                            order_id,
+                            terminal_update,
+                            pending.position_update_seq_before_fill,
+                            pending.order_label,
                         )
                         request_quote_refresh(state)
                         action_taken = True
@@ -1945,16 +2596,39 @@ async def order_manager_loop(state, client, symbol, runtime):
                 elif should_reuse_order(state, command.price, command.side, command.quantity):
                     action_taken = True
                 else:
-                    if not await cancel_and_finalize_active_order(
-                        state,
-                        client,
-                        symbol,
-                        log,
-                        command.trigger or "Requote replacement",
-                        "Requote order",
-                    ):
-                        await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
-                        continue
+                    if executor.fast_replace:
+                        order_id = state.active_order_id
+                        if not await cancel_active_order(
+                            state,
+                            client,
+                            symbol,
+                            log,
+                            command.trigger or "Fast requote replacement",
+                            clear_tracking_on_success=False,
+                        ):
+                            await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+                            continue
+
+                        if order_id is not None:
+                            state.pending_terminal_orders[order_id] = PendingTerminalOrder(
+                                side=state.last_order_side or command.side,
+                                reduce_only=False,
+                                position_update_seq_before_fill=state.position_update_seq,
+                                order_label="Fast requote order",
+                                cancel_requested_at=runtime.now(),
+                            )
+                        clear_order_tracking(state)
+                    else:
+                        if not await cancel_and_finalize_active_order(
+                            state,
+                            client,
+                            symbol,
+                            log,
+                            command.trigger or "Requote replacement",
+                            "Requote order",
+                        ):
+                            await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+                            continue
 
                     if runtime.shutdown_requested:
                         break
@@ -1962,7 +2636,7 @@ async def order_manager_loop(state, client, symbol, runtime):
                     command = drain_latest_order_command(state, command)
                     if command.kind == "quote":
                         try:
-                            placed = await place_order_from_command(state, client, symbol, runtime, log, command)
+                            placed = await executor.place_order(state, client, symbol, runtime, log, command)
                         except Exception:
                             if not command.reduce_only:
                                 record_opening_order_failure(state, runtime)
@@ -1985,6 +2659,12 @@ async def order_manager_loop(state, client, symbol, runtime):
             if state.active_order_id:
                 await cancel_active_order(state, client, symbol, log, "Order manager error")
             await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+
+
+async def order_manager_loop(state, client, symbol, runtime, executor=None):
+    """Compatibility wrapper around the explicit OrderExecutor component."""
+    executor = executor or OrderExecutor()
+    return await order_manager_loop_impl(state, client, symbol, runtime, executor)
 
 
 def _safe_float(value):
@@ -2086,81 +2766,10 @@ def get_avellaneda_params(symbol):
         return unavailable_params
 
 
-async def market_making_loop(state, client, symbol, runtime):
-    """Event-driven quote engine: turn the latest state snapshot into a desired order command."""
-    log = logging.getLogger('MarketMakerLoop')
-    log.info(f"Fetching trading rules for {symbol}...")
-    symbol_filters = await client.get_symbol_filters(symbol)
-    log.info(f"Filters loaded: {symbol_filters}")
-    request_quote_refresh(state)
-
-    while not runtime.shutdown_requested:
-        try:
-            await state.quote_refresh_event.wait()
-            state.quote_refresh_event.clear()
-
-            while True:
-                if runtime.shutdown_requested:
-                    break
-
-                if symbol_filters.get("status", "TRADING") != "TRADING":
-                    if state.active_order_id:
-                        publish_latest_order_command(
-                            state,
-                            OrderCommand(kind="cancel", trigger=f"Symbol status {symbol_filters.get('status', 'UNKNOWN')}"),
-                        )
-                    break
-
-                if not state.price_ws_connected or not state.user_data_ws_connected:
-                    if state.active_order_id:
-                        publish_latest_order_command(
-                            state,
-                            OrderCommand(kind="cancel", trigger="WebSocket disconnection"),
-                        )
-                    break
-
-                if not is_price_data_valid(state, runtime) or not is_balance_data_valid(state):
-                    break
-
-                if is_opening_circuit_breaker_active(state, runtime) and not has_open_position(state):
-                    break
-
-                bias_changed, current_notional = apply_supertrend_bias(state)
-                if bias_changed:
-                    trend_name = "DOWNTREND" if state.flip_mode else "UPTREND"
-                    log.info(f"Supertrend switched strategy bias to {trend_name} while inventory was below ${current_notional:.2f}.")
-
-                quote_command, order_candidate = build_quote_command(state, symbol_filters)
-                if quote_command is None:
-                    reason = order_candidate["reason"]
-                    if reason in {"missing_quote_params", "invalid_quote_params", "binance_alpha_unavailable"}:
-                        if state.active_order_id:
-                            publish_latest_order_command(
-                                state,
-                                OrderCommand(kind="cancel", trigger=f"Quotes unavailable: {reason}"),
-                            )
-                        break
-
-                    if reason in {"non_positive_quantity", "min_qty", "min_notional"} and state.active_order_id:
-                        publish_latest_order_command(
-                            state,
-                            OrderCommand(kind="cancel", trigger=f"Quote invalid: {reason}"),
-                        )
-                    break
-
-                if not should_reuse_order(state, quote_command.price, quote_command.side, quote_command.quantity):
-                    publish_latest_order_command(state, quote_command)
-
-                if not state.quote_refresh_event.is_set():
-                    break
-                state.quote_refresh_event.clear()
-
-        except asyncio.CancelledError:
-            log.info("Quote engine cancelled.")
-            break
-        except Exception as exc:
-            log.error(f"An error occurred in the quote engine: {exc}", exc_info=True)
-            await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+async def market_making_loop(state, client, symbol, runtime, quote_engine=None):
+    """Compatibility wrapper around the explicit QuoteEngine component."""
+    quote_engine = quote_engine or QuoteEngine()
+    return await quote_engine.run(state, client, symbol, runtime)
 
 
 
@@ -2275,6 +2884,10 @@ async def main():
     try:
         client = ApiClient(API_USER, API_SIGNER, API_PRIVATE_KEY, RELEASE_MODE)
         state = StrategyState(flip_mode=FLIP_MODE)
+        quote_engine = QuoteEngine()
+        order_executor = OrderExecutor()
+        top_of_book_feed = AsterTopOfBookFeed()
+        alpha_engine = BinanceAlphaEngine()
 
         async with client:
             if not await ensure_clean_startup(client, args.symbol):
@@ -2293,14 +2906,31 @@ async def main():
 
             params_task = asyncio.create_task(avellaneda_params_updater(state, args.symbol, runtime))
             support_tasks = [
-                asyncio.create_task(websocket_price_updater(state, args.symbol, runtime)),
+                asyncio.create_task(
+                    websocket_price_updater(
+                        state,
+                        args.symbol,
+                        runtime,
+                        top_of_book_feed=top_of_book_feed,
+                        quote_engine=quote_engine,
+                    )
+                ),
                 asyncio.create_task(websocket_user_data_updater(state, client, args.symbol, runtime)),
                 params_task,
             ]
             if USE_SUPERTREND_SIGNAL:
                 support_tasks.append(asyncio.create_task(supertrend_signal_updater(state, args.symbol, runtime)))
             if USE_BINANCE_OBI_ALPHA:
-                support_tasks.append(asyncio.create_task(binance_orderbook_imbalance_updater(state, args.symbol, runtime)))
+                support_tasks.append(
+                    asyncio.create_task(
+                        binance_orderbook_imbalance_updater(
+                            state,
+                            args.symbol,
+                            runtime,
+                            alpha_engine=alpha_engine,
+                        )
+                    )
+                )
             tasks.extend(support_tasks)
 
             if not await wait_for_startup_inputs(state, args.symbol, runtime):
@@ -2350,13 +2980,15 @@ async def main():
                 logging.warning(f"Could not check for existing position or set leverage, starting in default {state.mode} mode: {e}", exc_info=True)
 
             # Start all async tasks
-            quote_task = asyncio.create_task(market_making_loop(state, client, args.symbol, runtime))
-            order_task = asyncio.create_task(order_manager_loop(state, client, args.symbol, runtime))
+            quote_task = asyncio.create_task(market_making_loop(state, client, args.symbol, runtime, quote_engine=quote_engine))
+            order_task = asyncio.create_task(order_manager_loop(state, client, args.symbol, runtime, executor=order_executor))
+            watchdog_task = asyncio.create_task(order_executor.watch_open_orders(state, client, args.symbol, runtime))
             core_tasks = [quote_task, order_task]
             tasks.extend([
                 asyncio.create_task(balance_reporter(state, runtime)),
                 quote_task,
                 order_task,
+                watchdog_task,
                 asyncio.create_task(price_reporter(state, args.symbol, runtime)),
             ])
 

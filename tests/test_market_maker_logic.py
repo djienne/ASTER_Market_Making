@@ -215,8 +215,8 @@ def test_prepare_order_candidate_rejects_quantity_below_min_qty():
 
     assert candidate["ok"] is False
     assert candidate["reason"] == "min_qty"
-    assert candidate["formatted_price"] == "100.0"
-    assert candidate["formatted_quantity"] == "0.010"
+    assert abs(candidate["rounded_price"] - 100.0) < 1e-9
+    assert abs(candidate["rounded_quantity"] - 0.01) < 1e-9
 
 
 def test_quote_engine_emits_requote_command_on_price_move_above_threshold(monkeypatch):

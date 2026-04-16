@@ -1,6 +1,6 @@
 {
   "avellaneda_calculation": {
-    "fixed_gamma": 0.05,
+    "fixed_gamma": 1.0,
     "recent_param_periods": 10,
     "data_completeness_threshold": 0.90,
     "max_gap_seconds": 60,

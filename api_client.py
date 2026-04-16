@@ -197,6 +197,13 @@ class ApiClient:
         params = {"symbol": symbol}
         return await self.signed_request("DELETE", "/fapi/v3/allOpenOrders", params)
 
+    async def get_open_orders(self, symbol: str = None):
+        """Get all open orders, optionally scoped to a symbol."""
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        return await self.signed_request("GET", "/fapi/v3/openOrders", params)
+
     async def get_position_risk(self, symbol: str = None):
         """Get position risk information using Ethereum signature auth."""
         params = {}
