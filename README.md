@@ -46,7 +46,7 @@ python market_maker.py --symbol BTCUSDT
 
 ### `.env`
 
-You now only need Aster **Pro API V3** credentials. The same credential set is used for trading, account/user-data REST calls, and user-data listen-key management.
+You only need Aster **Pro API V3** credentials for live trading, account/user-data REST calls, and user-data listen-key management. The public `data_collector.py` flow does not require those credentials.
 
 ![API Management](APIs.png)
 
@@ -79,6 +79,7 @@ SYMBOL=BTCUSDT
 - `find_trend.py` defaults to `.env` `SYMBOL`, or `BTCUSDT`, and writes its params file using the same base-symbol normalization.
 - The live trading bot and user-data stream both use Pro API V3 signer-based auth; there is no longer a separate `APIV1_*` credential requirement in this repo.
 - `data_collector.py` currently stores partial order book snapshots from the top `N` levels (`@depth5/@depth10/@depth20` style streams), not a fully reconstructed local order book from diff-depth updates.
+- Order book parquet output keeps the active hour in `ASTER_data/orderbook_parquet/{SYMBOL}/_latest.parquet` and archives one UTC-hour parquet per completed hour using filenames like `20260416T090000Z.parquet`.
 
 ## Main Strategy Parameters
 
@@ -153,7 +154,7 @@ python terminal_dashboard.py
 ## Docker
 
 The Compose stack now supports the full automated loop in [docker-compose.yml](docker-compose.yml):
-- `data-collector` gathers market data for `.env` `SYMBOL`
+- `data-collector` gathers only `BTCUSDT` market data, even when no `.env` file exists
 - `avellaneda-params` retries parameter generation every 5 minutes
 - `trend-finder` refreshes the Supertrend file every 5 minutes
 - `market-maker` starts immediately but stays idle until valid Avellaneda quotes become available
@@ -164,6 +165,8 @@ docker-compose up -d
 docker-compose logs -f data-collector avellaneda-params trend-finder market-maker
 docker-compose down
 ```
+
+If you only want background market-data collection, `docker compose up -d data-collector` does not require a `.env` file or live credentials, and that service will collect only `BTCUSDT`. When you later want live trading, create the repo-root `.env` file with your real `API_USER`, `API_SIGNER`, `API_PRIVATE_KEY`, and `SYMBOL`.
 
 For `SYMBOL=BTCUSDT`, the automated stack will not quote immediately on a fresh machine. It will first collect BTC data, then `avellaneda-params` will keep retrying until there is enough continuous history to write a valid `params/avellaneda_parameters_BTC.json`. Once that file exists, the running market maker can begin quoting automatically.
 

@@ -5,6 +5,7 @@ import time
 import os
 import csv
 import argparse
+import signal
 import requests
 from datetime import datetime
 from collections import deque
@@ -18,6 +19,8 @@ def _default_markets():
 LIST_MARKETS = _default_markets()
 
 class WebSocketDataCollector:
+    ORDERBOOK_ARCHIVE_INTERVAL_MS = 60 * 60 * 1000
+
     def __init__(self, symbols, flush_interval=5, order_book_levels=10):
         self.symbols = [symbol.upper() for symbol in symbols]
         self.flush_interval = flush_interval
@@ -42,6 +45,7 @@ class WebSocketDataCollector:
         self.orderbook_buffer = {}  # symbol -> deque of partial order book snapshots
         self.trades_buffer = {}  # symbol -> deque of trade records
         self.seen_trade_ids = {}  # symbol -> set of seen trade IDs
+        self.orderbook_staging_recovered = {}  # symbol -> whether `_latest.parquet` has been merged after startup
 
         # Thread management
         self.flush_thread = None
@@ -53,6 +57,7 @@ class WebSocketDataCollector:
             self.orderbook_buffer[symbol] = deque()
             self.trades_buffer[symbol] = deque()
             self.seen_trade_ids[symbol] = self.load_seen_trade_ids(symbol)
+            self.orderbook_staging_recovered[symbol] = False
 
         print(f"Initialized WebSocket Data Collector for: {', '.join(self.symbols)}")
 
@@ -124,8 +129,12 @@ class WebSocketDataCollector:
             response.raise_for_status()
             data = response.json()
 
-            # Use transaction time from API response (in ms)
-            timestamp = int(data['T'])
+            # Prefer exchange timestamps when present, otherwise fall back to current wall time.
+            timestamp = (
+                self._coerce_timestamp_ms(data.get('T'))
+                or self._coerce_timestamp_ms(data.get('E'))
+                or int(time.time() * 1000)
+            )
             bids = [[float(bid[0]), float(bid[1])] for bid in data.get('bids', [])[:self.order_book_levels]]
             asks = [[float(ask[0]), float(ask[1])] for ask in data.get('asks', [])[:self.order_book_levels]]
 
@@ -133,7 +142,9 @@ class WebSocketDataCollector:
                 'timestamp': timestamp,
                 'bids': bids,
                 'asks': asks,
-                'lastUpdateId': data.get('lastUpdateId')
+                'lastUpdateId': data.get('lastUpdateId'),
+                'bookMode': 'partial',
+                'levels': self.order_book_levels,
             }
         except Exception as e:
             print(f"Error getting initial order book for {symbol}: {e}")
@@ -183,7 +194,9 @@ class WebSocketDataCollector:
 
                 if bids and asks:
                     # Use event time from WebSocket message (in ms)
-                    timestamp = data.get('E')
+                    timestamp = self._coerce_timestamp_ms(data.get('E'))
+                    if timestamp is None:
+                        return
 
                     # Process bids and asks up to the specified levels
                     processed_bids = [[float(bid[0]), float(bid[1])] for bid in bids[:self.order_book_levels] if len(bid) >= 2]
@@ -404,10 +417,75 @@ class WebSocketDataCollector:
         except Exception as e:
             print(f"Error flushing prices for {symbol}: {e}")
 
+    def _coerce_timestamp_ms(self, value):
+        """Convert exchange timestamps to millisecond integers when possible."""
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_orderbook_frame(self, df):
+        """Sort and deduplicate order book snapshots before writing them."""
+        if df.empty:
+            return df
+
+        df = df.copy()
+        if 'timestamp' not in df.columns:
+            return df.iloc[0:0]
+
+        df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
+        invalid_rows = int(df['timestamp'].isna().sum())
+        if invalid_rows:
+            print(f"Warning: Dropping {invalid_rows} order book records with invalid timestamps")
+            df = df[df['timestamp'].notna()].copy()
+
+        if df.empty:
+            return df
+
+        df['timestamp'] = df['timestamp'].astype('int64')
+        if 'lastUpdateId' not in df.columns:
+            df['lastUpdateId'] = pd.NA
+
+        df.sort_values(by='timestamp', inplace=True)
+        df.drop_duplicates(subset=['timestamp', 'lastUpdateId'], keep='first', inplace=True)
+        return df
+
+    def _orderbook_hour_bucket_ms(self, timestamp_ms):
+        """Return the UTC hour bucket for a millisecond timestamp."""
+        return int(timestamp_ms // self.ORDERBOOK_ARCHIVE_INTERVAL_MS * self.ORDERBOOK_ARCHIVE_INTERVAL_MS)
+
+    def _orderbook_archive_path(self, output_dir, hour_bucket_ms):
+        """Build a deterministic parquet filename for a UTC hour bucket."""
+        hour_label = datetime.utcfromtimestamp(hour_bucket_ms / 1000).strftime('%Y%m%dT%H0000Z')
+        return os.path.join(output_dir, f'{hour_label}.parquet')
+
+    def _write_orderbook_archive(self, archive_file_path, df):
+        """Write or merge an archived hourly order book parquet file."""
+        existing_df = self._read_orderbook_parquet(archive_file_path)
+        if not existing_df.empty:
+            df = pd.concat([existing_df, df], ignore_index=True)
+
+        df = self._normalize_orderbook_frame(df)
+        df.to_parquet(archive_file_path, engine='pyarrow', compression='ZSTD')
+
+    def _read_orderbook_parquet(self, file_path):
+        """Read an order book parquet file if it exists."""
+        if not os.path.isfile(file_path):
+            return pd.DataFrame()
+
+        try:
+            return pd.read_parquet(file_path, engine='pyarrow')
+        except Exception as e:
+            print(f"Warning: Could not read order book parquet {file_path}: {e}")
+            return pd.DataFrame()
+
     def flush_orderbook_buffer_to_parquet(self, symbol, force_archive=False):
         """
-        Flushes the partial order book buffer to a staging Parquet file.
-        If the buffer is full or if forced, archives the staging file.
+        Flush partial order book data to parquet files.
+        Completed UTC hours are archived into one parquet per hour, while the
+        current in-progress hour is mirrored to `_latest.parquet`.
         """
         if not self.orderbook_buffer[symbol]:
             return
@@ -416,27 +494,60 @@ class WebSocketDataCollector:
         os.makedirs(output_dir, exist_ok=True)
         staging_file_path = os.path.join(output_dir, '_latest.parquet')
 
-        # Convert current buffer to a DataFrame for saving
         df = pd.DataFrame(list(self.orderbook_buffer[symbol]))
-        df.sort_values(by='timestamp', inplace=True)
-        df.drop_duplicates(subset=['timestamp', 'lastUpdateId'], keep='first', inplace=True)
         
         try:
-            # Save to Parquet with ZSTD compression using the pyarrow engine
-            df.to_parquet(staging_file_path, engine='pyarrow', compression='ZSTD')
-            print(f"Flushed {len(df)} partial order book records for {symbol} to {staging_file_path}")
-            
-            # Check if it's time to archive the file
-            if force_archive or len(self.orderbook_buffer[symbol]) >= self.ORDERBOOK_BUFFER_SIZE_LIMIT:
-                timestamp_ms = int(time.time() * 1000)
-                archive_file_path = os.path.join(output_dir, f'{timestamp_ms}.parquet')
-                os.rename(staging_file_path, archive_file_path)
-                
-                # Clear the buffer now that it's been archived
+            if not self.orderbook_staging_recovered[symbol]:
+                existing_latest_df = self._read_orderbook_parquet(staging_file_path)
+                if not existing_latest_df.empty:
+                    df = pd.concat([existing_latest_df, df], ignore_index=True)
+                self.orderbook_staging_recovered[symbol] = True
+
+            df = self._normalize_orderbook_frame(df)
+            if df.empty:
                 self.orderbook_buffer[symbol].clear()
-                print(f"Archived {len(df)} partial order book records for {symbol} to {archive_file_path}")
-            else:
-                 print(f"Flushed {len(df)} partial order book records to staging file for {symbol}")
+                if os.path.isfile(staging_file_path):
+                    os.remove(staging_file_path)
+                print(f"No valid order book records remain for {symbol}")
+                return
+
+            df['hour_bucket_ms'] = df['timestamp'].map(self._orderbook_hour_bucket_ms)
+            current_hour_bucket = int(df['hour_bucket_ms'].max())
+            archive_hour_buckets = {
+                int(bucket_ms)
+                for bucket_ms in df['hour_bucket_ms'].unique()
+                if force_archive or int(bucket_ms) != current_hour_bucket
+            }
+
+            if len(df) >= self.ORDERBOOK_BUFFER_SIZE_LIMIT:
+                archive_hour_buckets.add(current_hour_bucket)
+
+            for hour_bucket_ms in sorted(archive_hour_buckets):
+                archive_df = df[df['hour_bucket_ms'] == hour_bucket_ms].drop(columns=['hour_bucket_ms'])
+                if archive_df.empty:
+                    continue
+
+                archive_file_path = self._orderbook_archive_path(output_dir, hour_bucket_ms)
+                self._write_orderbook_archive(archive_file_path, archive_df)
+                print(
+                    f"Archived {len(archive_df)} partial order book records for {symbol} "
+                    f"to {archive_file_path}"
+                )
+
+            latest_df = df[~df['hour_bucket_ms'].isin(archive_hour_buckets)].drop(columns=['hour_bucket_ms'])
+
+            if latest_df.empty:
+                if os.path.isfile(staging_file_path):
+                    os.remove(staging_file_path)
+                self.orderbook_buffer[symbol].clear()
+                print(f"No in-progress hourly order book staging file remains for {symbol}")
+                return
+
+            latest_df = self._normalize_orderbook_frame(latest_df)
+            latest_df.to_parquet(staging_file_path, engine='pyarrow', compression='ZSTD')
+            self.orderbook_buffer[symbol] = deque(latest_df.to_dict('records'))
+            print(f"Flushed {len(latest_df)} partial order book records for {symbol} to {staging_file_path}")
+            print(f"Flushed {len(latest_df)} partial order book records to staging file for {symbol}")
 
         except Exception as e:
             print(f"Error flushing partial order book for {symbol} to Parquet: {e}")
@@ -475,7 +586,10 @@ class WebSocketDataCollector:
         def flush_worker():
             while self.should_reconnect:
                 time.sleep(self.flush_interval)
-                self.flush_buffers()
+                try:
+                    self.flush_buffers()
+                except Exception as e:
+                    print(f"Error flushing buffers: {e}")
 
         self.flush_thread = threading.Thread(target=flush_worker, daemon=True)
         self.flush_thread.start()
@@ -559,14 +673,26 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     collector = WebSocketDataCollector(args.symbols, args.flush_interval, args.order_book_levels)
+    shutdown_requested = threading.Event()
+
+    def handle_shutdown(signum, frame):
+        signal_name = signal.Signals(signum).name
+        print(f"\nReceived {signal_name}. Shutting down...")
+        shutdown_requested.set()
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
 
     try:
         collector.start()
 
         # Keep running
-        while True:
+        while not shutdown_requested.is_set():
             time.sleep(1)
 
     except KeyboardInterrupt:
         print("\nShutting down...")
-        collector.stop()
+        shutdown_requested.set()
+    finally:
+        if collector.should_reconnect:
+            collector.stop()

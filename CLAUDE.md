@@ -263,7 +263,7 @@ The `docker-compose.yml` orchestrates 4 services:
 3. **trend-finder**: Updates trend signal every `TREND_REFRESH_MINUTES`
 4. **market-maker**: Depends on data-collector and avellaneda-params, runs trading logic
 
-All services share the `.env` file and automatically use the `SYMBOL` environment variable.
+The trading-related services (`avellaneda-params`, `trend-finder`, `market-maker`) share the repo-root `.env` file and use its `SYMBOL` environment variable. `data-collector` can run without `.env` and is pinned to `BTCUSDT`.
 
 ## Risk Management Features
 
