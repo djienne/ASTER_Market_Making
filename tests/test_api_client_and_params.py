@@ -130,6 +130,20 @@ def test_calculate_final_quotes_uses_explicit_ticker():
     assert result["ticker"] == "BTC"
 
 
+def test_stable_liquidity_term_matches_gamma_zero_limit():
+    result = cap.stable_liquidity_term(1e-12, 2.5)
+
+    assert abs(result - 0.4) < 1e-9
+
+
+def test_trailing_mean_ignores_invalid_values_without_lookahead_fill():
+    values = [float("nan"), 1.0, float("inf"), 3.0]
+
+    result = cap.trailing_mean(values, window=2, positive_only=True)
+
+    assert abs(result - 2.0) < 1e-9
+
+
 def test_calculate_final_quotes_clamps_spreads_to_configured_bps_limits():
     df = pd.DataFrame({"mid_price": [100.0]})
 

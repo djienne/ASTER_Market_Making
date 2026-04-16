@@ -25,6 +25,7 @@ logging.getLogger('numba').setLevel(logging.WARNING)
 
 DEFAULT_MIN_SPREAD_BPS = 5.0
 DEFAULT_MAX_SPREAD_BPS = 200.0
+SMALL_GAMMA = 1e-8
 
 
 def normalize_spread_limits_bps(spread_limits) -> dict:
@@ -59,6 +60,79 @@ def clamp_quote_spread_bps(raw_bps: float, side_label: str, spread_limits_bps: d
         f"{min_bps:.2f}-{max_bps:.2f} bps range and was clamped to {clamped_bps:.2f} bps."
     )
     return clamped_bps, warning
+
+
+def trailing_mean(values, *, window: int, positive_only: bool = False, non_negative_only: bool = False) -> float:
+    """Return the mean of the latest valid values in a sequence without look-ahead filling."""
+    if window <= 0:
+        return float("nan")
+
+    series = pd.Series(values, dtype="float64").replace([np.inf, -np.inf], np.nan)
+    if positive_only:
+        series = series.where(series > 0.0)
+    if non_negative_only:
+        series = series.where(series >= 0.0)
+
+    series = series.dropna()
+    if series.empty:
+        return float("nan")
+
+    return float(series.iloc[-window:].mean())
+
+
+def last_valid_value(values, *, positive_only: bool = False, non_negative_only: bool = False) -> float:
+    """Return the most recent valid value from a sequence."""
+    series = pd.Series(values, dtype="float64").replace([np.inf, -np.inf], np.nan)
+    if positive_only:
+        series = series.where(series > 0.0)
+    if non_negative_only:
+        series = series.where(series >= 0.0)
+
+    series = series.dropna()
+    if series.empty:
+        return float("nan")
+
+    return float(series.iloc[-1])
+
+
+def stable_liquidity_term(gamma: float, k: float) -> float:
+    """Stable evaluation of (1/gamma) * log(1 + gamma/k) with the gamma->0 limit."""
+    gamma = float(gamma)
+    k = float(k)
+
+    if not np.isfinite(gamma) or gamma < 0.0:
+        raise ValueError(f"gamma must be finite and non-negative, got {gamma!r}")
+    if not np.isfinite(k) or k <= 0.0:
+        raise ValueError(f"k must be finite and strictly positive, got {k!r}")
+
+    if abs(gamma) < SMALL_GAMMA:
+        return 1.0 / k
+
+    ratio = gamma / k
+    if ratio <= -1.0:
+        raise ValueError(f"Invalid gamma/k combination for log1p: gamma={gamma}, k={k}")
+
+    return float(np.log1p(ratio) / gamma)
+
+
+def validate_quote_inputs(mid_price: float, gamma: float, sigma: float, time_horizon: float, k_buy: float, k_sell: float) -> list[str]:
+    """Return validation errors for quote generation inputs."""
+    errors: list[str] = []
+
+    if not np.isfinite(mid_price) or mid_price <= 0.0:
+        errors.append(f"mid_price must be finite and > 0, got {mid_price!r}")
+    if not np.isfinite(gamma) or gamma < 0.0:
+        errors.append(f"gamma must be finite and >= 0, got {gamma!r}")
+    if not np.isfinite(sigma) or sigma < 0.0:
+        errors.append(f"sigma must be finite and >= 0, got {sigma!r}")
+    if not np.isfinite(time_horizon) or time_horizon < 0.0:
+        errors.append(f"time_horizon must be finite and >= 0, got {time_horizon!r}")
+    if not np.isfinite(k_buy) or k_buy <= 0.0:
+        errors.append(f"k_buy must be finite and > 0, got {k_buy!r}")
+    if not np.isfinite(k_sell) or k_sell <= 0.0:
+        errors.append(f"k_sell must be finite and > 0, got {k_sell!r}")
+
+    return errors
 
 
 def load_config():
@@ -122,14 +196,18 @@ def calculate_final_quotes(
     avg_sells_per_period=0,
 ):
     """Calculate the final reservation price and quotes for the current state using asymmetric parameters."""
-    s = mid_price_df['mid_price'].iloc[-1]
+    s = float(mid_price_df['mid_price'].iloc[-1])
     q = 0
     spread_limits_bps = normalize_spread_limits_bps(spread_limits_bps)
 
+    errors = validate_quote_inputs(s, gamma, sigma, time_horizon, k_buy, k_sell)
+    if errors:
+        raise ValueError("Invalid quote inputs: " + "; ".join(errors))
+
     risk_term = gamma * ((sigma * s) ** 2) * time_horizon
-    log_term_buy = (1 / gamma) * np.log(1 + (gamma / k_buy))
+    log_term_buy = stable_liquidity_term(gamma, k_buy)
     raw_delta_a = log_term_buy + (0.5 - q) * risk_term
-    log_term_sell = (1 / gamma) * np.log(1 + (gamma / k_sell))
+    log_term_sell = stable_liquidity_term(gamma, k_sell)
     raw_delta_b = log_term_sell + (0.5 + q) * risk_term
     raw_delta_a_bps = (raw_delta_a / s) * 10000.0
     raw_delta_b_bps = (raw_delta_b / s) * 10000.0
@@ -443,12 +521,12 @@ def main():
         fixed_gamma=fixed_gamma,
     )
 
-    gamma = pd.Series(gammalist[-ma_window:]).mean()
-    T_h = pd.Series(Tlist[-ma_window:]).mean()
-    A_buy = pd.Series(A_buys[-ma_window - 1:-1]).mean()
-    k_buy = pd.Series(k_buys[-ma_window - 1:-1]).mean()
-    A_sell = pd.Series(A_sells[-ma_window - 1:-1]).mean()
-    k_sell = pd.Series(k_sells[-ma_window - 1:-1]).mean()
+    gamma = trailing_mean(gammalist, window=ma_window, non_negative_only=True)
+    T_h = trailing_mean(Tlist, window=ma_window, non_negative_only=True)
+    A_buy = trailing_mean(A_buys[-ma_window - 1:-1], window=ma_window, positive_only=True)
+    k_buy = trailing_mean(k_buys[-ma_window - 1:-1], window=ma_window, positive_only=True)
+    A_sell = trailing_mean(A_sells[-ma_window - 1:-1], window=ma_window, positive_only=True)
+    k_sell = trailing_mean(k_sells[-ma_window - 1:-1], window=ma_window, positive_only=True)
 
     if pd.isna(A_buy):
         A_buy = A_sell
@@ -459,17 +537,29 @@ def main():
     if pd.isna(k_sell):
         k_sell = k_buy
 
-    sigma = sigma_list[-1]
-    garch_sigma = garch_sigma_list[-1]
-    rolling_sigma = rolling_sigma_list[-1]
-    avg_backtest_pnl = pd.Series(pnl_list[-ma_window:]).mean() if pnl_list else None
-    total_buys = sum(buy_count_list[-ma_window:]) if buy_count_list else 0
-    total_sells = sum(sell_count_list[-ma_window:]) if sell_count_list else 0
+    sigma = last_valid_value(sigma_list, non_negative_only=True)
+    garch_sigma = last_valid_value(garch_sigma_list)
+    rolling_sigma = last_valid_value(rolling_sigma_list)
+    avg_backtest_pnl = trailing_mean(pnl_list, window=ma_window) if pnl_list else None
+    if avg_backtest_pnl is not None and pd.isna(avg_backtest_pnl):
+        avg_backtest_pnl = None
+    total_buys = int(np.nansum(pd.Series(buy_count_list).tail(ma_window))) if buy_count_list else 0
+    total_sells = int(np.nansum(pd.Series(sell_count_list).tail(ma_window))) if sell_count_list else 0
     avg_buys_per_period = total_buys / ma_window if ma_window > 0 else 0
     avg_sells_per_period = total_sells / ma_window if ma_window > 0 else 0
 
-    if any(pd.isna([gamma, T_h, A_buy, k_buy, A_sell, k_sell, sigma])):
+    invalid_params = validate_quote_inputs(
+        processed_ob_df['mid_price'].iloc[-1],
+        gamma,
+        sigma,
+        T_h,
+        k_buy,
+        k_sell,
+    )
+    if invalid_params:
         print("Failed to calculate one or more parameters. Exiting.")
+        for message in invalid_params:
+            print(f"  - {message}")
         sys.exit(1)
 
     results = calculate_final_quotes(
