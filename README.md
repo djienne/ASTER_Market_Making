@@ -49,11 +49,19 @@ python market_maker.py --symbol ETHUSDT
 
 You only need Aster **Pro API V3** credentials for live trading, account/user-data REST calls, and user-data listen-key management. The public `data_collector.py` flow does not require those credentials.
 
+Use only the **Pro** API flow on the Aster website under `More -> API Management`:
+- `API_USER` is your L1 EVM wallet address (for example from Rabby or MetaMask)
+- `API_SIGNER` is the signer wallet address generated in `More -> API Management`
+- `API_PRIVATE_KEY` is the private key for that generated signer wallet
+
 ![API Management](APIs.png)
 
 ```bash
 # Pro API V3
+# L1 EVM wallet address (for example Rabby / MetaMask)
 API_USER=0x...
+
+# Generated under More -> API Management
 API_SIGNER=0x...
 API_PRIVATE_KEY=0x...
 
@@ -64,9 +72,6 @@ API_PRIVATE_KEY=0x...
 # SPOT_API_KEY=...
 # SPOT_API_SECRET=...
 ```
-
-<img src="infos_API_p1.png" alt="Info API 1" width="600"/>
-<img src="infos_API_p2.png" alt="Info API 2" width="600"/>
 
 ### `runtime.env`
 
