@@ -16,7 +16,7 @@ Referral link to support this work: [https://www.asterdex.com/en/referral/164f81
 
 ## Operating Assumptions
 
-- The market maker assumes it has exclusive control of the account and of the configured symbol in `runtime.env`.
+- The market maker assumes it has exclusive control of the account and of the active trading symbol.
 - Do not run this bot alongside a manual trader or another bot on the same account.
 - `market_maker.py` cancels all open orders for the configured symbol on startup and again during shutdown cleanup.
 - If the startup cancel-all cannot be confirmed, the bot aborts instead of trading on top of unknown open orders.
@@ -65,13 +65,14 @@ API_USER=0x...
 API_SIGNER=0x...
 API_PRIVATE_KEY=0x...
 
-# Optional: set to 0/false to show normal info logs from the bot
+# Optional for native runs: set to 0/false to show normal info logs from the bot
+# Note: `docker-compose.yml` currently forces `RELEASE_MODE=0` for the `market-maker` service.
 # RELEASE_MODE=0
 ```
 
 ### `runtime.env`
 
-`runtime.env` is the single source of truth for the active trading/collection symbol across Docker and the main scripts.
+`runtime.env` is the default symbol configuration file across Docker and the main scripts. CLI flags can override it, and `data_collector.py` also accepts a separate `SYMBOLS` env var.
 
 ```bash
 SYMBOL=ETHUSDT
@@ -80,7 +81,7 @@ SYMBOL=ETHUSDT
 ### Runtime Symbol Behavior
 
 - `market_maker.py` uses `--symbol` first, then `runtime.env` `SYMBOL`.
-- `data_collector.py` defaults to `runtime.env` `SYMBOL`.
+- `data_collector.py` defaults to `runtime.env` `SYMBOL`, unless you pass positional CLI symbols or set `SYMBOLS`.
 - `calculate_avellaneda_parameters.py` defaults to the base ticker derived from `runtime.env` `SYMBOL` after stripping common stablecoin quotes like `USDT`, `USDC`, `USDF`, `USD1`, and `USD`.
 - The local analytics loader accepts either a base ticker like `BTC` or a full symbol like `BTCUSDT`, then resolves the matching local trades/orderbook data using the available quote-suffix files.
 - `find_trend.py` defaults to `runtime.env` `SYMBOL` and writes its params file using the same base-symbol normalization.
@@ -156,15 +157,15 @@ The Compose stack now supports the full automated loop in [docker-compose.yml](d
 - `market-maker` waits for a valid Avellaneda file, a valid Supertrend file, and Binance OBI warmup before it begins opening quotes
 
 ```bash
-docker-compose build
-docker-compose up -d
-docker-compose logs -f data-collector avellaneda-params trend-finder market-maker
-docker-compose down
+docker compose build
+docker compose up -d
+docker compose logs -f data-collector avellaneda-params trend-finder market-maker
+docker compose down
 ```
 
 If you only want background market-data collection, `docker compose up -d data-collector` does not require a `.env` file or live credentials. Change `runtime.env` to switch the collected symbol, and use `.env` only for real API credentials.
 
-For a fresh symbol like `ETHUSDT`, the automated stack will not quote immediately on a fresh machine. It will first collect ETH data, then `avellaneda-params` will keep retrying until there is enough continuous history to write a valid `params/avellaneda_parameters_ETH.json`, and `trend-finder` will write `params/supertrend_params_ETH.json`. Once both files are valid and the Binance OBI alpha has warmed up, the running market maker can begin quoting automatically.
+For a fresh symbol like `ETHUSDT`, the automated stack will not quote immediately on a fresh machine. `avellaneda-params` depends on locally collected trades/orderbook history, so it will keep retrying until there is enough continuous data to write a valid `params/avellaneda_parameters_ETH.json`. `trend-finder` fetches and caches klines independently, then writes `params/supertrend_params_ETH.json`. Once both files are valid and the Binance OBI alpha has warmed up, the running market maker can begin quoting automatically.
 
 ## Testing
 
@@ -185,7 +186,7 @@ The default test suite does not place live trades. It covers local order-state l
 
 ## Performance Notes
 
-Low latency matters for market making, especially if you reduce `ORDER_REFRESH_INTERVAL`.
+Low latency still matters for market making, although normal re-quoting is event-driven and `ORDER_REFRESH_INTERVAL` mainly acts as a safety timeout for stale working orders.
 
 Recommendations:
 - Prefer an Asia-Pacific region close to the exchange
