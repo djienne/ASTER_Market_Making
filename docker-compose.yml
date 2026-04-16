@@ -52,6 +52,7 @@ services:
     build: .
     image: aster_market_making:latest
     container_name: aster_market_maker
+    stop_grace_period: 45s
     env_file:
       - .env
       - runtime.env

@@ -852,3 +852,54 @@ def test_cancel_active_order_success_clears_tracking():
         assert state.last_order_price is None
 
     asyncio.run(runner())
+
+
+def test_initiate_graceful_order_shutdown_requests_cancel_and_waits_for_clear():
+    async def runner():
+        state = market_maker.StrategyState()
+        state.active_order_id = 42
+        runtime = market_maker.RuntimeContext("BTCUSDT")
+
+        async def clear_soon():
+            await asyncio.sleep(0.05)
+            market_maker.clear_order_tracking(state)
+
+        task = asyncio.create_task(clear_soon())
+        cleared = await market_maker.initiate_graceful_order_shutdown(state, runtime, timeout=0.5)
+        await task
+
+        assert cleared is True
+        command = state.order_commands.get_nowait()
+        assert command.kind == "cancel"
+        assert command.trigger == "Shutdown cleanup"
+
+    asyncio.run(runner())
+
+
+def test_cleanup_orders_prefers_existing_client():
+    class DummySession:
+        closed = False
+
+    class DummyClient:
+        def __init__(self):
+            self.session = DummySession()
+            self.cancel_calls = 0
+
+        async def cancel_all_orders(self, symbol):
+            self.cancel_calls += 1
+            return {"symbol": symbol}
+
+    async def runner():
+        client = DummyClient()
+        success = await market_maker.cleanup_orders(
+            "BTCUSDT",
+            "0x0000000000000000000000000000000000000000",
+            "0x0000000000000000000000000000000000000000",
+            "dummy",
+            existing_client=client,
+            timeout=0.1,
+        )
+        assert success is True
+        assert client.cancel_calls == 1
+
+    asyncio.run(runner())

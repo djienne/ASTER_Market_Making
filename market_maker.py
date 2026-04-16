@@ -46,6 +46,9 @@ POSITION_SYNC_TIMEOUT = 2.0     # How long to wait for a position snapshot after
 STARTUP_CLEANUP_TIMEOUT = 20.0  # How long to wait for the initial cancel-all cleanup.
 CANCEL_CONFIRM_TIMEOUT = 5.0    # How long to wait for a terminal update after canceling a timed-out order.
 WEBSOCKET_MAX_CONNECTION_AGE = 23 * 60 * 60  # Rotate websocket connections before the documented 24h server limit.
+SHUTDOWN_ACTIVE_ORDER_GRACE_TIMEOUT = 8.0
+SHUTDOWN_CANCEL_ALL_TIMEOUT = 20.0
+SHUTDOWN_CANCEL_ALL_RETRIES = 2
 
 # ORDER REUSE SETTINGS
 DEFAULT_PRICE_CHANGE_THRESHOLD_BPS = 5.0  # Minimum price move required before replacing an order
@@ -2831,15 +2834,73 @@ async def ensure_clean_startup(client, symbol, timeout=STARTUP_CLEANUP_TIMEOUT):
     return True
 
 
-async def cleanup_orders(symbol, api_user, api_signer, api_private_key):
-    """Cleanup function to cancel all orders"""
-    try:
-        logging.info(f"Performing final cleanup: Cancelling all orders for {symbol}.")
-        async with ApiClient(api_user, api_signer, api_private_key, RELEASE_MODE) as cleanup_client:
-            await cleanup_client.cancel_all_orders(symbol)
-        logging.info("All open orders cancelled. Shutdown complete.")
-    except Exception as e:
-        logging.error(f"Error during final order cancellation: {e}")
+async def wait_for_active_order_clear(state, timeout):
+    """Wait for local active-order tracking to clear during shutdown."""
+    if state is None or not state.active_order_id:
+        return True
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while state.active_order_id and loop.time() < deadline:
+        await asyncio.sleep(0.05)
+    return state.active_order_id is None
+
+
+async def initiate_graceful_order_shutdown(state, runtime, timeout=SHUTDOWN_ACTIVE_ORDER_GRACE_TIMEOUT):
+    """Ask the running order manager to cancel the working order before task teardown."""
+    if state is None:
+        return True
+
+    runtime.request_shutdown()
+    if not state.active_order_id:
+        return True
+
+    logging.info(f"Requesting graceful shutdown cancel for active order {state.active_order_id}.")
+    publish_latest_order_command(state, OrderCommand(kind="cancel", trigger="Shutdown cleanup"))
+    request_quote_refresh(state)
+    cleared = await wait_for_active_order_clear(state, timeout)
+    if cleared:
+        logging.info("Active order cleared before task shutdown.")
+    else:
+        logging.warning(
+            f"Active order {state.active_order_id} did not clear within {timeout:.1f}s. "
+            "Falling back to direct cancel-all cleanup."
+        )
+    return cleared
+
+
+async def cleanup_orders(
+    symbol,
+    api_user,
+    api_signer,
+    api_private_key,
+    existing_client=None,
+    timeout=SHUTDOWN_CANCEL_ALL_TIMEOUT,
+):
+    """Best-effort final cleanup that cancels any submitted orders before exit."""
+    log = logging.getLogger("ShutdownCleanup")
+
+    async def _cancel_with(client_obj):
+        await asyncio.wait_for(client_obj.cancel_all_orders(symbol), timeout=timeout)
+
+    for attempt in range(1, SHUTDOWN_CANCEL_ALL_RETRIES + 1):
+        try:
+            log.info(f"Shutdown cleanup attempt {attempt}/{SHUTDOWN_CANCEL_ALL_RETRIES}: cancelling all orders for {symbol}.")
+
+            if existing_client is not None and getattr(existing_client, "session", None) is not None and not existing_client.session.closed:
+                await _cancel_with(existing_client)
+            else:
+                async with ApiClient(api_user, api_signer, api_private_key, RELEASE_MODE) as cleanup_client:
+                    await _cancel_with(cleanup_client)
+
+            log.info("All open orders cancelled. Shutdown complete.")
+            return True
+        except Exception as exc:
+            log.error(f"Shutdown cleanup attempt {attempt} failed: {exc}")
+            if attempt < SHUTDOWN_CANCEL_ALL_RETRIES:
+                await asyncio.sleep(0.5)
+
+    return False
 
 def build_signal_handler(runtime):
     """Build a signal handler bound to the active runtime context."""
@@ -2878,8 +2939,10 @@ async def main():
         signal.signal(signal.SIGTERM, signal_handler)
 
     client = None
+    state = None
     tasks = []
     core_tasks = []
+    cleanup_completed = False
 
     try:
         client = ApiClient(API_USER, API_SIGNER, API_PRIVATE_KEY, RELEASE_MODE)
@@ -2890,129 +2953,149 @@ async def main():
         alpha_engine = BinanceAlphaEngine()
 
         async with client:
-            if not await ensure_clean_startup(client, args.symbol):
-                return
-
-            # [IMPROVED] Fetch initial account balance with a timeout
-            logging.info("Fetching initial account balance...")
             try:
-                balance_success = await asyncio.wait_for(fetch_initial_balance(state, client, runtime), timeout=20.0)
-                if not balance_success:
-                    logging.error("Failed to fetch initial balance. Cannot proceed.")
+                if not await ensure_clean_startup(client, args.symbol):
                     return
-            except asyncio.TimeoutError:
-                logging.error("Timed out while fetching initial balance. Cannot proceed.")
-                return
 
-            params_task = asyncio.create_task(avellaneda_params_updater(state, args.symbol, runtime))
-            support_tasks = [
-                asyncio.create_task(
-                    websocket_price_updater(
-                        state,
-                        args.symbol,
-                        runtime,
-                        top_of_book_feed=top_of_book_feed,
-                        quote_engine=quote_engine,
-                    )
-                ),
-                asyncio.create_task(websocket_user_data_updater(state, client, args.symbol, runtime)),
-                params_task,
-            ]
-            if USE_SUPERTREND_SIGNAL:
-                support_tasks.append(asyncio.create_task(supertrend_signal_updater(state, args.symbol, runtime)))
-            if USE_BINANCE_OBI_ALPHA:
-                support_tasks.append(
+                # [IMPROVED] Fetch initial account balance with a timeout
+                logging.info("Fetching initial account balance...")
+                try:
+                    balance_success = await asyncio.wait_for(fetch_initial_balance(state, client, runtime), timeout=20.0)
+                    if not balance_success:
+                        logging.error("Failed to fetch initial balance. Cannot proceed.")
+                        return
+                except asyncio.TimeoutError:
+                    logging.error("Timed out while fetching initial balance. Cannot proceed.")
+                    return
+
+                params_task = asyncio.create_task(avellaneda_params_updater(state, args.symbol, runtime))
+                support_tasks = [
                     asyncio.create_task(
-                        binance_orderbook_imbalance_updater(
+                        websocket_price_updater(
                             state,
                             args.symbol,
                             runtime,
-                            alpha_engine=alpha_engine,
+                            top_of_book_feed=top_of_book_feed,
+                            quote_engine=quote_engine,
+                        )
+                    ),
+                    asyncio.create_task(websocket_user_data_updater(state, client, args.symbol, runtime)),
+                    params_task,
+                ]
+                if USE_SUPERTREND_SIGNAL:
+                    support_tasks.append(asyncio.create_task(supertrend_signal_updater(state, args.symbol, runtime)))
+                if USE_BINANCE_OBI_ALPHA:
+                    support_tasks.append(
+                        asyncio.create_task(
+                            binance_orderbook_imbalance_updater(
+                                state,
+                                args.symbol,
+                                runtime,
+                                alpha_engine=alpha_engine,
+                            )
                         )
                     )
-                )
-            tasks.extend(support_tasks)
+                tasks.extend(support_tasks)
 
-            if not await wait_for_startup_inputs(state, args.symbol, runtime):
-                logging.info("Shutdown requested before required startup inputs became available.")
-                return
+                if not await wait_for_startup_inputs(state, args.symbol, runtime):
+                    logging.info("Shutdown requested before required startup inputs became available.")
+                    return
 
-            # Initialize Supertrend signal before checking positions or starting loops
-            if USE_SUPERTREND_SIGNAL:
-                await initialize_supertrend_signal(state, args.symbol)
+                # Initialize Supertrend signal before checking positions or starting loops
+                if USE_SUPERTREND_SIGNAL:
+                    await initialize_supertrend_signal(state, args.symbol)
 
-            try:
-                logging.info(f"Checking for existing position for {args.symbol}...")
-                positions = await client.get_position_risk(args.symbol)
-                logging.debug(f"Position risk response: {positions}")
+                try:
+                    logging.info(f"Checking for existing position for {args.symbol}...")
+                    positions = await client.get_position_risk(args.symbol)
+                    logging.debug(f"Position risk response: {positions}")
 
-                position_found = False
-                if positions:
-                    position_size, notional_value, _, _ = sync_state_from_position_data(
-                        state,
-                        positions[0],
-                        reference_price=state.mid_price,
+                    position_found = False
+                    if positions:
+                        position_size, notional_value, _, _ = sync_state_from_position_data(
+                            state,
+                            positions[0],
+                            reference_price=state.mid_price,
+                        )
+
+                        if has_open_position(state):
+                            position_side = "LONG" if position_size > 0 else "SHORT"
+                            logging.info(f"Found existing {position_side} position of size {position_size} with notional value ${notional_value:.2f}.")
+                            if has_significant_position(state, notional_value):
+                                logging.info(f"Starting in {state.mode} mode to close position.")
+                            else:
+                                logging.info("Position is below the significance threshold, but the bot will still flatten it before opening new inventory.")
+                            position_found = True
+
+                    if not position_found:
+                        logging.info("No existing position found.")
+                        try:
+                            logging.info(f"Attempting to set leverage for {args.symbol} to {DEFAULT_LEVERAGE}x.")
+                            await client.change_leverage(args.symbol, DEFAULT_LEVERAGE)
+                            logging.info(f"Successfully set leverage for {args.symbol} to {DEFAULT_LEVERAGE}x.")
+                        except Exception as e:
+                            logging.error(f"Failed to set leverage: {e}", exc_info=True)
+
+                        opening_mode, _ = get_strategy_modes(state.flip_mode)
+                        state.mode = opening_mode
+                        logging.info(f"Starting in default {opening_mode} mode.")
+
+                except Exception as e:
+                    logging.warning(f"Could not check for existing position or set leverage, starting in default {state.mode} mode: {e}", exc_info=True)
+
+                # Start all async tasks
+                quote_task = asyncio.create_task(market_making_loop(state, client, args.symbol, runtime, quote_engine=quote_engine))
+                order_task = asyncio.create_task(order_manager_loop(state, client, args.symbol, runtime, executor=order_executor))
+                watchdog_task = asyncio.create_task(order_executor.watch_open_orders(state, client, args.symbol, runtime))
+                core_tasks = [quote_task, order_task]
+                tasks.extend([
+                    asyncio.create_task(balance_reporter(state, runtime)),
+                    quote_task,
+                    order_task,
+                    watchdog_task,
+                    asyncio.create_task(price_reporter(state, args.symbol, runtime)),
+                ])
+
+                request_quote_refresh(state)
+
+                # Wait for either a core trading task to complete or a shutdown signal
+                while not runtime.shutdown_requested and not any(task.done() for task in core_tasks):
+                    await asyncio.sleep(0.01)
+            finally:
+                logging.info("Shutdown initiated. Cleaning up...")
+                runtime.request_shutdown()
+                try:
+                    await initiate_graceful_order_shutdown(state, runtime)
+                except Exception as shutdown_exc:
+                    logging.error(f"Graceful shutdown pre-cancel failed: {shutdown_exc}", exc_info=True)
+
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                await asyncio.shield(
+                    cleanup_orders(
+                        args.symbol,
+                        API_USER,
+                        API_SIGNER,
+                        API_PRIVATE_KEY,
+                        existing_client=client,
                     )
-
-                    if has_open_position(state):
-                        position_side = "LONG" if position_size > 0 else "SHORT"
-                        logging.info(f"Found existing {position_side} position of size {position_size} with notional value ${notional_value:.2f}.")
-                        if has_significant_position(state, notional_value):
-                            logging.info(f"Starting in {state.mode} mode to close position.")
-                        else:
-                            logging.info("Position is below the significance threshold, but the bot will still flatten it before opening new inventory.")
-                        position_found = True
-
-                if not position_found:
-                    logging.info("No existing position found.")
-                    try:
-                        logging.info(f"Attempting to set leverage for {args.symbol} to {DEFAULT_LEVERAGE}x.")
-                        await client.change_leverage(args.symbol, DEFAULT_LEVERAGE)
-                        logging.info(f"Successfully set leverage for {args.symbol} to {DEFAULT_LEVERAGE}x.")
-                    except Exception as e:
-                        logging.error(f"Failed to set leverage: {e}", exc_info=True)
-                    
-                    opening_mode, _ = get_strategy_modes(state.flip_mode)
-                    state.mode = opening_mode
-                    logging.info(f"Starting in default {opening_mode} mode.")
-
-            except Exception as e:
-                logging.warning(f"Could not check for existing position or set leverage, starting in default {state.mode} mode: {e}", exc_info=True)
-
-            # Start all async tasks
-            quote_task = asyncio.create_task(market_making_loop(state, client, args.symbol, runtime, quote_engine=quote_engine))
-            order_task = asyncio.create_task(order_manager_loop(state, client, args.symbol, runtime, executor=order_executor))
-            watchdog_task = asyncio.create_task(order_executor.watch_open_orders(state, client, args.symbol, runtime))
-            core_tasks = [quote_task, order_task]
-            tasks.extend([
-                asyncio.create_task(balance_reporter(state, runtime)),
-                quote_task,
-                order_task,
-                watchdog_task,
-                asyncio.create_task(price_reporter(state, args.symbol, runtime)),
-            ])
-
-            request_quote_refresh(state)
-
-            # Wait for either a core trading task to complete or a shutdown signal
-            while not runtime.shutdown_requested and not any(task.done() for task in core_tasks):
-                await asyncio.sleep(0.01)
+                )
+                cleanup_completed = True
 
     except asyncio.CancelledError:
         logging.info("Main task was cancelled.")
     except Exception as e:
         logging.error(f"An unhandled exception occurred in main: {e}", exc_info=True)
     finally:
-        logging.info("Shutdown initiated. Cleaning up...")
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Always perform cleanup
-        await cleanup_orders(args.symbol, API_USER, API_SIGNER, API_PRIVATE_KEY)
+        if not cleanup_completed:
+            logging.info("Shutdown initiated. Cleaning up...")
+            runtime.request_shutdown()
+            await asyncio.shield(cleanup_orders(args.symbol, API_USER, API_SIGNER, API_PRIVATE_KEY))
 
 
 if __name__ == "__main__":
