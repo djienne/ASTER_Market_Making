@@ -497,6 +497,15 @@ def main():
     A_sells = pd.Series(A_sells).ffill().tolist()
     k_sells = pd.Series(k_sells).ffill().tolist()
 
+    # If every intensity fit failed, ffill propagates NaNs and downstream math quietly
+    # produces NaN parameters. Fail fast here with a clear message instead.
+    if all(pd.isna(x) for x in A_buys) and all(pd.isna(x) for x in A_sells):
+        print("All intensity fits returned NaN - cannot calculate parameters. Collect more data or widen the window.")
+        sys.exit(1)
+    if all(pd.isna(x) for x in k_buys) and all(pd.isna(x) for x in k_sells):
+        print("All intensity slope fits returned NaN - cannot calculate parameters.")
+        sys.exit(1)
+
     if len(calc_periods) <= 1:
         print(build_summary_text(None, calc_periods, df=raw_ob_df, minutes_window=window_minutes))
         sys.exit()

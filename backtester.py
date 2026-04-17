@@ -32,7 +32,7 @@ def jit_backtest_loop(s_values, buy_min_values, sell_max_values, gamma, k, sigma
         if buy:
             buy_count += 1
 
-        q[i+1] = q[i] + (sell - buy)
+        q[i+1] = q[i] + (buy - sell)
         x[i+1] = x[i] + (r_a * (1 - fee) if sell else 0) - (r_b * (1 + fee) if buy else 0)
         pnl[i+1] = x[i+1] + q[i+1] * s_values[i]
 
@@ -40,10 +40,18 @@ def jit_backtest_loop(s_values, buy_min_values, sell_max_values, gamma, k, sigma
 
 def run_backtest(mid_prices, buy_trades, sell_trades, gamma, k, sigma, window_minutes, time_horizon, fee=0.00040):
     """Simulate the market making strategy over a historical period."""
-    time_index = mid_prices.index
-    buy_min = buy_trades['price'].resample('5s').min().reindex(time_index, method='ffill')
-    sell_max = sell_trades['price'].resample('5s').max().reindex(time_index, method='ffill')
-    s_values = mid_prices.resample('5s').first().reindex(time_index, method='ffill').values
+    if not (gamma > 0 and k > 0):
+        return None
+
+    # Previously resampled to 5s then reindexed back to the 1s mid index, which
+    # ffill-ed each 5s bucket across 5 rows and inflated fill counts ~5x.
+    # Now the JIT loop runs at the same 5s cadence as the trade aggregation.
+    bucket_freq = '5s'
+    s_series = mid_prices.resample(bucket_freq).first().ffill()
+    bucket_index = s_series.index
+    buy_min = buy_trades['price'].resample(bucket_freq).min().reindex(bucket_index)
+    sell_max = sell_trades['price'].resample(bucket_freq).max().reindex(bucket_index)
+    s_values = s_series.values
 
     N = len(s_values)
     T_backtest = window_minutes / 1440.0
@@ -58,6 +66,8 @@ def run_backtest(mid_prices, buy_trades, sell_trades, gamma, k, sigma, window_mi
 def evaluate_gamma(gamma, mid_prices, buy_trades, sell_trades, k, sigma, window_minutes, time_horizon):
     """Evaluate a single gamma value by running a backtest and returning the PnL and trade counts."""
     res = run_backtest(mid_prices, buy_trades, sell_trades, gamma, k, sigma, window_minutes, time_horizon)
+    if res is None:
+        return [gamma, np.nan, 0, 0]
     final_pnl = res['pnl'][-1]
     if np.isfinite(final_pnl):
         return [gamma, final_pnl, res['buys'], res['sells']]

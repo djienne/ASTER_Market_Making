@@ -91,10 +91,10 @@ def calculate_intensity_params(periods: list, window_minutes: int, buy_orders: p
             ss_tot = np.sum((y_data - np.mean(y_data)) ** 2)
             
             if ss_tot == 0:
-                r_squared = 0
-            else:
-                r_squared = 1 - (ss_res / ss_tot)
-            
+                # Degenerate fit: log-intensity is constant, no slope is meaningful.
+                return np.nan, np.nan
+            r_squared = 1 - (ss_res / ss_tot)
+
             # R-squared threshold
             if r_squared < 0.6: # Filter poor fits
                 return np.nan, np.nan

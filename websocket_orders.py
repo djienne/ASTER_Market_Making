@@ -177,7 +177,7 @@ async def extended_demo():
     api_signer = os.getenv('API_SIGNER')
     api_private_key = os.getenv('API_PRIVATE_KEY')
 
-    if not all([apiv1_public, apiv1_private]):
+    if not all([api_user, api_signer, api_private_key]):
         print("ERROR: Missing API_USER, API_SIGNER, or API_PRIVATE_KEY")
         return
 

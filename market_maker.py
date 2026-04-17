@@ -2,6 +2,9 @@ import os
 import asyncio
 import argparse
 import logging
+from logging.handlers import RotatingFileHandler
+
+import orjson
 import websockets
 import json
 import signal
@@ -82,6 +85,7 @@ CANCEL_SPECIFIC_ORDER = True # If True, cancel specific order ID. If False, canc
 ORDER_REPLACE_MODE = os.getenv("ORDER_REPLACE_MODE", "fast").strip().lower()
 FAST_ORDER_REPLACE = ORDER_REPLACE_MODE == "fast"
 OPEN_ORDER_WATCHDOG_INTERVAL = 15.0
+OPEN_ORDER_WATCHDOG_STALE_GRACE = 5.0
 OPEN_ORDER_WATCHDOG_CANCEL_ALL = True
 QUOTE_REFRESH_PREFILTER_BPS = 2.0
 
@@ -339,20 +343,12 @@ def setup_logging(file_log_level):
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    # File handler - only add if not in release mode or for errors
-    if not RELEASE_MODE:
-        file_handler = logging.FileHandler(LOG_FILE)
-        file_handler.setLevel(log_level)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    else:
-        # In release mode, only log errors to file
-        file_handler = logging.FileHandler(LOG_FILE)
-        file_handler.setLevel(logging.ERROR)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+    # File handler - bounded rotation so multi-week runs don't consume the disk.
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=50_000_000, backupCount=5)
+    file_handler.setLevel(log_level if not RELEASE_MODE else logging.ERROR)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
     # Console handler - only add if not in release mode or for errors
     if not RELEASE_MODE:
@@ -1049,6 +1045,22 @@ class OrderExecutor:
                     break
 
                 open_orders = await client.get_open_orders(symbol)
+                open_order_ids = {order.get("orderId") for order in open_orders}
+                active_id = state.active_order_id
+                if active_id is not None and active_id not in open_order_ids:
+                    # Grace window avoids racing a freshly placed order whose
+                    # GET /openOrders snapshot hasn't propagated yet.
+                    started_at = state.active_order_started_at
+                    age = runtime.now() - started_at if started_at is not None else float("inf")
+                    if age >= OPEN_ORDER_WATCHDOG_STALE_GRACE:
+                        log.warning(
+                            "Tracked order %s missing from exchange for %.1fs; clearing stale tracking.",
+                            active_id, age,
+                        )
+                        clear_order_tracking(state)
+                        state.pending_terminal_orders.pop(active_id, None)
+                        request_quote_refresh(state)
+
                 if len(open_orders) <= 1:
                     continue
 
@@ -1175,7 +1187,7 @@ async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None,
                         last_message_time = runtime.now()
 
                         try:
-                            data = json.loads(message)
+                            data = orjson.loads(message)
 
                             if data.get('e') == 'depthUpdate' and ('b' in data and 'a' in data):
                                 bids = data.get('b', [])
@@ -1194,7 +1206,11 @@ async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None,
                                         )
                                         if should_refresh:
                                             request_quote_refresh(state)
-                                        log.debug(f"Updated prices for {symbol}: Bid={best_bid}, Ask={best_ask}, Mid={state.mid_price:.4f}")
+                                        if log.isEnabledFor(logging.DEBUG):
+                                            log.debug(
+                                                "Updated prices for %s: Bid=%s, Ask=%s, Mid=%.4f",
+                                                symbol, best_bid, best_ask, state.mid_price,
+                                            )
 
                         except json.JSONDecodeError:
                             log.warning("Failed to decode WebSocket message")
@@ -1404,7 +1420,7 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime, alpha_engi
 
                 while not snapshot_task.done() and not runtime.shutdown_requested:
                     message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
-                    event = _extract_binance_depth_event(json.loads(message))
+                    event = _extract_binance_depth_event(orjson.loads(message))
                     if event is not None:
                         buffered_events.append(event)
 
@@ -1434,7 +1450,7 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime, alpha_engi
                         raise BinanceOrderBookSyncError("Binance OBI stream became stale")
 
                     last_message_time = runtime.now()
-                    event = _extract_binance_depth_event(json.loads(message))
+                    event = _extract_binance_depth_event(orjson.loads(message))
                     if event is None:
                         continue
 
@@ -1582,7 +1598,7 @@ async def websocket_user_data_updater(state, client, symbol, runtime):
                         message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
 
                         try:
-                            data = json.loads(message)
+                            data = orjson.loads(message)
                             event_type = data.get('e')
 
                             if event_type == 'ACCOUNT_UPDATE':
@@ -2380,8 +2396,13 @@ async def place_order_from_command(state, client, symbol, runtime, log, command,
     formatted_quantity = f"{command.quantity:.{quantity_precision}f}"
 
     log.info(
-        f"Placing {command.side} order: {formatted_quantity} {symbol} @ {formatted_price} "
-        f"({percentage_diff:+.4f}% from mid-price, Binance shift {state.binance_alpha_snapshot.shift_bps:+.1f} bps)"
+        "Placing %s order: %s %s @ %s (%+.4f%% from mid-price, Binance shift %+.1f bps)",
+        command.side,
+        formatted_quantity,
+        symbol,
+        formatted_price,
+        percentage_diff,
+        state.binance_alpha_snapshot.shift_bps,
     )
 
     active_order = await client.place_order(
@@ -2745,7 +2766,7 @@ def get_avellaneda_params(symbol):
         return {"buy_spread": DEFAULT_BUY_SPREAD, "sell_spread": DEFAULT_SELL_SPREAD, "source": "default"}
 
     symbol_key = (symbol or "").upper() or DEFAULT_SYMBOL
-    now = time.time()
+    now = time.monotonic()
     cached_entry = _SPREAD_CACHE.get(symbol_key)
     if cached_entry and cached_entry.get("expires_at", 0) > now:
         return cached_entry["params"]

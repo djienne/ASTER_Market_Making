@@ -1,7 +1,8 @@
+import asyncio
 import json
-import math
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 from eth_account import Account
@@ -10,6 +11,26 @@ try:
 except ImportError:  # pragma: no cover - compatibility path
     from eth_account.messages import encode_structured_data as _encode_typed_message
 from web3 import Web3
+
+
+_EIP712_TYPES = {
+    "EIP712Domain": [
+        {"name": "name", "type": "string"},
+        {"name": "version", "type": "string"},
+        {"name": "chainId", "type": "uint256"},
+        {"name": "verifyingContract", "type": "address"},
+    ],
+    "Message": [
+        {"name": "msg", "type": "string"},
+    ],
+}
+
+_EIP712_DOMAIN = {
+    "name": "AsterSignTransaction",
+    "version": "1",
+    "chainId": 1666,
+    "verifyingContract": "0x0000000000000000000000000000000000000000",
+}
 
 
 def _trim_dict(my_dict):
@@ -47,44 +68,42 @@ class ApiClient:
         self.base_url = "https://fapi.asterdex.com"
         self.session = None
         self.timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_connect=10, sock_read=20)
+        self._last_nonce = 0
+        self._signing_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="aster-sign"
+        )
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession(timeout=self.timeout)
+        connector = aiohttp.TCPConnector(
+            limit=0,
+            keepalive_timeout=75,
+            enable_cleanup_closed=True,
+            ttl_dns_cache=300,
+            resolver=aiohttp.AsyncResolver(),
+        )
+        self.session = aiohttp.ClientSession(timeout=self.timeout, connector=connector)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.session:
             await self.session.close()
+        self._signing_executor.shutdown(wait=False)
 
-    def _sign(self, params):
-        """Sign request params using the official Pro API V3 typed-data signature flow."""
-        nonce = math.trunc(time.time() * 1000000)
-        my_dict = {k: v for k, v in params.items() if v is not None}
-        my_dict["nonce"] = str(nonce)
-        my_dict["user"] = self.api_user
-        my_dict["signer"] = self.api_signer
-        _trim_dict(my_dict)
-        payload = urllib.parse.urlencode(my_dict)
+    def _next_nonce(self):
+        # Microsecond-resolution nonce that stays strictly increasing across
+        # wall-clock skews (NTP steps, DST). Aster Pro V3 rejects stale nonces.
+        now_us = time.time_ns() // 1000
+        nonce = now_us if now_us > self._last_nonce else self._last_nonce + 1
+        self._last_nonce = nonce
+        return nonce
 
+    def _sign_payload(self, payload: str) -> str:
+        """Keccak + secp256k1 sign of the urlencoded payload. Runs in a worker
+        thread because eth_account releases the GIL for the heavy math."""
         typed_data = {
-            "types": {
-                "EIP712Domain": [
-                    {"name": "name", "type": "string"},
-                    {"name": "version", "type": "string"},
-                    {"name": "chainId", "type": "uint256"},
-                    {"name": "verifyingContract", "type": "address"},
-                ],
-                "Message": [
-                    {"name": "msg", "type": "string"},
-                ],
-            },
+            "types": _EIP712_TYPES,
             "primaryType": "Message",
-            "domain": {
-                "name": "AsterSignTransaction",
-                "version": "1",
-                "chainId": 1666,
-                "verifyingContract": "0x0000000000000000000000000000000000000000",
-            },
+            "domain": _EIP712_DOMAIN,
             "message": {"msg": payload},
         }
         try:
@@ -92,8 +111,36 @@ class ApiClient:
         except TypeError:
             signable_msg = _encode_typed_message(typed_data)
         signed_message = Account.sign_message(signable_msg, private_key=self.api_private_key)
+        return signed_message.signature.hex()
 
-        my_dict['signature'] = signed_message.signature.hex()
+    def _sign(self, params):
+        """Synchronous sign path. Kept for callers outside the hot path
+        (e.g., get_my_trading_volume.py, direct test invocation)."""
+        my_dict = {k: v for k, v in params.items() if v is not None}
+        my_dict["nonce"] = str(self._next_nonce())
+        my_dict["user"] = self.api_user
+        my_dict["signer"] = self.api_signer
+        _trim_dict(my_dict)
+        payload = urllib.parse.urlencode(my_dict)
+        my_dict['signature'] = self._sign_payload(payload)
+        return my_dict
+
+    async def _sign_async(self, params):
+        """Async sign path. Generates the nonce on the event loop (so ordering
+        is preserved) and offloads Keccak + secp256k1 signing to a worker thread
+        to keep the main loop from stalling during order placement."""
+        my_dict = {k: v for k, v in params.items() if v is not None}
+        my_dict["nonce"] = str(self._next_nonce())
+        my_dict["user"] = self.api_user
+        my_dict["signer"] = self.api_signer
+        _trim_dict(my_dict)
+        payload = urllib.parse.urlencode(my_dict)
+
+        loop = asyncio.get_running_loop()
+        signature_hex = await loop.run_in_executor(
+            self._signing_executor, self._sign_payload, payload
+        )
+        my_dict['signature'] = signature_hex
         return my_dict
 
     def _build_headers(self):
@@ -105,6 +152,12 @@ class ApiClient:
     def _prepare_request(self, params: dict = None):
         clean_params = dict(params or {})
         request_params = self._sign(clean_params)
+        headers = self._build_headers()
+        return request_params, headers
+
+    async def _prepare_request_async(self, params: dict = None):
+        clean_params = dict(params or {})
+        request_params = await self._sign_async(clean_params)
         headers = self._build_headers()
         return request_params, headers
 
@@ -164,7 +217,7 @@ class ApiClient:
     async def signed_request(self, method: str, endpoint: str, params: dict = None):
         """Generic method for making signed requests to the Pro API V3."""
         url = f"{self.base_url}{endpoint}"
-        request_params, headers = self._prepare_request(params)
+        request_params, headers = await self._prepare_request_async(params)
         return await self._request_json(method, url, request_params, headers)
 
     async def place_order(self, symbol, price, quantity, side, reduce_only=False):
