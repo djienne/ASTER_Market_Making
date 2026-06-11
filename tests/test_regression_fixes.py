@@ -1,12 +1,9 @@
 """Regression tests for bugs fixed in the Round 1/Round 2 review."""
-import importlib
+import importlib.util
 import os
-import runpy
-import sys
 
 import numpy as np
 import pandas as pd
-import pytest
 
 import api_client
 from api_client import ApiClient
@@ -69,6 +66,15 @@ def test_intensity_flat_log_curve_returns_nan():
     assert np.isnan(A_s[0]) and np.isnan(k_s[0])
 
 
+def _load_module_from_path(name, path):
+    """Import a module by file path, bypassing any same-named installed package
+    (some site-packages ship a top-level `tests` package that shadows ours)."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_websocket_orders_module_imports_cleanly():
     """Round 1 fixed a NameError at websocket_orders.py:180. Both the production
     module and the tests/ copy must now reach the early-return env-check branch
@@ -77,11 +83,24 @@ def test_websocket_orders_module_imports_cleanly():
 
     saved = {k: os.environ.pop(k, None) for k in ("API_USER", "API_SIGNER", "API_PRIVATE_KEY")}
     try:
-        # Production module
-        import websocket_orders as prod_module
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        # Production module. Its import-time load_dotenv() may repopulate the
+        # credentials from a local .env, so pop them again before running the
+        # demo: this test must exercise the env-check branch, never go live.
+        prod_module = _load_module_from_path(
+            "websocket_orders_prod_copy", os.path.join(repo_root, "websocket_orders.py")
+        )
+        for k in saved:
+            os.environ.pop(k, None)
         asyncio.run(prod_module.extended_demo())
-        # Test-directory duplicate (regression caught in Round 2)
-        import tests.websocket_orders as demo_module
+
+        # Test-directory duplicate (regression caught in Round 2).
+        demo_module = _load_module_from_path(
+            "websocket_orders_tests_copy", os.path.join(repo_root, "tests", "websocket_orders.py")
+        )
+        for k in saved:
+            os.environ.pop(k, None)
         asyncio.run(demo_module.extended_demo())
     finally:
         for k, v in saved.items():

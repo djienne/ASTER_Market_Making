@@ -2,8 +2,6 @@ import os
 import asyncio
 import argparse
 import logging
-from logging.handlers import RotatingFileHandler
-
 import orjson
 import websockets
 import json
@@ -14,10 +12,11 @@ from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional
-import numpy as np
 import requests
 from api_client import ApiClient
-from utils import configured_symbol, load_project_env, normalize_symbol_base
+from logging_config import setup_root_logging
+from utils import configured_symbol, load_project_env
+from vol_obi import VolObiCalculator
 
 load_project_env()
 
@@ -32,13 +31,22 @@ def env_flag(name, default):
 # --- Configuration ---
 # STRATEGY
 DEFAULT_SYMBOL = configured_symbol()
-FLIP_MODE = False # True for short-biased (SELL first), False for long-biased (BUY first)
-DEFAULT_BUY_SPREAD = 0.006   # 0.6% below mid-price for buy orders
-DEFAULT_SELL_SPREAD = 0.006  # 0.6% above mid-price for sell orders
-USE_AVELLANEDA_SPREADS = True  # Toggle to pull spreads from Avellaneda parameter files
 DEFAULT_LEVERAGE = 1
 DEFAULT_BALANCE_FRACTION = 0.2  # Use a fraction of tracked wallet balance for each order
-POSITION_THRESHOLD_USD = 15.0  # USD threshold before a position is treated as significant inventory
+
+# VOL+OBI STRATEGY (port of the lighter_MM vol_obi quoting model)
+OBI_WINDOW_STEPS = 6000                       # Rolling window for vol/imbalance stats
+OBI_STEP_NS = 100_000_000                     # Binance diff-depth cadence (100ms)
+OBI_VOL_TO_HALF_SPREAD = float(os.getenv("OBI_VOL_TO_HALF_SPREAD", "42.0"))
+# NOTE: lighter_MM production config used 42.0 on the same 100ms signal cadence;
+# the vol_obi.py code default is 0.8. This gain is the primary tuning knob.
+OBI_MIN_HALF_SPREAD_BPS = float(os.getenv("OBI_MIN_HALF_SPREAD_BPS", "4.0"))
+OBI_C1_TICKS = float(os.getenv("OBI_C1_TICKS", "120.0"))  # alpha → fair shift, in ticks per sigma
+OBI_SKEW = float(os.getenv("OBI_SKEW", "1.5"))            # inventory skew gain
+OBI_LOOKING_DEPTH = 0.025                     # Imbalance band: +/- 2.5% around Binance mid
+OBI_MIN_WARMUP_SAMPLES = 100                  # Samples required before quoting
+MAX_POSITION_SAFETY_FACTOR = 0.9              # Headroom under the leverage-derived position cap
+BALANCE_EPSILON_USD = 0.01                    # Epsilon for USD balance comparisons
 
 # TIMING (in seconds)
 ORDER_REFRESH_INTERVAL = 60     # Safety lifetime for a working order before a forced refresh, in seconds.
@@ -61,115 +69,31 @@ ORDER_FAILURE_WINDOW_SECONDS = 60.0
 ORDER_FAILURE_LIMIT = 3
 OPENING_CIRCUIT_BREAKER_COOLDOWN = 120.0
 
-# SUPERTREND INTEGRATION
-USE_SUPERTREND_SIGNAL = True  # Toggle to use Supertrend signal for dynamic flip_mode
-SUPERTREND_PARAMS_TEMPLATE = "supertrend_params_{}.json"
-SUPERTREND_CHECK_INTERVAL = 600 # Seconds between checking the signal file
-USE_BINANCE_OBI_ALPHA = True
-BINANCE_OBI_LOOKING_DEPTH_PCT = 0.025
+# BINANCE FEED PLUMBING (drives the Vol+OBI signal)
 BINANCE_OBI_BOOK_RETAIN_PCT = 0.03
-BINANCE_OBI_ZSCORE_WINDOW_SECONDS = 600
-BINANCE_OBI_WARMUP_SECONDS = 300
-BINANCE_OBI_BUFFER_CAPACITY = 8192
-BINANCE_OBI_MIN_SAMPLES = 100
 BINANCE_OBI_STALE_TIMEOUT_SECONDS = 5.0
-BINANCE_OBI_BPS_PER_SIGMA = 5.0
-BINANCE_OBI_MAX_SHIFT_BPS = 15.0
-BINANCE_OBI_SHIFT_LOG_DELTA_BPS = 1.0
 BINANCE_OBI_TRIM_INTERVAL_SECONDS = 1.0
 BINANCE_OBI_TRIM_INTERVAL_UPDATES = 10
 BINANCE_OBI_BAND_REBUILD_BPS = 1.0
 
 # ORDER CANCELLATION
-CANCEL_SPECIFIC_ORDER = True # If True, cancel specific order ID. If False, cancel all orders for the symbol.
 ORDER_REPLACE_MODE = os.getenv("ORDER_REPLACE_MODE", "fast").strip().lower()
 FAST_ORDER_REPLACE = ORDER_REPLACE_MODE == "fast"
 OPEN_ORDER_WATCHDOG_INTERVAL = 15.0
-OPEN_ORDER_WATCHDOG_STALE_GRACE = 5.0
 OPEN_ORDER_WATCHDOG_CANCEL_ALL = True
+OPEN_ORDER_WATCHDOG_STALE_GRACE = 5.0  # Grace before clearing tracking for an order missing on the exchange.
 QUOTE_REFRESH_PREFILTER_BPS = 2.0
 
 # LOGGING
 LOG_FILE = 'market_maker.log'
 RELEASE_MODE = env_flag("RELEASE_MODE", True)  # When True, suppress all non-error logs and prints
 
-MIN_ORDER_INTERVAL = 1.0  # Minimum seconds between order placements
+MIN_ORDER_INTERVAL = 1.0  # Minimum seconds between order reconcile bursts
 POSITION_SIZE_EPSILON = 1e-12
-
-# Spread configuration
-PARAMS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "params")
-AVELLANEDA_FILE_PREFIX = "avellaneda_parameters_"
-DEFAULT_MIN_AVELLANEDA_SPREAD_BPS = 5.0
-DEFAULT_MAX_AVELLANEDA_SPREAD_BPS = 200.0
-SPREAD_CACHE_TTL_SECONDS = 10
-_SPREAD_CACHE = {}
 
 
 class BinanceOrderBookSyncError(Exception):
     """Raised when the Binance local book must be resynchronized."""
-
-
-class RollingZScoreBuffer:
-    """Fixed-capacity, time-evicting ring buffer for rolling z-score stats."""
-
-    def __init__(self, capacity: int):
-        self.capacity = max(int(capacity), 1)
-        self.timestamps_ms = np.zeros(self.capacity, dtype=np.int64)
-        self.values = np.zeros(self.capacity, dtype=np.float64)
-        self.head = 0
-        self.tail = 0
-        self.count = 0
-        self.sum = 0.0
-        self.sum_sq = 0.0
-
-    def clear(self):
-        self.head = 0
-        self.tail = 0
-        self.count = 0
-        self.sum = 0.0
-        self.sum_sq = 0.0
-
-    def _drop_oldest(self):
-        if self.count == 0:
-            return
-        value = float(self.values[self.head])
-        self.sum -= value
-        self.sum_sq -= value * value
-        self.head = (self.head + 1) % self.capacity
-        self.count -= 1
-
-    def evict_older_than(self, cutoff_ms: int):
-        while self.count > 0 and int(self.timestamps_ms[self.head]) < int(cutoff_ms):
-            self._drop_oldest()
-
-    def append(self, timestamp_ms: int, value: float):
-        if self.count == self.capacity:
-            self._drop_oldest()
-
-        self.timestamps_ms[self.tail] = int(timestamp_ms)
-        self.values[self.tail] = float(value)
-        self.tail = (self.tail + 1) % self.capacity
-        self.count += 1
-        self.sum += float(value)
-        self.sum_sq += float(value) * float(value)
-
-    def mean(self):
-        if self.count <= 0:
-            return None
-        return self.sum / self.count
-
-    def std(self):
-        if self.count <= 1:
-            return None
-        mean = self.sum / self.count
-        variance = max((self.sum_sq / self.count) - (mean * mean), 0.0)
-        return math.sqrt(variance)
-
-    def span_seconds(self):
-        if self.count <= 1:
-            return 0.0
-        last_index = (self.tail - 1) % self.capacity
-        return max(0.0, (int(self.timestamps_ms[last_index]) - int(self.timestamps_ms[self.head])) / 1000.0)
 
 
 @dataclass(frozen=True)
@@ -181,32 +105,16 @@ class AsterTopOfBookSnapshot:
 
 
 @dataclass(frozen=True)
-class BinanceAlphaSnapshot:
-    ready: bool = False
-    raw_imbalance: Optional[float] = None
-    zscore: Optional[float] = None
-    shift_bps: float = 0.0
-    warmup_seconds: float = 0.0
+class VolObiSnapshot:
+    """Immutable view of the Vol+OBI signal published by the Binance feed."""
+    warmed_up: bool = False
+    volatility: float = 0.0
+    alpha: float = 0.0
     sample_count: int = 0
     best_bid: Optional[float] = None
     best_ask: Optional[float] = None
     last_updated: Optional[float] = None
     ws_connected: bool = False
-
-
-@dataclass(frozen=True)
-class PreparedQuoteParams:
-    kind: str
-    source: str
-    buy_spread: float = 0.0
-    sell_spread: float = 0.0
-    gamma: float = 0.0
-    sigma: float = 0.0
-    k_buy: float = 0.0
-    k_sell: float = 0.0
-    time_horizon_days: float = 0.0
-    spread_limits_min_bps: float = DEFAULT_MIN_AVELLANEDA_SPREAD_BPS
-    spread_limits_max_bps: float = DEFAULT_MAX_AVELLANEDA_SPREAD_BPS
 
 
 @dataclass(frozen=True)
@@ -219,82 +127,36 @@ class PendingTerminalOrder:
 
 
 @dataclass(frozen=True)
-class OrderCommand:
-    """The latest desired action for the order manager."""
-    kind: str
-    side: str = ""
+class SideQuote:
+    """Desired resting order for one side of the book."""
+    side: str
+    price: float
+    quantity: float
     reduce_only: bool = False
-    price: float = 0.0
-    quantity: float = 0.0
-    formatted_price: str = ""
-    formatted_quantity: str = ""
     order_notional: float = 0.0
+
+
+@dataclass(frozen=True)
+class QuoteSetCommand:
+    """The latest desired full state of both sides for the order manager.
+
+    One command always carries the complete desired quote set so the
+    latest-wins maxsize-1 handoff queue can never evict half of an update.
+    """
+    kind: str                       # "quote_set" | "cancel_all"
+    bid: Optional[SideQuote] = None
+    ask: Optional[SideQuote] = None
     trigger: str = ""
 
 
-def get_unavailable_quote_params():
-    """Return a sentinel payload meaning the bot must not quote yet."""
-    return {"source": "unavailable"}
-
-
-def get_unavailable_prepared_quote_params():
-    """Return the immutable unavailable quote snapshot used by the hot path."""
-    return PreparedQuoteParams(kind="unavailable", source="unavailable")
-
-
-def prepare_quote_params_snapshot(params):
-    """Validate and normalize quote params once so the hot path stays memory-only."""
-    if not isinstance(params, dict):
-        return get_unavailable_prepared_quote_params()
-
-    source = str(params.get("source") or "unavailable")
-    if source == "unavailable":
-        return get_unavailable_prepared_quote_params()
-
-    if source == "default":
-        buy_spread = _safe_float(params.get("buy_spread"))
-        sell_spread = _safe_float(params.get("sell_spread"))
-        if buy_spread is None or sell_spread is None or buy_spread <= 0.0 or sell_spread <= 0.0:
-            return get_unavailable_prepared_quote_params()
-        return PreparedQuoteParams(
-            kind="default",
-            source=source,
-            buy_spread=buy_spread,
-            sell_spread=sell_spread,
-        )
-
-    spread_limits = resolve_avellaneda_spread_limits_bps(params)
-    gamma = _safe_float(params.get("gamma"))
-    sigma = _safe_float(params.get("sigma"))
-    k_buy = _safe_float(params.get("k_buy"))
-    k_sell = _safe_float(params.get("k_sell"))
-    time_horizon_days = _safe_float(params.get("time_horizon_days"))
-    required_positive = (gamma, sigma, k_buy, k_sell, time_horizon_days)
-    if any(value is None or value <= 0.0 for value in required_positive):
-        return get_unavailable_prepared_quote_params()
-
-    return PreparedQuoteParams(
-        kind="avellaneda",
-        source=source,
-        gamma=gamma,
-        sigma=sigma,
-        k_buy=k_buy,
-        k_sell=k_sell,
-        time_horizon_days=time_horizon_days,
-        spread_limits_min_bps=spread_limits["min"],
-        spread_limits_max_bps=spread_limits["max"],
-    )
-
-
-def publish_binance_alpha_snapshot(state):
-    """Mirror mutable Binance alpha fields into a single immutable snapshot."""
-    state.binance_alpha_snapshot = BinanceAlphaSnapshot(
-        ready=bool(state.binance_alpha_ready),
-        raw_imbalance=state.binance_alpha_raw_imbalance,
-        zscore=state.binance_alpha_zscore,
-        shift_bps=float(state.binance_alpha_shift_bps or 0.0),
-        warmup_seconds=float(state.binance_alpha_warmup_seconds or 0.0),
-        sample_count=int(state.binance_alpha_buffer.count),
+def publish_vol_obi_snapshot(state):
+    """Mirror mutable Vol+OBI signal fields into a single immutable snapshot."""
+    calc = state.vol_obi_calc
+    state.vol_obi_snapshot = VolObiSnapshot(
+        warmed_up=bool(calc is not None and calc.warmed_up),
+        volatility=float(calc.volatility) if calc is not None else 0.0,
+        alpha=float(calc.alpha) if calc is not None else 0.0,
+        sample_count=int(calc.total_samples) if calc is not None else 0,
         best_bid=state.binance_best_bid,
         best_ask=state.binance_best_ask,
         last_updated=state.binance_alpha_last_updated,
@@ -331,56 +193,34 @@ class RuntimeContext:
 
 
 def setup_logging(file_log_level):
-    """Configures logging to both console (INFO) and file (specified level)."""
+    """Configure non-blocking logging (console INFO, file at the given level).
+
+    Log records are drained by a background QueueListener thread so the
+    asyncio event loop never blocks on disk/console I/O (hot-path safety).
+    """
     log_level = getattr(logging, file_log_level.upper(), logging.DEBUG)
-    logger = logging.getLogger()  # Get root logger
+    setup_root_logging(log_file=LOG_FILE, release_mode=RELEASE_MODE, file_log_level=log_level)
 
-    if RELEASE_MODE:
-        logger.setLevel(logging.ERROR)  # Only errors in release mode
-    else:
-        logger.setLevel(log_level)
 
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    # File handler - bounded rotation so multi-week runs don't consume the disk.
-    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=50_000_000, backupCount=5)
-    file_handler.setLevel(log_level if not RELEASE_MODE else logging.ERROR)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    # Console handler - only add if not in release mode or for errors
-    if not RELEASE_MODE:
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-    else:
-        # In release mode, only show errors on console
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.ERROR)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
+@dataclass
+class SideOrderState:
+    """Mutable tracking for the resting order on one side of the book."""
+    order_id: Optional[int] = None
+    price: Optional[float] = None
+    quantity: Optional[float] = None
+    reduce_only: bool = False
+    placed_at: Optional[float] = None
 
 
 class StrategyState:
     """A simple class to hold the shared state of the strategy."""
-    def __init__(self, flip_mode=False):
+    def __init__(self):
         self.bid_price = None
         self.ask_price = None
         self.mid_price = None
-        self.active_order_id = None
         self.position_size = 0.0
-        # Mode can be 'BUY' or 'SELL'
-        self.flip_mode = flip_mode
-        self.mode = 'SELL' if self.flip_mode else 'BUY'
-        # Track last order details for reuse logic
-        self.last_order_price = None
-        self.last_order_side = None
-        self.last_order_quantity = None
+        # Per-side resting order tracking (two-sided quoting)
+        self.side_orders = {'BUY': SideOrderState(), 'SELL': SideOrderState()}
         # Account balance tracking
         self.account_balance = None  # Total USDF + USDT + USDC balance
         self.balance_last_updated = None
@@ -394,45 +234,26 @@ class StrategyState:
         self.order_commands = asyncio.Queue(maxsize=1)
         self.quote_refresh_event = asyncio.Event()
         self.aster_top_of_book_snapshot = None
-        self.quote_params = (
-            {"buy_spread": DEFAULT_BUY_SPREAD, "sell_spread": DEFAULT_SELL_SPREAD, "source": "default"}
-            if not USE_AVELLANEDA_SPREADS
-            else get_unavailable_quote_params()
-        )
-        self.prepared_quote_params = PreparedQuoteParams(
-            kind="default",
-            source="default",
-            buy_spread=DEFAULT_BUY_SPREAD,
-            sell_spread=DEFAULT_SELL_SPREAD,
-        ) if not USE_AVELLANEDA_SPREADS else PreparedQuoteParams(kind="unavailable", source="unavailable")
         # WebSocket connection health flags
         self.price_ws_connected = False
         self.user_data_ws_connected = False
         self.symbol_filters = None
-        # Supertrend signal
-        self.supertrend_signal = None # Can be 1 (up) or -1 (down)
         # Position snapshots are the source of truth for inventory state
         self.position_update_seq = 0
-        self.active_order_started_at = None
         self.order_failure_timestamps = deque()
         self.opening_circuit_breaker_until = 0.0
-        # Binance order book imbalance alpha state
+        # Vol+OBI strategy signal (fed by the Binance depth stream)
+        self.vol_obi_calc = None  # VolObiCalculator, created in main() once tick_size is known
+        self.vol_obi_snapshot = VolObiSnapshot()
+        self.binance_last_refresh_alpha = None
+        # Binance local order book state
         self.binance_bid_book = {}
         self.binance_ask_book = {}
         self.binance_last_update_id = None
-        self.binance_alpha_buffer = RollingZScoreBuffer(BINANCE_OBI_BUFFER_CAPACITY)
         self.binance_alpha_ws_connected = False
-        self.binance_alpha_ready = False
         self.binance_alpha_last_updated = None
-        self.binance_alpha_raw_imbalance = None
-        self.binance_alpha_zscore = None
-        self.binance_alpha_shift_bps = 0.0
-        self.binance_alpha_warmup_seconds = 0.0
         self.binance_best_bid = None
         self.binance_best_ask = None
-        self.binance_last_logged_shift_bps = None
-        self.binance_alpha_last_status = None
-        self.binance_alpha_snapshot = BinanceAlphaSnapshot()
         self.binance_book_last_trim_at = 0.0
         self.binance_book_updates_since_trim = 0
         self.binance_band_mid_price = None
@@ -441,13 +262,6 @@ class StrategyState:
         self.binance_band_bid_qty = 0.0
         self.binance_band_ask_qty = 0.0
         self.pending_terminal_orders = {}
-
-
-def get_strategy_modes(flip_mode):
-    """Return the opening and closing order sides for the current bias."""
-    opening_mode = 'SELL' if flip_mode else 'BUY'
-    closing_mode = 'BUY' if flip_mode else 'SELL'
-    return opening_mode, closing_mode
 
 
 def get_position_close_side(position_size):
@@ -469,35 +283,24 @@ def has_open_position(state):
     return has_open_position_size(state.position_size)
 
 
-def has_significant_position(state, position_notional=None):
-    """Return True when inventory is non-zero and large enough to require an explicit close."""
-    if position_notional is None:
-        position_notional = get_position_notional_usd(state.position_size, state.mid_price)
-
-    return has_open_position(state) and is_position_significant(position_notional)
+def clear_side_order(state, side):
+    """Clear the tracked resting order for one side."""
+    state.side_orders[side] = SideOrderState()
 
 
-def get_target_mode(state, position_notional=None):
-    """Return the desired trading side given current bias and tracked inventory."""
-    opening_mode, _ = get_strategy_modes(state.flip_mode)
-
-    if position_notional is None:
-        position_notional = get_position_notional_usd(state.position_size, state.mid_price)
-
-    close_side = get_position_close_side(state.position_size)
-    if close_side and is_position_significant(position_notional):
-        return close_side
-
-    return opening_mode
+def has_live_orders(state):
+    """Return True when any side has a tracked resting order."""
+    return any(side_state.order_id is not None for side_state in state.side_orders.values())
 
 
-def clear_order_tracking(state):
-    """Clear the active order id and reuse-tracking fields."""
-    state.active_order_id = None
-    state.last_order_price = None
-    state.last_order_side = None
-    state.last_order_quantity = None
-    state.active_order_started_at = None
+def get_tracked_side_for_order(state, order_id):
+    """Return the side ('BUY'/'SELL') tracking the given order id, or None."""
+    if order_id is None:
+        return None
+    for side, side_state in state.side_orders.items():
+        if side_state.order_id == order_id:
+            return side
+    return None
 
 
 def get_position_notional_usd(position_size, reference_price):
@@ -507,16 +310,10 @@ def get_position_notional_usd(position_size, reference_price):
     return abs(position_size * reference_price)
 
 
-def is_position_significant(position_notional):
-    """Return True when the position is large enough to force closing mode."""
-    return position_notional >= POSITION_THRESHOLD_USD
-
-
-def apply_position_snapshot(state, position_size, position_notional=None):
-    """Store the latest position size and align the mode without erasing residual inventory."""
+def apply_position_snapshot(state, position_size):
+    """Store the latest position size without erasing residual inventory."""
     state.position_size = position_size
     state.position_update_seq += 1
-    return sync_mode_with_position(state, position_notional=position_notional)
 
 
 def extract_position_snapshot(position_data, reference_price=None):
@@ -538,16 +335,9 @@ def extract_position_snapshot(position_data, reference_price=None):
 
 def sync_state_from_position_data(state, position_data, reference_price=None):
     """Apply an exchange position payload to local state."""
-    previous_mode = state.mode
     position_size, notional_value = extract_position_snapshot(position_data, reference_price=reference_price)
-    apply_position_snapshot(state, position_size, position_notional=notional_value)
-    return position_size, notional_value, previous_mode, state.mode
-
-
-def sync_mode_with_position(state, position_notional=None):
-    """Keep the strategy mode aligned with the current bias and inventory threshold."""
-    state.mode = get_target_mode(state, position_notional=position_notional)
-    return state.mode
+    apply_position_snapshot(state, position_size)
+    return position_size, notional_value
 
 
 def request_quote_refresh(state):
@@ -576,26 +366,10 @@ def drain_latest_order_command(state, initial_command):
             return latest_command
 
 
-def get_supertrend_params_path(symbol):
-    """Return the normalized Supertrend params file path for a trading symbol."""
-    filename_symbol = normalize_symbol_base(symbol)
-    return os.path.join(PARAMS_DIR, SUPERTREND_PARAMS_TEMPLATE.format(filename_symbol))
-
-
-def load_supertrend_signal(symbol):
-    """Load the latest Supertrend signal from disk."""
-    params_file = get_supertrend_params_path(symbol)
-    if not os.path.exists(params_file):
-        raise FileNotFoundError(params_file)
-
-    with open(params_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    signal = data.get('current_signal', {}).get('trend')
-    if signal not in [1, -1]:
-        raise ValueError(f"Invalid signal '{signal}' in {params_file}")
-
-    return signal, params_file
+def publish_cancel_all_if_live(state, trigger):
+    """Ask the order manager to pull all working orders if any side is live."""
+    if has_live_orders(state):
+        publish_latest_order_command(state, QuoteSetCommand(kind="cancel_all", trigger=trigger))
 
 
 def round_price_to_tick(price, tick_size, side):
@@ -630,21 +404,13 @@ def _binance_depth_snapshot_url(symbol):
 
 
 def clear_binance_alpha_state(state):
-    """Reset all in-memory Binance alpha state to avoid stale reuse or memory growth."""
+    """Reset all in-memory Binance book and Vol+OBI state to avoid stale reuse."""
     state.binance_bid_book.clear()
     state.binance_ask_book.clear()
     state.binance_last_update_id = None
-    state.binance_alpha_buffer.clear()
-    state.binance_alpha_ready = False
     state.binance_alpha_last_updated = None
-    state.binance_alpha_raw_imbalance = None
-    state.binance_alpha_zscore = None
-    state.binance_alpha_shift_bps = 0.0
-    state.binance_alpha_warmup_seconds = 0.0
     state.binance_best_bid = None
     state.binance_best_ask = None
-    state.binance_last_logged_shift_bps = None
-    state.binance_alpha_last_status = None
     state.binance_book_last_trim_at = 0.0
     state.binance_book_updates_since_trim = 0
     state.binance_band_mid_price = None
@@ -652,7 +418,11 @@ def clear_binance_alpha_state(state):
     state.binance_band_upper_bound = None
     state.binance_band_bid_qty = 0.0
     state.binance_band_ask_qty = 0.0
-    publish_binance_alpha_snapshot(state)
+    state.binance_last_refresh_alpha = None
+    # A stale signal must never survive a reconnect: warmup restarts by design.
+    if state.vol_obi_calc is not None:
+        state.vol_obi_calc.reset()
+    publish_vol_obi_snapshot(state)
 
 
 def _refresh_binance_best_prices(state):
@@ -743,8 +513,8 @@ def _rebuild_binance_band_totals(state):
         return
 
     mid_price = (best_bid + best_ask) / 2.0
-    lower_bound = mid_price * (1.0 - BINANCE_OBI_LOOKING_DEPTH_PCT)
-    upper_bound = mid_price * (1.0 + BINANCE_OBI_LOOKING_DEPTH_PCT)
+    lower_bound = mid_price * (1.0 - OBI_LOOKING_DEPTH)
+    upper_bound = mid_price * (1.0 + OBI_LOOKING_DEPTH)
 
     bid_qty = 0.0
     for price, qty in state.binance_bid_book.items():
@@ -778,8 +548,8 @@ def _binance_band_requires_rebuild(state):
     return drift_bps >= BINANCE_OBI_BAND_REBUILD_BPS
 
 
-def calculate_binance_orderbook_imbalance(state):
-    """Compute normalized Binance book imbalance within +/- looking depth around mid."""
+def compute_binance_band_imbalance(state):
+    """Compute the raw Binance book imbalance (bid qty - ask qty) within the band."""
     if not state.binance_bid_book or not state.binance_ask_book:
         return None
 
@@ -789,56 +559,31 @@ def calculate_binance_orderbook_imbalance(state):
     if state.binance_band_mid_price is None:
         return None
 
-    total_qty = state.binance_band_bid_qty + state.binance_band_ask_qty
-    if total_qty <= 0.0:
-        return None
-
-    return (state.binance_band_bid_qty - state.binance_band_ask_qty) / total_qty
+    return state.binance_band_bid_qty - state.binance_band_ask_qty
 
 
-def calculate_binance_alpha_shift_bps(zscore):
-    """Map a z-score to a capped quote shift in basis points."""
-    if zscore is None or not np.isfinite(zscore):
-        return 0.0
-    shift_bps = float(zscore) * BINANCE_OBI_BPS_PER_SIGMA
-    return max(-BINANCE_OBI_MAX_SHIFT_BPS, min(BINANCE_OBI_MAX_SHIFT_BPS, shift_bps))
+def is_vol_obi_live(state, runtime):
+    """Return True when the Vol+OBI signal is warmed up, connected, and fresh.
+
+    With two resting orders the bot must pull quotes when the signal feed
+    dies, so staleness is part of liveness.
+    """
+    snapshot = state.vol_obi_snapshot
+    if not snapshot.warmed_up or not snapshot.ws_connected:
+        return False
+    if snapshot.last_updated is None:
+        return False
+    return (runtime.now() - snapshot.last_updated) <= BINANCE_OBI_STALE_TIMEOUT_SECONDS
 
 
-def is_binance_alpha_live(state):
-    """Return True when Binance alpha is warmed up and ready for opening quotes."""
-    if not USE_BINANCE_OBI_ALPHA:
-        return True
-    return bool(state.binance_alpha_snapshot.ready or state.binance_alpha_ready)
-
-
-def binance_alpha_status_text(state):
-    """Return a compact status string for logs and reporters."""
-    snapshot = state.binance_alpha_snapshot
-    if not USE_BINANCE_OBI_ALPHA:
-        return "Binance OBI disabled"
-    if snapshot.ready is False and state.binance_alpha_ready:
-        snapshot = BinanceAlphaSnapshot(
-            ready=True,
-            zscore=state.binance_alpha_zscore,
-            shift_bps=state.binance_alpha_shift_bps,
-            warmup_seconds=state.binance_alpha_warmup_seconds,
-            sample_count=state.binance_alpha_buffer.count,
-            best_bid=state.binance_best_bid,
-            best_ask=state.binance_best_ask,
-            last_updated=state.binance_alpha_last_updated,
-            ws_connected=state.binance_alpha_ws_connected,
-        )
-    if snapshot.ready:
-        zscore = snapshot.zscore if snapshot.zscore is not None else 0.0
-        return f"Binance OBI z={zscore:+.2f} shift={snapshot.shift_bps:+.1f}bps"
+def vol_obi_status_text(state):
+    """Return a compact Vol+OBI status string for logs and reporters."""
+    snapshot = state.vol_obi_snapshot
+    if snapshot.warmed_up:
+        return f"Vol+OBI vol=${snapshot.volatility:.4f}/s alpha={snapshot.alpha:+.2f}"
     if snapshot.ws_connected:
-        return (
-            f"Binance OBI warming {snapshot.warmup_seconds:.0f}s/"
-            f"{BINANCE_OBI_WARMUP_SECONDS}s samples={snapshot.sample_count}"
-        )
-    return "Binance OBI unavailable"
-
-    return rounded
+        return f"Vol+OBI warming samples={snapshot.sample_count}/{OBI_MIN_WARMUP_SAMPLES}"
+    return "Vol+OBI feed unavailable"
 
 
 def round_quantity_to_step(quantity, step_size):
@@ -877,14 +622,14 @@ class AsterTopOfBookFeed:
 
 
 class BinanceAlphaEngine:
-    """Maintain Binance order book state and publish immutable alpha snapshots."""
+    """Maintain Binance order book state and feed the Vol+OBI calculator."""
 
     def clear(self, state):
         clear_binance_alpha_state(state)
 
     def initialize_local_book(self, state, snapshot):
         _initialize_binance_local_book(state, snapshot)
-        publish_binance_alpha_snapshot(state)
+        publish_vol_obi_snapshot(state)
 
     def apply_depth_event(self, state, event, require_prev_match=True):
         return _apply_binance_depth_event(state, event, require_prev_match=require_prev_match)
@@ -894,31 +639,20 @@ class BinanceAlphaEngine:
 
 
 class QuoteEngine:
-    """Own all quote decisions off immutable feed snapshots and prepared params."""
+    """Own all quote decisions off immutable feed snapshots."""
 
-    def prepare_quote_params(self, params):
-        return prepare_quote_params_snapshot(params)
-
-    def get_prepared_params(self, state):
-        return state.prepared_quote_params or get_unavailable_prepared_quote_params()
-
-    def estimate_quote_center(self, state, book_snapshot=None, prepared_params=None):
+    def estimate_quote_center(self, state, book_snapshot=None):
         snapshot = book_snapshot or state.aster_top_of_book_snapshot
         if snapshot is None:
             return None
 
-        params = prepared_params or self.get_prepared_params(state)
         mid_price = snapshot.mid_price
-        alpha_snapshot = state.binance_alpha_snapshot
-        alpha_shift_abs = 0.0
-        if alpha_snapshot.ready and mid_price and mid_price > 0.0:
-            alpha_shift_abs = mid_price * (alpha_snapshot.shift_bps / 10000.0)
+        calc = state.vol_obi_calc
+        vol_obi = state.vol_obi_snapshot
+        if calc is not None and vol_obi.warmed_up:
+            return mid_price + calc.c1 * vol_obi.alpha
 
-        if params.kind == "avellaneda":
-            risk_term = params.gamma * ((params.sigma * mid_price) ** 2) * params.time_horizon_days
-            return mid_price - state.position_size * risk_term + alpha_shift_abs
-
-        return mid_price + alpha_shift_abs
+        return mid_price
 
     def should_refresh_from_top_of_book(self, state, previous_snapshot, new_snapshot):
         if previous_snapshot is None or new_snapshot is None:
@@ -935,15 +669,16 @@ class QuoteEngine:
             center_threshold = max(center_threshold, tick_size)
         return abs(new_center - previous_center) >= center_threshold
 
-    def build_quote_command(self, state, symbol_filters):
-        return build_quote_command(state, symbol_filters)
+    def build_quote_set(self, state, symbol_filters, runtime):
+        return build_quote_set(state, symbol_filters, runtime)
 
     async def run(self, state, client, symbol, runtime):
         log = logging.getLogger('MarketMakerLoop')
-        log.info(f"Fetching trading rules for {symbol}...")
-        symbol_filters = await client.get_symbol_filters(symbol)
-        state.symbol_filters = symbol_filters
-        log.info(f"Filters loaded: {symbol_filters}")
+        if state.symbol_filters is None:
+            log.info(f"Fetching trading rules for {symbol}...")
+            state.symbol_filters = await client.get_symbol_filters(symbol)
+            log.info(f"Filters loaded: {state.symbol_filters}")
+        symbol_filters = state.symbol_filters
         request_quote_refresh(state)
 
         while not runtime.shutdown_requested:
@@ -956,52 +691,29 @@ class QuoteEngine:
                         break
 
                     if symbol_filters.get("status", "TRADING") != "TRADING":
-                        if state.active_order_id:
-                            publish_latest_order_command(
-                                state,
-                                OrderCommand(kind="cancel", trigger=f"Symbol status {symbol_filters.get('status', 'UNKNOWN')}"),
-                            )
+                        publish_cancel_all_if_live(
+                            state,
+                            f"Symbol status {symbol_filters.get('status', 'UNKNOWN')}",
+                        )
                         break
 
                     if not state.price_ws_connected or not state.user_data_ws_connected:
-                        if state.active_order_id:
-                            publish_latest_order_command(
-                                state,
-                                OrderCommand(kind="cancel", trigger="WebSocket disconnection"),
-                            )
+                        publish_cancel_all_if_live(state, "WebSocket disconnection")
                         break
 
                     if not is_price_data_valid(state, runtime) or not is_balance_data_valid(state):
                         break
 
-                    if is_opening_circuit_breaker_active(state, runtime) and not has_open_position(state):
+                    quote_set, diagnostics = self.build_quote_set(state, symbol_filters, runtime)
+                    if quote_set is None:
+                        publish_cancel_all_if_live(
+                            state,
+                            f"Quotes unavailable: {diagnostics['reason']}",
+                        )
                         break
 
-                    bias_changed, current_notional = apply_supertrend_bias(state)
-                    if bias_changed:
-                        trend_name = "DOWNTREND" if state.flip_mode else "UPTREND"
-                        log.info(f"Supertrend switched strategy bias to {trend_name} while inventory was below ${current_notional:.2f}.")
-
-                    quote_command, order_candidate = self.build_quote_command(state, symbol_filters)
-                    if quote_command is None:
-                        reason = order_candidate["reason"]
-                        if reason in {"missing_quote_params", "invalid_quote_params", "binance_alpha_unavailable"}:
-                            if state.active_order_id:
-                                publish_latest_order_command(
-                                    state,
-                                    OrderCommand(kind="cancel", trigger=f"Quotes unavailable: {reason}"),
-                                )
-                            break
-
-                        if reason in {"non_positive_quantity", "min_qty", "min_notional"} and state.active_order_id:
-                            publish_latest_order_command(
-                                state,
-                                OrderCommand(kind="cancel", trigger=f"Quote invalid: {reason}"),
-                            )
-                        break
-
-                    if not should_reuse_order(state, quote_command.price, quote_command.side, quote_command.quantity):
-                        publish_latest_order_command(state, quote_command)
+                    if quote_set_requires_update(state, quote_set):
+                        publish_latest_order_command(state, quote_set)
 
                     if not state.quote_refresh_event.is_set():
                         break
@@ -1021,14 +733,14 @@ class OrderExecutor:
     def __init__(self, fast_replace=FAST_ORDER_REPLACE):
         self.fast_replace = bool(fast_replace)
 
-    async def place_order(self, state, client, symbol, runtime, log, command):
-        return await place_order_from_command(
+    async def place_order(self, state, client, symbol, runtime, log, quote):
+        return await place_side_order(
             state,
             client,
             symbol,
             runtime,
             log,
-            command,
+            quote,
             symbol_filters=state.symbol_filters,
         )
 
@@ -1046,40 +758,51 @@ class OrderExecutor:
 
                 open_orders = await client.get_open_orders(symbol)
                 open_order_ids = {order.get("orderId") for order in open_orders}
-                active_id = state.active_order_id
-                if active_id is not None and active_id not in open_order_ids:
-                    # Grace window avoids racing a freshly placed order whose
-                    # GET /openOrders snapshot hasn't propagated yet.
-                    started_at = state.active_order_started_at
-                    age = runtime.now() - started_at if started_at is not None else float("inf")
+
+                # Clear local tracking for orders the exchange no longer has.
+                # Grace window avoids racing a freshly placed order whose
+                # GET /openOrders snapshot hasn't propagated yet.
+                for side, side_state in state.side_orders.items():
+                    if side_state.order_id is None or side_state.order_id in open_order_ids:
+                        continue
+                    age = (
+                        runtime.now() - side_state.placed_at
+                        if side_state.placed_at is not None
+                        else float("inf")
+                    )
                     if age >= OPEN_ORDER_WATCHDOG_STALE_GRACE:
                         log.warning(
-                            "Tracked order %s missing from exchange for %.1fs; clearing stale tracking.",
-                            active_id, age,
+                            "Tracked %s order %s missing from exchange for %.1fs; clearing stale tracking.",
+                            side, side_state.order_id, age,
                         )
-                        clear_order_tracking(state)
-                        state.pending_terminal_orders.pop(active_id, None)
+                        state.pending_terminal_orders.pop(side_state.order_id, None)
+                        clear_side_order(state, side)
                         request_quote_refresh(state)
 
-                if len(open_orders) <= 1:
+                tracked_ids = {
+                    side_state.order_id
+                    for side_state in state.side_orders.values()
+                    if side_state.order_id is not None
+                }
+                tracked_ids.update(state.pending_terminal_orders.keys())
+                untracked = [
+                    order_id for order_id in open_order_ids if order_id not in tracked_ids
+                ]
+                if not untracked:
                     continue
 
-                order_ids = [order.get("orderId") for order in open_orders]
-                log.error(f"Detected multiple open orders for {symbol}: {order_ids}")
+                log.error(f"Detected untracked open orders for {symbol}: {untracked}")
                 if OPEN_ORDER_WATCHDOG_CANCEL_ALL:
                     await client.cancel_all_orders(symbol)
-                    log.error(f"Cancelled all open orders for {symbol} after watchdog detected duplicates.")
+                    log.error(f"Cancelled all open orders for {symbol} after watchdog detected untracked orders.")
+                    for side in list(state.side_orders.keys()):
+                        clear_side_order(state, side)
+                    state.pending_terminal_orders.clear()
                 else:
-                    active_order_id = state.active_order_id
-                    for order in open_orders:
-                        order_id = order.get("orderId")
-                        if active_order_id is not None and order_id == active_order_id:
-                            continue
+                    for order_id in untracked:
                         await client.cancel_order(symbol, order_id)
-                    log.error(f"Cancelled duplicate open orders for {symbol}; keeping tracked order {active_order_id}.")
+                    log.error(f"Cancelled untracked open orders for {symbol}; keeping tracked orders {sorted(tracked_ids)}.")
 
-                clear_order_tracking(state)
-                state.pending_terminal_orders.clear()
                 request_quote_refresh(state)
 
             except asyncio.CancelledError:
@@ -1088,33 +811,23 @@ class OrderExecutor:
             except Exception as exc:
                 log.error(f"Order watchdog error: {exc}", exc_info=True)
 
-async def cancel_active_order(state, client, symbol, log, reason, clear_tracking_on_success=True):
-    """Cancel the currently tracked order and optionally clear local tracking on success."""
-    if not state.active_order_id:
+async def cancel_side_order(state, client, symbol, log, side, reason, clear_tracking_on_success=True):
+    """Cancel the tracked order on one side and optionally clear local tracking on success."""
+    side_state = state.side_orders[side]
+    if side_state.order_id is None:
         return True
 
-    order_id_to_cancel = state.active_order_id
+    order_id_to_cancel = side_state.order_id
     try:
-        if CANCEL_SPECIFIC_ORDER:
-            await client.cancel_order(symbol, order_id_to_cancel)
-        else:
-            await client.cancel_all_orders(symbol)
+        await client.cancel_order(symbol, order_id_to_cancel)
     except Exception as cancel_error:
-        log.error(f"{reason}: failed to cancel active order {order_id_to_cancel}: {cancel_error}")
+        log.error(f"{reason}: failed to cancel {side} order {order_id_to_cancel}: {cancel_error}")
         return False
 
     if clear_tracking_on_success:
-        clear_order_tracking(state)
-    log.info(f"{reason}: cancelled active order {order_id_to_cancel}.")
+        clear_side_order(state, side)
+    log.info(f"{reason}: cancelled {side} order {order_id_to_cancel}.")
     return True
-
-
-def get_close_side_for_trading(state):
-    """Return the side needed to flatten any tracked inventory, including small residuals."""
-    if not has_open_position(state):
-        return None
-
-    return get_position_close_side(state.position_size)
 
 
 async def wait_for_position_sync(state, previous_seq, timeout):
@@ -1132,24 +845,18 @@ async def wait_for_position_sync(state, previous_seq, timeout):
 
 
 async def reconcile_fill_with_position(state, client, symbol, log, previous_position_seq, fill_context):
-    """Refresh strategy mode after a fill using position snapshots as the source of truth."""
-    previous_mode = state.mode
-
+    """Refresh tracked inventory after a fill using position snapshots as the source of truth."""
     if await wait_for_position_sync(state, previous_position_seq, POSITION_SYNC_TIMEOUT):
-        sync_mode_with_position(state)
-        new_mode = state.mode
-        return True, previous_mode, new_mode
+        return True
 
     log.warning(f"{fill_context}: no position snapshot arrived within {POSITION_SYNC_TIMEOUT:.1f}s; falling back to REST sync.")
     positions = await client.get_position_risk(symbol)
     if positions:
         sync_state_from_position_data(state, positions[0], reference_price=state.mid_price)
     else:
-        apply_position_snapshot(state, 0.0, position_notional=0.0)
+        apply_position_snapshot(state, 0.0)
 
-    sync_mode_with_position(state)
-    new_mode = state.mode
-    return False, previous_mode, new_mode
+    return False
 
 
 async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None, quote_engine=None):
@@ -1206,11 +913,7 @@ async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None,
                                         )
                                         if should_refresh:
                                             request_quote_refresh(state)
-                                        if log.isEnabledFor(logging.DEBUG):
-                                            log.debug(
-                                                "Updated prices for %s: Bid=%s, Ask=%s, Mid=%.4f",
-                                                symbol, best_bid, best_ask, state.mid_price,
-                                            )
+                                        log.debug(f"Updated prices for {symbol}: Bid={best_bid}, Ask={best_ask}, Mid={state.mid_price:.4f}")
 
                         except json.JSONDecodeError:
                             log.warning("Failed to decode WebSocket message")
@@ -1245,7 +948,12 @@ async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None,
 
 
 def _update_binance_alpha_metrics(state, runtime):
-    """Refresh the bounded rolling Binance alpha state from the latest local book."""
+    """HOT PATH: feed the Vol+OBI calculator from the latest local Binance book.
+
+    Runs once per 100ms diff-depth event. Everything here is O(1) float math
+    against the incrementally maintained band totals — no REST, no disk, no
+    book re-summation (the band is rebuilt only on >=1bps mid drift).
+    """
     now = runtime.now()
     should_trim = (
         state.binance_book_updates_since_trim >= BINANCE_OBI_TRIM_INTERVAL_UPDATES
@@ -1256,36 +964,17 @@ def _update_binance_alpha_metrics(state, runtime):
         state.binance_book_last_trim_at = now
         state.binance_book_updates_since_trim = 0
 
-    raw_imbalance = calculate_binance_orderbook_imbalance(state)
+    raw_imbalance = compute_binance_band_imbalance(state)
     if raw_imbalance is None:
-        publish_binance_alpha_snapshot(state)
+        publish_vol_obi_snapshot(state)
         return
 
-    now_ms = int(now * 1000)
-    cutoff_ms = now_ms - (BINANCE_OBI_ZSCORE_WINDOW_SECONDS * 1000)
-    state.binance_alpha_buffer.evict_older_than(cutoff_ms)
-    state.binance_alpha_buffer.append(now_ms, raw_imbalance)
+    calc = state.vol_obi_calc
+    if calc is not None:
+        calc.on_sample(state.binance_band_mid_price, raw_imbalance)
 
     state.binance_alpha_last_updated = now
-    state.binance_alpha_raw_imbalance = raw_imbalance
-    state.binance_alpha_warmup_seconds = state.binance_alpha_buffer.span_seconds()
-    std = state.binance_alpha_buffer.std()
-    if std is None or std <= 1e-12:
-        state.binance_alpha_zscore = None
-        state.binance_alpha_shift_bps = 0.0
-        state.binance_alpha_ready = False
-        publish_binance_alpha_snapshot(state)
-        return
-
-    mean = state.binance_alpha_buffer.mean()
-    zscore = (raw_imbalance - mean) / std
-    state.binance_alpha_zscore = zscore
-    state.binance_alpha_shift_bps = calculate_binance_alpha_shift_bps(zscore)
-    state.binance_alpha_ready = (
-        state.binance_alpha_buffer.count >= BINANCE_OBI_MIN_SAMPLES
-        and state.binance_alpha_warmup_seconds >= BINANCE_OBI_WARMUP_SECONDS
-    )
-    publish_binance_alpha_snapshot(state)
+    publish_vol_obi_snapshot(state)
 
 
 async def _fetch_binance_depth_snapshot(symbol):
@@ -1393,8 +1082,23 @@ def _apply_binance_depth_event(state, event, require_prev_match=True):
     return True
 
 
+def _vol_obi_alpha_refresh_required(state, calc):
+    """Return True when alpha moved the fair price enough to warrant a requote."""
+    last_alpha = state.binance_last_refresh_alpha
+    if last_alpha is None:
+        return True
+
+    fair_shift_abs = abs(calc.c1 * (calc.alpha - last_alpha))
+    reference_mid = state.mid_price or state.binance_band_mid_price or 0.0
+    threshold = reference_mid * (QUOTE_REFRESH_PREFILTER_BPS / 10000.0)
+    tick_size = float((state.symbol_filters or {}).get("tick_size", 0.0) or 0.0)
+    if tick_size > 0.0:
+        threshold = max(threshold, tick_size)
+    return threshold > 0.0 and fair_shift_abs >= threshold
+
+
 async def binance_orderbook_imbalance_updater(state, symbol, runtime, alpha_engine=None):
-    """Maintain a bounded local Binance futures book and rolling imbalance alpha."""
+    """Maintain a bounded local Binance futures book feeding the Vol+OBI signal."""
     log = logging.getLogger("BinanceOBIUpdater")
     alpha_engine = alpha_engine or BinanceAlphaEngine()
     websocket_url = _binance_depth_stream_url(symbol)
@@ -1410,7 +1114,7 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime, alpha_engi
 
             async with websockets.connect(websocket_url, ping_interval=20, ping_timeout=10) as websocket:
                 state.binance_alpha_ws_connected = True
-                publish_binance_alpha_snapshot(state)
+                publish_vol_obi_snapshot(state)
                 request_quote_refresh(state)
                 reconnect_delay = 5.0
                 log.info(f"Binance OBI connected for {symbol} via diff-depth @100ms")
@@ -1441,7 +1145,6 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime, alpha_engi
                     alpha_engine.update_metrics(state, runtime)
 
                 last_message_time = runtime.now()
-                last_ready = state.binance_alpha_ready
 
                 while not runtime.shutdown_requested:
                     try:
@@ -1455,36 +1158,21 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime, alpha_engi
                         continue
 
                     alpha_engine.apply_depth_event(state, event)
-                    previous_ready = state.binance_alpha_ready
-                    previous_shift = state.binance_alpha_shift_bps
+                    calc = state.vol_obi_calc
+                    previous_warmed = calc.warmed_up if calc is not None else False
                     alpha_engine.update_metrics(state, runtime)
 
-                    if state.binance_alpha_ready and not previous_ready:
-                        zscore = state.binance_alpha_zscore if state.binance_alpha_zscore is not None else 0.0
-                        log.info(
-                            f"Binance OBI ready: raw={state.binance_alpha_raw_imbalance:+.4f} "
-                            f"z={zscore:+.2f} shift={state.binance_alpha_shift_bps:+.1f} bps "
-                            f"window={state.binance_alpha_warmup_seconds:.0f}s samples={state.binance_alpha_buffer.count}"
-                        )
-
-                    if state.binance_alpha_ready:
-                        should_log_shift = (
-                            state.binance_last_logged_shift_bps is None
-                            or abs(state.binance_alpha_shift_bps - state.binance_last_logged_shift_bps) >= BINANCE_OBI_SHIFT_LOG_DELTA_BPS
-                        )
-                        if should_log_shift:
-                            zscore = state.binance_alpha_zscore if state.binance_alpha_zscore is not None else 0.0
+                    if calc is not None and calc.warmed_up:
+                        if not previous_warmed:
                             log.info(
-                                f"Binance OBI shift update: z={zscore:+.2f}, "
-                                f"shift={state.binance_alpha_shift_bps:+.1f} bps"
+                                "Vol+OBI warmed up after %d samples: vol=$%.4f/s alpha=%+.2f",
+                                calc.total_samples, calc.volatility, calc.alpha,
                             )
-                            state.binance_last_logged_shift_bps = state.binance_alpha_shift_bps
-
-                    if (
-                        state.binance_alpha_ready != previous_ready
-                        or abs(state.binance_alpha_shift_bps - previous_shift) >= BINANCE_OBI_SHIFT_LOG_DELTA_BPS
-                    ):
-                        request_quote_refresh(state)
+                            state.binance_last_refresh_alpha = calc.alpha
+                            request_quote_refresh(state)
+                        elif _vol_obi_alpha_refresh_required(state, calc):
+                            state.binance_last_refresh_alpha = calc.alpha
+                            request_quote_refresh(state)
 
                     if runtime.now() - last_message_time > BINANCE_OBI_STALE_TIMEOUT_SECONDS:
                         raise BinanceOrderBookSyncError("Binance OBI stream stale threshold exceeded")
@@ -1623,21 +1311,14 @@ async def websocket_user_data_updater(state, client, symbol, runtime):
                                     if position.get('s') == symbol:
                                         reference_price = state.mid_price if state.mid_price and state.mid_price > 0 else float(position.get('ep', '0') or 0.0)
                                         previous_position_size = state.position_size
-                                        new_position_size, notional_value, previous_mode, _ = sync_state_from_position_data(
+                                        new_position_size, notional_value = sync_state_from_position_data(
                                             state,
                                             position,
                                             reference_price=reference_price,
                                         )
 
                                         if abs(previous_position_size - new_position_size) > 1e-9:
-                                            log.info(f"Real-time position update for {symbol}: size changed from {previous_position_size:.6f} to {new_position_size:.6f}")
-
-                                        # Update mode based on notional value
-                                        if state.mode != previous_mode:
-                                            log.info(
-                                                f"Position notional from WS (${notional_value:.2f}) changed mode: "
-                                                f"{previous_mode} -> {state.mode}."
-                                            )
+                                            log.info(f"Real-time position update for {symbol}: size changed from {previous_position_size:.6f} to {new_position_size:.6f} (${notional_value:.2f})")
                                         request_quote_refresh(state)
 
                             
@@ -1720,7 +1401,7 @@ async def price_reporter(state, symbol, runtime):
                 if is_balance_data_valid(state):
                     balance_info = f" | Balance: ${state.account_balance:.2f}"
 
-                alpha_info = f" | {binance_alpha_status_text(state)}"
+                alpha_info = f" | {vol_obi_status_text(state)}"
                 log.info(
                     f"{symbol} | Mid-Price: ${state.mid_price:.4f} | Bid-Ask Spread: {spread_percentage:.3f}% "
                     f"| Bid: ${state.bid_price:.4f} | Ask: ${state.ask_price:.4f}{balance_info}{alpha_info}"
@@ -1732,62 +1413,25 @@ async def price_reporter(state, symbol, runtime):
     log.info("Price reporter shutting down")
 
 
-async def initialize_supertrend_signal(state, symbol):
-    """Reads the Supertrend signal file once at startup to set the initial state."""
-    log = logging.getLogger('SupertrendInitializer')
-
-    try:
-        initial_signal, params_file = load_supertrend_signal(symbol)
-        state.supertrend_signal = initial_signal
-        new_flip_mode = (initial_signal == -1)
-        if state.flip_mode != new_flip_mode:
-            state.flip_mode = new_flip_mode
-            sync_mode_with_position(state)
-            log.info(f"Initialized Supertrend signal to: {'UPTREND (+1)' if initial_signal == 1 else 'DOWNTREND (-1)'}")
-            log.info(f"Initial strategy bias set by signal: FLIP_MODE -> {state.flip_mode}")
-        else:
-            log.info(f"Initial Supertrend signal confirms default bias: FLIP_MODE -> {state.flip_mode}")
-    except FileNotFoundError:
-        params_file = get_supertrend_params_path(symbol)
-        log.warning(f"Supertrend params file not found at {params_file}. Using default FLIP_MODE={state.flip_mode}.")
-    except ValueError as exc:
-        log.warning(f"{exc}. Using default FLIP_MODE={state.flip_mode}.")
-    except Exception as e:
-        log.error(f"Error initializing Supertrend signal: {e}. Using default FLIP_MODE={state.flip_mode}.")
-
-
 async def wait_for_startup_inputs(state, symbol, runtime):
-    """Block startup until Avellaneda, Supertrend, and Binance alpha are ready."""
+    """Block startup until the Vol+OBI signal has warmed up."""
     log = logging.getLogger('StartupInputs')
     wait_seconds = 5
     last_status = None
 
     while not runtime.shutdown_requested:
-        avellaneda_ready = (not USE_AVELLANEDA_SPREADS) or state.quote_params.get("source") != "unavailable"
-        supertrend_ready = (not USE_SUPERTREND_SIGNAL) or state.supertrend_signal in [1, -1]
-        binance_ready = is_binance_alpha_live(state)
-        status = (avellaneda_ready, supertrend_ready, binance_ready)
-        if status != last_status:
-            if avellaneda_ready and supertrend_ready and binance_ready:
-                log.info(
-                    f"Startup inputs ready for {symbol}: Avellaneda params, Supertrend signal, "
-                    "and Binance OBI warmup are all valid."
-                )
+        vol_obi_ready = is_vol_obi_live(state, runtime)
+        if vol_obi_ready != last_status:
+            if vol_obi_ready:
+                log.info(f"Startup inputs ready for {symbol}: Vol+OBI signal warmed up.")
             else:
-                missing = []
-                if not avellaneda_ready:
-                    missing.append("Avellaneda params")
-                if not supertrend_ready:
-                    missing.append("Supertrend signal")
-                if not binance_ready:
-                    missing.append("Binance OBI warmup")
                 log.info(
-                    f"Waiting for startup inputs for {symbol}: missing {', '.join(missing)}. "
+                    f"Waiting for startup inputs for {symbol}: {vol_obi_status_text(state)}. "
                     f"Retrying every {wait_seconds}s."
                 )
-            last_status = status
+            last_status = vol_obi_ready
 
-        if avellaneda_ready and supertrend_ready and binance_ready:
+        if vol_obi_ready:
             return True
 
         await asyncio.sleep(wait_seconds)
@@ -1795,103 +1439,34 @@ async def wait_for_startup_inputs(state, symbol, runtime):
     return False
 
 
-async def supertrend_signal_updater(state, symbol, runtime):
-    """Periodically reads the Supertrend signal file and updates the strategy state."""
-    log = logging.getLogger('SupertrendUpdater')
+def should_reuse_side(side_state, new_price, threshold=DEFAULT_PRICE_CHANGE_THRESHOLD):
+    """Check if the resting order on one side can be reused for the new price.
 
-    while not runtime.shutdown_requested:
-        try:
-            new_signal, params_file = load_supertrend_signal(symbol)
-            if state.supertrend_signal != new_signal:
-                state.supertrend_signal = new_signal
-                log.info(f"Supertrend signal updated to: {'UPTREND (+1)' if new_signal == 1 else 'DOWNTREND (-1)'}")
-                request_quote_refresh(state)
-
-            await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
-
-        except FileNotFoundError:
-            params_file = get_supertrend_params_path(symbol)
-            if state.supertrend_signal is None:
-                log.warning(f"Supertrend params file not found at {params_file}. Keeping default bias until a valid signal appears.")
-            else:
-                log.warning(f"Supertrend params file not found at {params_file}. Holding previous signal {state.supertrend_signal}.")
-            await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
-        except json.JSONDecodeError:
-            params_file = get_supertrend_params_path(symbol)
-            if state.supertrend_signal is None:
-                log.error(f"Error decoding JSON from {params_file}. Keeping default bias until a valid signal appears.")
-            else:
-                log.error(f"Error decoding JSON from {params_file}. Holding previous signal {state.supertrend_signal}.")
-            await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
-        except ValueError as exc:
-            if state.supertrend_signal is None:
-                log.warning(f"{exc}. Keeping default bias until a valid signal appears.")
-            else:
-                log.warning(f"{exc}. Holding previous signal {state.supertrend_signal}.")
-            await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
-        except Exception as e:
-            if state.supertrend_signal is None:
-                log.error(f"An error occurred in the Supertrend signal updater: {e}. Keeping default bias until a valid signal appears.")
-            else:
-                log.error(f"An error occurred in the Supertrend signal updater: {e}. Holding previous signal {state.supertrend_signal}.")
-            await asyncio.sleep(SUPERTREND_CHECK_INTERVAL)
-    
-    log.info("Supertrend signal updater shutting down.")
-def should_reuse_order(state, new_price, new_side, new_quantity, threshold=DEFAULT_PRICE_CHANGE_THRESHOLD):
-    """Check if existing order can be reused based on price change threshold."""
-    if (state.active_order_id is None or
-        state.last_order_price is None or
-        state.last_order_side != new_side or
-        abs(state.last_order_quantity - new_quantity) > 0.000000000001):  # Different quantity
+    Price-only comparison: desired quantity wobbles with every balance tick
+    and partial fill, so comparing quantities would churn quotes pointlessly.
+    """
+    if side_state.order_id is None or side_state.price is None or side_state.price <= 0:
         return False
 
-    # Calculate price change percentage
-    price_change_pct = abs(new_price - state.last_order_price) / state.last_order_price
-
-    # Reuse if price change is below threshold
+    price_change_pct = abs(new_price - side_state.price) / side_state.price
     return price_change_pct < threshold
 
 
-def apply_supertrend_bias(state):
-    """Update flip_mode from the cached signal when inventory is below the significance threshold."""
-    if not USE_SUPERTREND_SIGNAL or state.supertrend_signal is None:
-        return False, None
-
-    current_notional = get_position_notional_usd(state.position_size, state.mid_price)
-    if current_notional >= POSITION_THRESHOLD_USD:
-        return False, current_notional
-
-    new_flip_mode = (state.supertrend_signal == -1)
-    if state.flip_mode == new_flip_mode:
-        return False, current_notional
-
-    state.flip_mode = new_flip_mode
-    sync_mode_with_position(state, position_notional=current_notional)
-    return True, current_notional
-
-
-def get_runtime_quote_params(state):
-    """Return the latest cached quoting parameters."""
-    if state.quote_params:
-        return state.quote_params
-
-    if not USE_AVELLANEDA_SPREADS:
-        return {"buy_spread": DEFAULT_BUY_SPREAD, "sell_spread": DEFAULT_SELL_SPREAD, "source": "default"}
-
-    return get_unavailable_quote_params()
-
-
-def get_runtime_prepared_quote_params(state):
-    """Return the prevalidated quote snapshot used by the quote hot path."""
-    raw_params = get_runtime_quote_params(state)
-    prepared = state.prepared_quote_params
-    if prepared is None:
-        return prepare_quote_params_snapshot(raw_params)
-    if prepared.kind == "unavailable" and raw_params.get("source") != "unavailable":
-        return prepare_quote_params_snapshot(raw_params)
-    if prepared.source != str(raw_params.get("source") or "unavailable"):
-        return prepare_quote_params_snapshot(raw_params)
-    return prepared
+def quote_set_requires_update(state, command):
+    """Return True when the desired quote set differs from the live orders."""
+    for side, quote in (('BUY', command.bid), ('SELL', command.ask)):
+        side_state = state.side_orders[side]
+        if quote is None:
+            if side_state.order_id is not None:
+                return True
+            continue
+        if side_state.order_id is None:
+            return True
+        if side_state.reduce_only != quote.reduce_only:
+            return True
+        if not should_reuse_side(side_state, quote.price):
+            return True
+    return False
 
 
 def record_opening_order_failure(state, runtime):
@@ -1933,123 +1508,19 @@ def get_required_opening_balance(symbol_filters, reference_price):
     return safe_min_open_notional / DEFAULT_BALANCE_FRACTION
 
 
-def resolve_avellaneda_spread_limits_bps(params):
-    """Return validated Avellaneda spread guardrails from params or runtime defaults."""
-    default_limits = {
-        "min": DEFAULT_MIN_AVELLANEDA_SPREAD_BPS,
-        "max": DEFAULT_MAX_AVELLANEDA_SPREAD_BPS,
-    }
-    spread_limits = params.get("spread_limits_bps")
-    if not isinstance(spread_limits, dict):
-        return default_limits
+def compute_max_position_usd(state):
+    """Compute the dynamic max position notional from live capital and leverage.
 
-    min_bps = _safe_float(spread_limits.get("min"))
-    max_bps = _safe_float(spread_limits.get("max"))
-    if min_bps is None or max_bps is None or min_bps < 0.0 or max_bps <= 0.0 or min_bps > max_bps:
-        return default_limits
-
-    return {"min": min_bps, "max": max_bps}
-
-
-def clamp_offset_to_spread_limits(offset, mid_price, spread_limits_bps):
-    """Clamp a dynamic Avellaneda quote offset to configured basis-point guardrails."""
-    if mid_price <= 0:
-        return offset
-
-    raw_bps = (float(offset) / float(mid_price)) * 10000.0
-    clamped_bps = min(max(raw_bps, spread_limits_bps["min"]), spread_limits_bps["max"])
-    return float(mid_price) * (clamped_bps / 10000.0)
-
-
-def get_binance_alpha_shift_abs(state, reference_price):
-    """Convert the current Binance alpha shift in bps into an absolute price offset."""
-    if reference_price is None or reference_price <= 0:
+    Mirrors lighter_MM's _dynamic_max_position_dollar with one level per side:
+    reserve margin for both resting orders, then keep a safety margin.
+    """
+    balance = state.account_balance
+    if balance is None or balance <= 0.0:
         return 0.0
-    alpha_snapshot = state.binance_alpha_snapshot
-    alpha_ready = alpha_snapshot.ready or state.binance_alpha_ready
-    shift_bps = alpha_snapshot.shift_bps if alpha_snapshot.ready else state.binance_alpha_shift_bps
-    if not USE_BINANCE_OBI_ALPHA or not alpha_ready:
-        return 0.0
-    return float(reference_price) * (shift_bps / 10000.0)
 
-
-def build_order_plan(state, opening_mode, params):
-    """Build the intended side, price, and size for the next quote."""
-    if isinstance(params, dict):
-        params = prepare_quote_params_snapshot(params)
-
-    close_side = get_close_side_for_trading(state)
-
-    if params.kind == "avellaneda":
-        gamma = params.gamma
-        sigma = params.sigma
-        k_buy = params.k_buy
-        k_sell = params.k_sell
-        time_horizon = params.time_horizon_days
-        position_size = state.position_size
-        mid_price = state.mid_price
-        spread_limits_bps = {
-            "min": params.spread_limits_min_bps,
-            "max": params.spread_limits_max_bps,
-        }
-
-        risk_term = gamma * ((sigma * mid_price) ** 2) * time_horizon
-        reservation_price = mid_price - position_size * risk_term
-        alpha_shift_abs = get_binance_alpha_shift_abs(state, mid_price)
-        reservation_price += alpha_shift_abs
-        ask_offset = (1 / gamma) * math.log1p(gamma / k_buy) + (risk_term / 2.0)
-        bid_offset = (1 / gamma) * math.log1p(gamma / k_sell) + (risk_term / 2.0)
-        ask_offset = clamp_offset_to_spread_limits(ask_offset, mid_price, spread_limits_bps)
-        bid_offset = clamp_offset_to_spread_limits(bid_offset, mid_price, spread_limits_bps)
-        ask_price = reservation_price + ask_offset
-        bid_price = reservation_price - bid_offset
-
-        if close_side:
-            side, reduce_only = close_side, True
-            quantity_to_trade = abs(state.position_size)
-            limit_price = ask_price if side == 'SELL' else bid_price
-        else:
-            side, reduce_only = opening_mode, False
-            quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
-            limit_price = bid_price if opening_mode == 'BUY' else ask_price
-
-        used_spread = (ask_price - bid_price) / mid_price if mid_price > 0 else 0
-        return {
-            "side": side,
-            "reduce_only": reduce_only,
-            "quantity_to_trade": quantity_to_trade,
-            "limit_price": limit_price,
-            "used_spread": used_spread,
-            "reservation_price": reservation_price,
-            "bid_price": bid_price,
-            "ask_price": ask_price,
-            "binance_alpha_shift_bps": state.binance_alpha_snapshot.shift_bps if state.binance_alpha_snapshot.ready else 0.0,
-        }
-
-    if params.kind == "unavailable":
-        return None
-
-    buy_spread, sell_spread = params.buy_spread, params.sell_spread
-    alpha_shift_abs = get_binance_alpha_shift_abs(state, state.mid_price)
-    if close_side:
-        side, reduce_only = close_side, True
-        quantity_to_trade = abs(state.position_size)
-        limit_price = state.mid_price * (1 + sell_spread) if side == 'SELL' else state.mid_price * (1 - buy_spread)
-    else:
-        side, reduce_only = opening_mode, False
-        quantity_to_trade = (state.account_balance * DEFAULT_BALANCE_FRACTION) / state.mid_price
-        limit_price = state.mid_price * (1 - buy_spread) if opening_mode == 'BUY' else state.mid_price * (1 + sell_spread)
-    limit_price += alpha_shift_abs
-
-    used_spread = sell_spread if side == 'SELL' else buy_spread
-    return {
-        "side": side,
-        "reduce_only": reduce_only,
-        "quantity_to_trade": quantity_to_trade,
-        "limit_price": limit_price,
-        "used_spread": used_spread,
-        "binance_alpha_shift_bps": state.binance_alpha_snapshot.shift_bps if state.binance_alpha_snapshot.ready else 0.0,
-    }
+    order_value = balance * DEFAULT_BALANCE_FRACTION
+    raw = balance * DEFAULT_LEVERAGE - 2.0 * order_value
+    return max(0.0, raw * MAX_POSITION_SAFETY_FACTOR)
 
 
 def prepare_order_candidate(symbol_filters, side, reduce_only, limit_price, quantity_to_trade):
@@ -2098,58 +1569,120 @@ def prepare_order_candidate(symbol_filters, side, reduce_only, limit_price, quan
     }
 
 
-def build_quote_command(state, symbol_filters):
-    """Build the current desired order command from in-memory state only."""
-    params = get_runtime_prepared_quote_params(state)
-    if params.kind == "unavailable":
-        return None, {"reason": "missing_quote_params"}
+def _build_side_quote(state, symbol_filters, side, price, mid_price, reduce_only):
+    """Round, size, and validate one side of the desired quote set."""
+    if price is None or price <= 0.0:
+        return None
 
-    opening_mode, _ = get_strategy_modes(state.flip_mode)
-    order_plan = build_order_plan(state, opening_mode, params)
-    if order_plan is None:
-        return None, {"reason": "invalid_quote_params"}
-    if not order_plan["reduce_only"] and USE_BINANCE_OBI_ALPHA and not is_binance_alpha_live(state):
-        return None, {
-            "reason": "binance_alpha_unavailable",
-            "warmup_seconds": state.binance_alpha_snapshot.warmup_seconds,
-            "sample_count": state.binance_alpha_snapshot.sample_count,
-        }
+    if reduce_only:
+        quantity_to_trade = abs(state.position_size)
+    else:
+        balance = state.account_balance
+        if balance is None or balance <= 0.0:
+            return None
+        required_balance = get_required_opening_balance(symbol_filters, price)
+        if balance + BALANCE_EPSILON_USD < required_balance:
+            return None
+        quantity_to_trade = (balance * DEFAULT_BALANCE_FRACTION) / mid_price
 
-    if not order_plan["reduce_only"]:
-        required_balance = get_required_opening_balance(symbol_filters, order_plan["limit_price"])
-        if state.account_balance is None or state.account_balance + POSITION_SIZE_EPSILON < required_balance:
-            return None, {
-                "reason": "insufficient_opening_capital",
-                "required_balance": required_balance,
-                "current_balance": state.account_balance,
-            }
-
-    order_candidate = prepare_order_candidate(
-        symbol_filters,
-        order_plan["side"],
-        order_plan["reduce_only"],
-        order_plan["limit_price"],
-        order_plan["quantity_to_trade"],
-    )
+    order_candidate = prepare_order_candidate(symbol_filters, side, reduce_only, price, quantity_to_trade)
     if not order_candidate["ok"]:
-        return None, order_candidate
+        return None
 
-    command = OrderCommand(
-        kind="quote",
-        side=order_plan["side"],
-        reduce_only=order_plan["reduce_only"],
+    return SideQuote(
+        side=side,
         price=float(order_candidate["rounded_price"]),
         quantity=float(order_candidate["rounded_quantity"]),
+        reduce_only=reduce_only,
         order_notional=order_candidate["order_notional"],
-        trigger="price",
     )
-    return command, order_candidate
 
 
-def classify_order_update(order_data, fill_notional_threshold=POSITION_THRESHOLD_USD):
+def build_quote_set(state, symbol_filters, runtime):
+    """Build the desired two-sided quote set from in-memory state only.
+
+    Pure float math off immutable snapshots (hot path): the Vol+OBI quote,
+    position-limit suppression, GTX post-only clamping, and per-side
+    validation against exchange filters.
+    """
+    calc = state.vol_obi_calc
+    mid_price = state.mid_price
+    if calc is None or mid_price is None or mid_price <= 0.0:
+        return None, {"reason": "missing_price"}
+
+    if not is_vol_obi_live(state, runtime):
+        return None, {
+            "reason": "vol_obi_unavailable",
+            "sample_count": state.vol_obi_snapshot.sample_count,
+        }
+
+    max_pos = compute_max_position_usd(state)
+    if max_pos <= 0.0:
+        return None, {"reason": "no_position_capacity"}
+    calc.set_max_position_dollar(max_pos)
+
+    bid_price, ask_price = calc.quote(mid_price, state.position_size)
+    if bid_price is None or ask_price is None:
+        return None, {"reason": "crossed_or_warming_quote"}
+
+    # Hard position limit: suppress the side that would add exposure and
+    # flag the surviving side reduce-only so inventory can only shrink.
+    position_usd = abs(state.position_size) * mid_price
+    reduce_only_side = None
+    if position_usd >= max_pos:
+        if state.position_size > 0:
+            bid_price = None
+            reduce_only_side = 'SELL'
+        elif state.position_size < 0:
+            ask_price = None
+            reduce_only_side = 'BUY'
+
+    # Opening circuit breaker: pause exposure-adding quotes, keep reducing.
+    if is_opening_circuit_breaker_active(state, runtime):
+        close_side = get_position_close_side(state.position_size)
+        if close_side == 'SELL':
+            bid_price = None
+        elif close_side == 'BUY':
+            ask_price = None
+        else:
+            return None, {"reason": "opening_circuit_breaker"}
+
+    # GTX clamp: a post-only order is rejected when it would cross the
+    # OPPOSITE side of the book (bid >= best ask / ask <= best bid), which
+    # happens when alpha pushes fair through the touch. Quoting inside the
+    # spread is legal and stays untouched.
+    tick_size = float(symbol_filters.get('tick_size', 0.0) or 0.0)
+    best_bid = state.bid_price
+    best_ask = state.ask_price
+    if bid_price is not None and best_ask is not None and bid_price >= best_ask:
+        bid_price = best_ask - tick_size if tick_size > 0.0 else None
+    if ask_price is not None and best_bid is not None and ask_price <= best_bid:
+        ask_price = best_bid + tick_size if tick_size > 0.0 else None
+    if bid_price is not None and ask_price is not None and bid_price >= ask_price:
+        # Clamping collapsed the spread: drop the side fair price pushed
+        # through the book and keep the passive one.
+        if calc.alpha >= 0.0:
+            bid_price = None
+        else:
+            ask_price = None
+
+    bid_quote = _build_side_quote(
+        state, symbol_filters, 'BUY', bid_price, mid_price,
+        reduce_only=(reduce_only_side == 'BUY'),
+    )
+    ask_quote = _build_side_quote(
+        state, symbol_filters, 'SELL', ask_price, mid_price,
+        reduce_only=(reduce_only_side == 'SELL'),
+    )
+    if bid_quote is None and ask_quote is None:
+        return None, {"reason": "no_valid_sides"}
+
+    command = QuoteSetCommand(kind="quote_set", bid=bid_quote, ask=ask_quote, trigger="price")
+    return command, {"reason": "ok"}
+
+
+def classify_order_update(order_data):
     """Classify an order update into terminal/non-terminal and fill/non-fill outcomes."""
-    del fill_notional_threshold  # Retained for compatibility with older callers/tests.
-
     status = order_data.get('X', order_data.get('status'))
     filled_qty = float(order_data.get('z', order_data.get('executedQty', 0.0)) or 0.0)
 
@@ -2222,29 +1755,20 @@ async def wait_for_terminal_order_update(order_updates, order_id, timeout, log, 
         return terminal_update
 
 
-def apply_fill_to_state(state, side, filled_qty):
-    """Refresh strategy mode after a fill using the latest position snapshot."""
-    if filled_qty is not None and filled_qty <= 0:
-        return state.mode, state.mode
-
-    previous_mode = state.mode
-
-    sync_mode_with_position(state)
-    return previous_mode, state.mode
-
-
-async def cancel_and_finalize_active_order(state, client, symbol, log, reason, order_label):
-    """Cancel the tracked order and wait for a terminal state before proceeding."""
-    if not state.active_order_id:
+async def cancel_and_finalize_side_order(state, client, symbol, log, side, reason, order_label):
+    """Cancel one side's tracked order and wait for a terminal state before proceeding."""
+    side_state = state.side_orders[side]
+    if side_state.order_id is None:
         return True
 
-    order_id = state.active_order_id
+    order_id = side_state.order_id
     position_update_seq_before_fill = state.position_update_seq
-    if not await cancel_active_order(
+    if not await cancel_side_order(
         state,
         client,
         symbol,
         log,
+        side,
         reason,
         clear_tracking_on_success=False,
     ):
@@ -2286,7 +1810,7 @@ async def cancel_and_finalize_active_order(state, client, symbol, log, reason, o
         client,
         symbol,
         log,
-        state.last_order_side,
+        side,
         order_id,
         terminal_update,
         position_update_seq_before_fill,
@@ -2310,7 +1834,7 @@ async def handle_terminal_order_update(
     filled_qty = terminal_update["filled_qty"]
     if terminal_update["treat_as_fill"]:
         log.info(f"{order_label} {order_id} filled! Quantity: {filled_qty}")
-        synced_via_ws, previous_mode, new_mode = await reconcile_fill_with_position(
+        synced_via_ws = await reconcile_fill_with_position(
             state,
             client,
             symbol,
@@ -2319,14 +1843,13 @@ async def handle_terminal_order_update(
             f"{order_label} {order_id}",
         )
         sync_source = "WebSocket" if synced_via_ws else "REST fallback"
-        log.info(f"{side} fill reconciled via {sync_source}: tracked position size {state.position_size:.6f}")
-        if new_mode != previous_mode:
-            log.info(f"Mode change: {previous_mode} -> {new_mode}")
+        log.info(f"{side or 'UNKNOWN'} fill reconciled via {sync_source}: tracked position size {state.position_size:.6f}")
     else:
         log.info(f"{order_label} {order_id} ended as {terminal_update['status']} without an executed fill.")
 
-    if state.active_order_id == order_id:
-        clear_order_tracking(state)
+    tracked_side = get_tracked_side_for_order(state, order_id)
+    if tracked_side is not None:
+        clear_side_order(state, tracked_side)
     log.debug(f"Adding 0.01s delay after {order_label.lower()} terminal update")
     await asyncio.sleep(0.01)
 
@@ -2372,87 +1895,246 @@ async def reconcile_stale_pending_terminal_orders(state, client, symbol, runtime
         request_quote_refresh(state)
 
 
-async def place_order_from_command(state, client, symbol, runtime, log, command, symbol_filters=None):
-    """Submit the desired order command and update local tracking."""
-    current_time = runtime.now()
-    time_since_last_order = current_time - runtime.last_order_time
-    if time_since_last_order < MIN_ORDER_INTERVAL:
-        wait_time = MIN_ORDER_INTERVAL - time_since_last_order
-        log.info(f"Rate limiting: waiting {wait_time:.3f}s before placing order")
-        await asyncio.sleep(wait_time)
-        if not state.active_order_id and command.kind == "quote":
-            command = drain_latest_order_command(state, command)
-            if command.kind != "quote":
-                return None
+async def place_side_order(state, client, symbol, runtime, log, quote, symbol_filters=None):
+    """Submit one side's desired order and update local tracking.
 
+    Pacing happens once per reconcile burst in apply_quote_set, not per
+    placement, so the two sides of a quote set go out back-to-back on the
+    same price snapshot.
+    """
     percentage_diff = 0.0
     if state.mid_price:
-        percentage_diff = (command.price - state.mid_price) / state.mid_price * 100
+        percentage_diff = (quote.price - state.mid_price) / state.mid_price * 100
 
     filters = symbol_filters or state.symbol_filters or {}
     price_precision = int(filters.get("price_precision", 8))
     quantity_precision = int(filters.get("quantity_precision", 8))
-    formatted_price = f"{command.price:.{price_precision}f}"
-    formatted_quantity = f"{command.quantity:.{quantity_precision}f}"
+    formatted_price = f"{quote.price:.{price_precision}f}"
+    formatted_quantity = f"{quote.quantity:.{quantity_precision}f}"
 
     log.info(
-        "Placing %s order: %s %s @ %s (%+.4f%% from mid-price, Binance shift %+.1f bps)",
-        command.side,
-        formatted_quantity,
-        symbol,
-        formatted_price,
-        percentage_diff,
-        state.binance_alpha_snapshot.shift_bps,
+        f"Placing {quote.side} order: {formatted_quantity} {symbol} @ {formatted_price} "
+        f"({percentage_diff:+.4f}% from mid-price, {vol_obi_status_text(state)})"
     )
 
-    active_order = await client.place_order(
+    placed_order = await client.place_order(
         symbol,
         formatted_price,
         formatted_quantity,
-        command.side,
-        command.reduce_only,
+        quote.side,
+        quote.reduce_only,
     )
     runtime.last_order_time = runtime.now()
-    state.active_order_id = active_order.get('orderId')
-    state.active_order_started_at = runtime.last_order_time
-    state.last_order_price = command.price
-    state.last_order_side = command.side
-    state.last_order_quantity = command.quantity
-    if not command.reduce_only:
+    state.side_orders[quote.side] = SideOrderState(
+        order_id=placed_order.get('orderId'),
+        price=quote.price,
+        quantity=quote.quantity,
+        reduce_only=quote.reduce_only,
+        placed_at=runtime.last_order_time,
+    )
+    if not quote.reduce_only:
         reset_opening_order_failures(state)
-    log.info(f"Order placed successfully: ID={state.active_order_id}")
-    return active_order
+    log.info(f"{quote.side} order placed successfully: ID={state.side_orders[quote.side].order_id}")
+    return placed_order
 
 
-async def avellaneda_params_updater(state, symbol, runtime):
-    """Refresh quote parameters out of band so the quote engine stays memory-only."""
-    log = logging.getLogger('AvellanedaParamsUpdater')
-    quote_engine = QuoteEngine()
+async def cancel_all_side_orders(state, client, symbol, runtime, log, reason):
+    """Cancel every working order with one REST call and park them as pending."""
+    if not has_live_orders(state):
+        return True
 
-    while not runtime.shutdown_requested:
+    try:
+        await client.cancel_all_orders(symbol)
+    except Exception as cancel_error:
+        log.error(f"{reason}: failed to cancel all working orders: {cancel_error}")
+        return False
+
+    for side, side_state in state.side_orders.items():
+        if side_state.order_id is not None:
+            state.pending_terminal_orders[side_state.order_id] = PendingTerminalOrder(
+                side=side,
+                reduce_only=side_state.reduce_only,
+                position_update_seq_before_fill=state.position_update_seq,
+                order_label="Cancelled quote",
+                cancel_requested_at=runtime.now(),
+            )
+            clear_side_order(state, side)
+    log.info(f"{reason}: cancelled all working orders.")
+    return True
+
+
+def _side_needs_replace(state, side, quote):
+    """Return True when the live order on a side no longer matches the desired quote."""
+    side_state = state.side_orders[side]
+    if side_state.order_id is None:
+        return False
+    if quote is None:
+        return True
+    if side_state.reduce_only != quote.reduce_only:
+        return True
+    return not should_reuse_side(side_state, quote.price)
+
+
+async def apply_quote_set(state, client, symbol, runtime, log, executor, command):
+    """Reconcile the desired two-sided quote set with the live exchange orders.
+
+    Cancels run before placements so a large fair-price jump can never leave
+    a new bid resting above our own still-live old ask. Pacing is per
+    reconcile burst (not per order) so both sides go out on the same prices.
+    """
+    if command.kind == "cancel_all":
+        if not await cancel_all_side_orders(state, client, symbol, runtime, log, command.trigger or "Cancel all"):
+            await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+        return
+
+    if command.kind != "quote_set":
+        return
+
+    wait_time = MIN_ORDER_INTERVAL - (runtime.now() - runtime.last_order_time)
+    if wait_time > 0:
+        log.debug(f"Pacing: waiting {wait_time:.3f}s before the next quote reconcile")
+        await asyncio.sleep(wait_time)
+        # Never act on stale prices after a pacing wait: take the freshest plan.
+        command = drain_latest_order_command(state, command)
+        if command.kind == "cancel_all":
+            if not await cancel_all_side_orders(state, client, symbol, runtime, log, command.trigger or "Cancel all"):
+                await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+            return
+        if command.kind != "quote_set":
+            return
+
+    desired = {'BUY': command.bid, 'SELL': command.ask}
+
+    # Pass 1: cancel sides that disappeared or moved beyond the reuse threshold.
+    for side, quote in desired.items():
+        if not _side_needs_replace(state, side, quote):
+            continue
+
+        if executor.fast_replace:
+            side_state = state.side_orders[side]
+            order_id = side_state.order_id
+            if not await cancel_side_order(
+                state,
+                client,
+                symbol,
+                log,
+                side,
+                command.trigger or "Fast requote replacement",
+                clear_tracking_on_success=False,
+            ):
+                await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+                return
+
+            if order_id is not None:
+                state.pending_terminal_orders[order_id] = PendingTerminalOrder(
+                    side=side,
+                    reduce_only=side_state.reduce_only,
+                    position_update_seq_before_fill=state.position_update_seq,
+                    order_label="Fast requote order",
+                    cancel_requested_at=runtime.now(),
+                )
+            clear_side_order(state, side)
+        else:
+            if not await cancel_and_finalize_side_order(
+                state,
+                client,
+                symbol,
+                log,
+                side,
+                command.trigger or "Requote replacement",
+                "Requote order",
+            ):
+                await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
+                return
+
+    if runtime.shutdown_requested:
+        return
+
+    # Pass 2: place sides that are wanted but not resting (reused sides skip).
+    for side, quote in desired.items():
+        if quote is None or state.side_orders[side].order_id is not None:
+            continue
+
         try:
-            params = get_avellaneda_params(symbol)
-            prepared_params = quote_engine.prepare_quote_params(params)
-            if params != state.quote_params or prepared_params != state.prepared_quote_params:
-                state.quote_params = params
-                state.prepared_quote_params = prepared_params
-                log.info(f"Updated quoting parameters for {symbol} from {params['source']}")
-                request_quote_refresh(state)
-        except Exception as exc:
-            log.error(f"Failed to refresh quoting parameters for {symbol}: {exc}")
+            await executor.place_order(state, client, symbol, runtime, log, quote)
+        except Exception:
+            if not quote.reduce_only:
+                record_opening_order_failure(state, runtime)
+            raise
 
-        await asyncio.sleep(SPREAD_CACHE_TTL_SECONDS)
+
+def _oldest_live_order_age(state, runtime):
+    """Return the age in seconds of the oldest live resting order, or None."""
+    placed_times = [
+        side_state.placed_at
+        for side_state in state.side_orders.values()
+        if side_state.order_id is not None and side_state.placed_at is not None
+    ]
+    if not placed_times:
+        return None
+    return runtime.now() - min(placed_times)
+
+
+async def _handle_tracked_terminal_update(state, client, symbol, runtime, log, received_update):
+    """Process an ORDER_TRADE_UPDATE against live and pending tracked orders.
+
+    Returns True when a terminal update for a tracked order was finalized.
+    """
+    if received_update.get('e') != 'ORDER_TRADE_UPDATE':
+        return False
+
+    order_data = received_update.get('o', {})
+    order_id = order_data.get('i')
+
+    tracked_side = get_tracked_side_for_order(state, order_id)
+    pending_order = state.pending_terminal_orders.get(order_id) if tracked_side is None else None
+    if tracked_side is None and pending_order is None:
+        return False
+
+    terminal_update = classify_order_update(order_data)
+    if not terminal_update["is_terminal"]:
+        return False
+
+    order_was_opening = not is_order_reduce_only(order_data)
+    if terminal_update["status"] == "REJECTED" and order_was_opening:
+        record_opening_order_failure(state, runtime)
+    elif terminal_update["status"] == "FILLED" and order_was_opening:
+        reset_opening_order_failures(state)
+
+    if pending_order is not None:
+        state.pending_terminal_orders.pop(order_id, None)
+        side = pending_order.side
+        seq_before_fill = pending_order.position_update_seq_before_fill
+        order_label = pending_order.order_label
+    else:
+        side = tracked_side
+        seq_before_fill = state.position_update_seq
+        order_label = "Order"
+
+    await handle_terminal_order_update(
+        state,
+        client,
+        symbol,
+        log,
+        side,
+        order_id,
+        terminal_update,
+        seq_before_fill,
+        order_label,
+    )
+    request_quote_refresh(state)
+    return True
 
 
 async def order_manager_loop_impl(state, client, symbol, runtime, executor):
-    """Own the active exchange order and react to quote intents immediately."""
+    """Own the working exchange orders (both sides) and react to quote intents."""
     log = logging.getLogger('OrderManager')
 
     while not runtime.shutdown_requested:
         try:
             await reconcile_stale_pending_terminal_orders(state, client, symbol, runtime, log)
 
-            if not state.active_order_id:
+            if not has_live_orders(state):
                 if state.pending_terminal_orders:
                     order_update_task = asyncio.create_task(state.order_updates.get())
                     command_task = asyncio.create_task(state.order_commands.get())
@@ -2466,52 +2148,20 @@ async def order_manager_loop_impl(state, client, symbol, runtime, executor):
                         await asyncio.gather(*pending, return_exceptions=True)
 
                     if order_update_task in done:
-                        received_update = order_update_task.result()
-                        order_data = received_update.get('o', {})
-                        order_id = order_data.get('i')
-                        if received_update.get('e') == 'ORDER_TRADE_UPDATE' and order_id in state.pending_terminal_orders:
-                            terminal_update = classify_order_update(order_data)
-                            if terminal_update["is_terminal"]:
-                                pending_order = state.pending_terminal_orders.pop(order_id)
-                                order_was_opening = not is_order_reduce_only(order_data)
-                                if terminal_update["status"] == "REJECTED" and order_was_opening:
-                                    record_opening_order_failure(state, runtime)
-                                elif terminal_update["status"] == "FILLED" and order_was_opening:
-                                    reset_opening_order_failures(state)
-                                await handle_terminal_order_update(
-                                    state,
-                                    client,
-                                    symbol,
-                                    log,
-                                    pending_order.side,
-                                    order_id,
-                                    terminal_update,
-                                    pending_order.position_update_seq_before_fill,
-                                    pending_order.order_label,
-                                )
-                                request_quote_refresh(state)
+                        await _handle_tracked_terminal_update(
+                            state, client, symbol, runtime, log, order_update_task.result()
+                        )
                         continue
 
                     command = command_task.result()
                 else:
                     command = await state.order_commands.get()
                 command = drain_latest_order_command(state, command)
-                if command.kind != "quote":
-                    continue
-
-                try:
-                    placed = await executor.place_order(state, client, symbol, runtime, log, command)
-                except Exception:
-                    if not command.reduce_only:
-                        record_opening_order_failure(state, runtime)
-                    raise
-
-                if placed is None:
-                    continue
+                await apply_quote_set(state, client, symbol, runtime, log, executor, command)
                 continue
 
-            order_age = runtime.now() - (state.active_order_started_at or runtime.now())
-            remaining_timeout = max(0.0, ORDER_REFRESH_INTERVAL - order_age)
+            oldest_age = _oldest_live_order_age(state, runtime)
+            remaining_timeout = max(0.0, ORDER_REFRESH_INTERVAL - (oldest_age or 0.0))
 
             order_update_task = asyncio.create_task(state.order_updates.get())
             command_task = asyncio.create_task(state.order_commands.get())
@@ -2533,69 +2183,37 @@ async def order_manager_loop_impl(state, client, symbol, runtime, executor):
             action_taken = False
 
             if received_update is not None:
-                order_data = received_update.get('o', {})
-                order_id = order_data.get('i')
-                if received_update.get('e') == 'ORDER_TRADE_UPDATE' and order_id == state.active_order_id:
-                    terminal_update = classify_order_update(order_data)
-                    if terminal_update["is_terminal"]:
-                        order_was_opening = not is_order_reduce_only(order_data)
-                        if terminal_update["status"] == "REJECTED" and order_was_opening:
-                            record_opening_order_failure(state, runtime)
-                        elif terminal_update["status"] == "FILLED" and order_was_opening:
-                            reset_opening_order_failures(state)
-
-                        order_id = state.active_order_id
-                        position_update_seq_before_fill = state.position_update_seq
-                        await handle_terminal_order_update(
-                            state,
-                            client,
-                            symbol,
-                            log,
-                            state.last_order_side,
-                            order_id,
-                            terminal_update,
-                            position_update_seq_before_fill,
-                            "Order",
-                        )
-                        request_quote_refresh(state)
-                        action_taken = True
-                elif received_update.get('e') == 'ORDER_TRADE_UPDATE' and order_id in state.pending_terminal_orders:
-                    terminal_update = classify_order_update(order_data)
-                    if terminal_update["is_terminal"]:
-                        pending = state.pending_terminal_orders.pop(order_id)
-                        order_was_opening = not is_order_reduce_only(order_data)
-                        if terminal_update["status"] == "REJECTED" and order_was_opening:
-                            record_opening_order_failure(state, runtime)
-                        elif terminal_update["status"] == "FILLED" and order_was_opening:
-                            reset_opening_order_failures(state)
-
-                        await handle_terminal_order_update(
-                            state,
-                            client,
-                            symbol,
-                            log,
-                            pending.side,
-                            order_id,
-                            terminal_update,
-                            pending.position_update_seq_before_fill,
-                            pending.order_label,
-                        )
-                        request_quote_refresh(state)
-                        action_taken = True
+                action_taken = await _handle_tracked_terminal_update(
+                    state, client, symbol, runtime, log, received_update
+                )
 
             if not action_taken and timed_out:
-                log.info(
-                    f"Order {state.active_order_id} reached the {ORDER_REFRESH_INTERVAL:.1f}s safety lifetime. "
-                    "Refreshing the quote."
-                )
-                if not await cancel_and_finalize_active_order(
-                    state,
-                    client,
-                    symbol,
-                    log,
-                    "Timed-out order refresh",
-                    "Timed-out order",
-                ):
+                expired_sides = [
+                    side
+                    for side, side_state in state.side_orders.items()
+                    if side_state.order_id is not None
+                    and side_state.placed_at is not None
+                    and runtime.now() - side_state.placed_at >= ORDER_REFRESH_INTERVAL
+                ]
+                refresh_failed = False
+                for side in expired_sides:
+                    log.info(
+                        f"{side} order {state.side_orders[side].order_id} reached the "
+                        f"{ORDER_REFRESH_INTERVAL:.1f}s safety lifetime. Refreshing the quote."
+                    )
+                    if not await cancel_and_finalize_side_order(
+                        state,
+                        client,
+                        symbol,
+                        log,
+                        side,
+                        "Timed-out order refresh",
+                        "Timed-out order",
+                    ):
+                        refresh_failed = True
+                        break
+
+                if refresh_failed:
                     await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
                     continue
 
@@ -2604,73 +2222,8 @@ async def order_manager_loop_impl(state, client, symbol, runtime, executor):
 
             if not action_taken and received_command is not None:
                 command = drain_latest_order_command(state, received_command)
-                if command.kind == "cancel":
-                    if not await cancel_and_finalize_active_order(
-                        state,
-                        client,
-                        symbol,
-                        log,
-                        command.trigger or "Quote engine cancel",
-                        "Active order",
-                    ):
-                        await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
-                        continue
-                    request_quote_refresh(state)
-                    action_taken = True
-                elif should_reuse_order(state, command.price, command.side, command.quantity):
-                    action_taken = True
-                else:
-                    if executor.fast_replace:
-                        order_id = state.active_order_id
-                        if not await cancel_active_order(
-                            state,
-                            client,
-                            symbol,
-                            log,
-                            command.trigger or "Fast requote replacement",
-                            clear_tracking_on_success=False,
-                        ):
-                            await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
-                            continue
-
-                        if order_id is not None:
-                            state.pending_terminal_orders[order_id] = PendingTerminalOrder(
-                                side=state.last_order_side or command.side,
-                                reduce_only=False,
-                                position_update_seq_before_fill=state.position_update_seq,
-                                order_label="Fast requote order",
-                                cancel_requested_at=runtime.now(),
-                            )
-                        clear_order_tracking(state)
-                    else:
-                        if not await cancel_and_finalize_active_order(
-                            state,
-                            client,
-                            symbol,
-                            log,
-                            command.trigger or "Requote replacement",
-                            "Requote order",
-                        ):
-                            await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
-                            continue
-
-                    if runtime.shutdown_requested:
-                        break
-
-                    command = drain_latest_order_command(state, command)
-                    if command.kind == "quote":
-                        try:
-                            placed = await executor.place_order(state, client, symbol, runtime, log, command)
-                        except Exception:
-                            if not command.reduce_only:
-                                record_opening_order_failure(state, runtime)
-                            raise
-
-                        if placed is None:
-                            continue
-                    else:
-                        request_quote_refresh(state)
-                    action_taken = True
+                await apply_quote_set(state, client, symbol, runtime, log, executor, command)
+                action_taken = True
 
             if not action_taken and received_update is not None:
                 continue
@@ -2680,8 +2233,9 @@ async def order_manager_loop_impl(state, client, symbol, runtime, executor):
             break
         except Exception as exc:
             log.error(f"An error occurred in the order manager: {exc}", exc_info=True)
-            if state.active_order_id:
-                await cancel_active_order(state, client, symbol, log, "Order manager error")
+            for side in list(state.side_orders.keys()):
+                if state.side_orders[side].order_id is not None:
+                    await cancel_side_order(state, client, symbol, log, side, "Order manager error")
             await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
 
 
@@ -2690,104 +2244,6 @@ async def order_manager_loop(state, client, symbol, runtime, executor=None):
     executor = executor or OrderExecutor()
     return await order_manager_loop_impl(state, client, symbol, runtime, executor)
 
-
-def _safe_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _parameter_file_candidates(symbol):
-    symbol = (symbol or "").upper()
-    candidates = []
-
-    def add(candidate):
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-
-    add(symbol)
-    add(normalize_symbol_base(symbol))
-
-    return candidates
-
-
-
-
-
-def _load_avellaneda_params(symbol):
-    log = logging.getLogger('AvellanedaLoader')
-    for candidate in _parameter_file_candidates(symbol):
-        file_path = os.path.join(PARAMS_DIR, f"{AVELLANEDA_FILE_PREFIX}{candidate}.json")
-        if not os.path.isfile(file_path):
-            continue
-
-        try:
-            with open(file_path, "r", encoding="utf-8") as file:
-                payload = json.load(file)
-        except Exception as exc:
-            log.warning(f"Failed to load {file_path}: {exc}")
-            continue
-        
-        # Extract all necessary parameters
-        optimal_params = payload.get("optimal_parameters", {})
-        market_data = payload.get("market_data", {})
-        legacy_k = _safe_float(market_data.get("k"))
-        
-        params = {
-            "gamma": _safe_float(optimal_params.get("gamma")),
-            "time_horizon_days": _safe_float(optimal_params.get("time_horizon_days")),
-            "sigma": _safe_float(market_data.get("sigma")),
-            "A_buy": _safe_float(market_data.get("A_buy")),
-            "A_sell": _safe_float(market_data.get("A_sell")),
-            "k_buy": _safe_float(market_data.get("k_buy")) or legacy_k,
-            "k_sell": _safe_float(market_data.get("k_sell")) or legacy_k,
-            "spread_limits_bps": resolve_avellaneda_spread_limits_bps(payload),
-            "source_path": file_path
-        }
-        
-        required_positive = ["gamma", "time_horizon_days", "sigma", "k_buy", "k_sell"]
-        if not all(params[key] is not None and params[key] > 0 for key in required_positive):
-            log.warning(f"File {file_path} is missing one or more positive Avellaneda parameters. Skipping.")
-            continue
-
-        return params
-
-    return None
-
-
-def get_avellaneda_params(symbol):
-    """
-    Abstracted function to retrieve Avellaneda-Stoikov parameters.
-    Handles caching and blocks quoting until valid params exist when dynamic spreads are enabled.
-    :return: A dictionary of parameters.
-    """
-    if not USE_AVELLANEDA_SPREADS:
-        return {"buy_spread": DEFAULT_BUY_SPREAD, "sell_spread": DEFAULT_SELL_SPREAD, "source": "default"}
-
-    symbol_key = (symbol or "").upper() or DEFAULT_SYMBOL
-    now = time.monotonic()
-    cached_entry = _SPREAD_CACHE.get(symbol_key)
-    if cached_entry and cached_entry.get("expires_at", 0) > now:
-        return cached_entry["params"]
-
-    log = logging.getLogger('AvellanedaLoader')
-    params = _load_avellaneda_params(symbol_key)
-
-    if params:
-        # If we have full params, we don't need default spreads
-        params["source"] = os.path.basename(params["source_path"])
-        _SPREAD_CACHE[symbol_key] = {"params": params, "expires_at": now + SPREAD_CACHE_TTL_SECONDS}
-        log.info(f"Loaded Avellaneda parameters for {symbol_key} from {params['source']}")
-        return params
-    else:
-        unavailable_params = get_unavailable_quote_params()
-        _SPREAD_CACHE[symbol_key] = {"params": unavailable_params, "expires_at": now + SPREAD_CACHE_TTL_SECONDS}
-        log.warning(
-            f"No valid Avellaneda parameter file found for {symbol_key}. "
-            "Quoting is disabled until enough historical data has been processed."
-        )
-        return unavailable_params
 
 
 async def market_making_loop(state, client, symbol, runtime, quote_engine=None):
@@ -2856,35 +2312,40 @@ async def ensure_clean_startup(client, symbol, timeout=STARTUP_CLEANUP_TIMEOUT):
 
 
 async def wait_for_active_order_clear(state, timeout):
-    """Wait for local active-order tracking to clear during shutdown."""
-    if state is None or not state.active_order_id:
+    """Wait for local working-order tracking to clear on both sides during shutdown."""
+    if state is None or not has_live_orders(state):
         return True
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
-    while state.active_order_id and loop.time() < deadline:
+    while has_live_orders(state) and loop.time() < deadline:
         await asyncio.sleep(0.05)
-    return state.active_order_id is None
+    return not has_live_orders(state)
 
 
 async def initiate_graceful_order_shutdown(state, runtime, timeout=SHUTDOWN_ACTIVE_ORDER_GRACE_TIMEOUT):
-    """Ask the running order manager to cancel the working order before task teardown."""
+    """Ask the running order manager to cancel the working orders before task teardown."""
     if state is None:
         return True
 
     runtime.request_shutdown()
-    if not state.active_order_id:
+    if not has_live_orders(state):
         return True
 
-    logging.info(f"Requesting graceful shutdown cancel for active order {state.active_order_id}.")
-    publish_latest_order_command(state, OrderCommand(kind="cancel", trigger="Shutdown cleanup"))
+    live_ids = [
+        side_state.order_id
+        for side_state in state.side_orders.values()
+        if side_state.order_id is not None
+    ]
+    logging.info(f"Requesting graceful shutdown cancel for working orders {live_ids}.")
+    publish_latest_order_command(state, QuoteSetCommand(kind="cancel_all", trigger="Shutdown cleanup"))
     request_quote_refresh(state)
     cleared = await wait_for_active_order_clear(state, timeout)
     if cleared:
-        logging.info("Active order cleared before task shutdown.")
+        logging.info("Working orders cleared before task shutdown.")
     else:
         logging.warning(
-            f"Active order {state.active_order_id} did not clear within {timeout:.1f}s. "
+            f"Working orders did not clear within {timeout:.1f}s. "
             "Falling back to direct cancel-all cleanup."
         )
     return cleared
@@ -2947,7 +2408,6 @@ async def main():
     runtime = RuntimeContext(args.symbol)
 
     logging.info(f"Starting market maker with arguments: {args}")
-    logging.info(f"FLIP_MODE is set to: {FLIP_MODE}")
 
     API_USER = os.getenv("API_USER")
     API_SIGNER = os.getenv("API_SIGNER")
@@ -2967,7 +2427,7 @@ async def main():
 
     try:
         client = ApiClient(API_USER, API_SIGNER, API_PRIVATE_KEY, RELEASE_MODE)
-        state = StrategyState(flip_mode=FLIP_MODE)
+        state = StrategyState()
         quote_engine = QuoteEngine()
         order_executor = OrderExecutor()
         top_of_book_feed = AsterTopOfBookFeed()
@@ -2989,7 +2449,24 @@ async def main():
                     logging.error("Timed out while fetching initial balance. Cannot proceed.")
                     return
 
-                params_task = asyncio.create_task(avellaneda_params_updater(state, args.symbol, runtime))
+                # The Vol+OBI calculator needs the Aster tick size before the
+                # Binance feed starts pumping samples into it.
+                logging.info(f"Fetching trading rules for {args.symbol}...")
+                state.symbol_filters = await client.get_symbol_filters(args.symbol)
+                logging.info(f"Filters loaded: {state.symbol_filters}")
+                state.vol_obi_calc = VolObiCalculator(
+                    tick_size=float(state.symbol_filters["tick_size"]),
+                    window_steps=OBI_WINDOW_STEPS,
+                    step_ns=OBI_STEP_NS,
+                    vol_to_half_spread=OBI_VOL_TO_HALF_SPREAD,
+                    min_half_spread_bps=OBI_MIN_HALF_SPREAD_BPS,
+                    c1_ticks=OBI_C1_TICKS,
+                    skew=OBI_SKEW,
+                    looking_depth=OBI_LOOKING_DEPTH,
+                    min_warmup_samples=OBI_MIN_WARMUP_SAMPLES,
+                    max_position_dollar=0.0,  # set dynamically each quote cycle
+                )
+
                 support_tasks = [
                     asyncio.create_task(
                         websocket_price_updater(
@@ -3001,30 +2478,20 @@ async def main():
                         )
                     ),
                     asyncio.create_task(websocket_user_data_updater(state, client, args.symbol, runtime)),
-                    params_task,
-                ]
-                if USE_SUPERTREND_SIGNAL:
-                    support_tasks.append(asyncio.create_task(supertrend_signal_updater(state, args.symbol, runtime)))
-                if USE_BINANCE_OBI_ALPHA:
-                    support_tasks.append(
-                        asyncio.create_task(
-                            binance_orderbook_imbalance_updater(
-                                state,
-                                args.symbol,
-                                runtime,
-                                alpha_engine=alpha_engine,
-                            )
+                    asyncio.create_task(
+                        binance_orderbook_imbalance_updater(
+                            state,
+                            args.symbol,
+                            runtime,
+                            alpha_engine=alpha_engine,
                         )
-                    )
+                    ),
+                ]
                 tasks.extend(support_tasks)
 
                 if not await wait_for_startup_inputs(state, args.symbol, runtime):
                     logging.info("Shutdown requested before required startup inputs became available.")
                     return
-
-                # Initialize Supertrend signal before checking positions or starting loops
-                if USE_SUPERTREND_SIGNAL:
-                    await initialize_supertrend_signal(state, args.symbol)
 
                 try:
                     logging.info(f"Checking for existing position for {args.symbol}...")
@@ -3033,7 +2500,7 @@ async def main():
 
                     position_found = False
                     if positions:
-                        position_size, notional_value, _, _ = sync_state_from_position_data(
+                        position_size, notional_value = sync_state_from_position_data(
                             state,
                             positions[0],
                             reference_price=state.mid_price,
@@ -3041,11 +2508,10 @@ async def main():
 
                         if has_open_position(state):
                             position_side = "LONG" if position_size > 0 else "SHORT"
-                            logging.info(f"Found existing {position_side} position of size {position_size} with notional value ${notional_value:.2f}.")
-                            if has_significant_position(state, notional_value):
-                                logging.info(f"Starting in {state.mode} mode to close position.")
-                            else:
-                                logging.info("Position is below the significance threshold, but the bot will still flatten it before opening new inventory.")
+                            logging.info(
+                                f"Found existing {position_side} position of size {position_size} with notional value "
+                                f"${notional_value:.2f}. Inventory skew will work it off."
+                            )
                             position_found = True
 
                     if not position_found:
@@ -3057,12 +2523,8 @@ async def main():
                         except Exception as e:
                             logging.error(f"Failed to set leverage: {e}", exc_info=True)
 
-                        opening_mode, _ = get_strategy_modes(state.flip_mode)
-                        state.mode = opening_mode
-                        logging.info(f"Starting in default {opening_mode} mode.")
-
                 except Exception as e:
-                    logging.warning(f"Could not check for existing position or set leverage, starting in default {state.mode} mode: {e}", exc_info=True)
+                    logging.warning(f"Could not check for existing position or set leverage: {e}", exc_info=True)
 
                 # Start all async tasks
                 quote_task = asyncio.create_task(market_making_loop(state, client, args.symbol, runtime, quote_engine=quote_engine))

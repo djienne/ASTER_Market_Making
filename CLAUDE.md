@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ASTER Market Making is a sophisticated Python-based market making bot for the Aster Finance DEX platform. It implements the Avellaneda-Stoikov model for optimal spread calculation and uses real-time WebSocket data feeds for market making operations.
+ASTER Market Making is a Python-based two-sided market making bot for the Aster Finance DEX platform. It runs a volatility + order-book-imbalance (Vol+OBI) strategy ported from the lighter_MM project: volatility sets the half-spread, a Binance order-book-imbalance z-score (alpha) shifts the fair price, and inventory skew manages position risk. Both a bid and an ask are quoted simultaneously (one level per side, GTX post-only).
 
 ## Quick Start Commands
 
@@ -13,25 +13,23 @@ ASTER Market Making is a sophisticated Python-based market making bot for the As
 pip install -r requirements.txt
 ```
 
-### Data Collection (Required First Step)
-```bash
-# Run for at least 1 hour before using other components
-python data_collector.py
-```
-
-### Parameter Calculation
-```bash
-# Calculate Avellaneda-Stoikov parameters (requires collected data)
-python calculate_avellaneda_parameters.py ETH --minutes 5
-
-# Calculate SuperTrend directional bias
-python find_trend.py --symbol ETHUSDT --interval 5m
-```
-
 ### Running the Market Maker
 ```bash
-# Requires .env file with API credentials
+# Requires .env file with API credentials. No parameter files needed —
+# the Vol+OBI signal warms up from the live Binance depth stream.
 python market_maker.py --symbol ETHUSDT
+```
+
+### Optional Analytics (not used by the live bot)
+```bash
+# Collect market data
+python data_collector.py
+
+# Avellaneda-Stoikov parameter analysis
+python calculate_avellaneda_parameters.py ETH --minutes 5
+
+# SuperTrend directional bias analysis
+python find_trend.py --symbol ETHUSDT --interval 5m
 ```
 
 ### Monitoring
@@ -61,37 +59,31 @@ docker-compose down
 
 ### Core Components
 
-**Data Collection Pipeline**
-- `data_collector.py`: WebSocket-based real-time market data collection
-  - Collects orderbook depth (bid/ask levels)
-  - Captures all trades with deduplication
-  - Stores data in CSV (prices/trades) and Parquet (orderbooks)
-  - Configurable symbols via `LIST_MARKETS` variable
-  - Auto-reconnection with exponential backoff
-
-**Parameter Calculation**
-- `calculate_avellaneda_parameters.py`: Implements Avellaneda-Stoikov model
-  - Calculates optimal spreads (delta_a, delta_b) based on collected data
-  - Volatility estimation via GARCH and rolling methods
-  - Order arrival intensity calculation (A, k parameters)
-  - Backtesting-based optimization for gamma (risk aversion) and time horizon
-  - Outputs JSON files to `params/` directory
-
-- `find_trend.py`: SuperTrend indicator calculation
-  - Determines market directional bias (bullish/bearish)
-  - Uses Numba-optimized calculations for performance
-  - Backtests multiple parameter combinations to find optimal settings
-  - Outputs signal to `params/supertrend_params_{symbol}.json`
-
 **Trading Engine**
 - `market_maker.py`: Main market making bot
   - Async event-driven architecture using asyncio
-  - Dual WebSocket connections: market data + user account updates
-  - Dynamic spread loading from Avellaneda parameter files
-  - SuperTrend integration for directional bias
-  - Position management with threshold-based mode switching
-  - Order reuse logic to minimize API calls
+  - Three WebSocket connections: Aster depth5 (top-of-book), Aster user stream (fills/balances), Binance futures diff-depth @100ms (Vol+OBI signal)
+  - Two-sided quoting: per-side order tracking in `state.side_orders['BUY'/'SELL']`
+  - Inventory skew + dynamic max-position cap replace mode switching
+  - Per-side order reuse logic (5 bps price threshold) to minimize API calls
   - Graceful shutdown with automatic order cleanup
+
+- `vol_obi.py`: Vol+OBI strategy math (port of lighter_MM)
+  - `RollingStats`: O(1) Welford ring-buffer mean/std/z-score
+  - `VolObiCalculator`: volatility from mid-price changes, alpha from imbalance z-score, `quote()` returns skewed bid/ask
+  - Fed via `on_sample(mid, imbalance)` from the Binance depth handler using incrementally maintained band totals
+
+- `logging_config.py`: Non-blocking logging (QueueHandler/QueueListener) so log I/O never blocks the event loop; the log file rotates at 50MB x 5 backups
+
+**Hot/cold path separation (important design constraint)**
+- Hot path (never blocks, no REST/disk): Binance depth handler → O(Δ) band totals → `VolObiCalculator.on_sample` (O(1)) → refresh trigger; Aster depth handler → top-of-book snapshot → 2 bps prefilter; quote engine → `build_quote_set` (pure float math) → latest-wins command queue
+- WebSocket payloads are parsed with `orjson`; EIP-712 signing is offloaded to a worker thread (`api_client._sign_async`) so Keccak/secp256k1 math never stalls the event loop
+- Cold path: order manager REST calls, position reconciliation, listen-key keepalive, watchdog, reporters
+
+**Optional Analytics (not consumed by the live bot)**
+- `data_collector.py`: WebSocket-based market data collection into `ASTER_data/`
+- `calculate_avellaneda_parameters.py`: Avellaneda-Stoikov parameter analysis
+- `find_trend.py`: SuperTrend indicator analysis
 
 **API Client**
 - `api_client.py`: Aster Finance API wrapper
@@ -110,19 +102,20 @@ docker-compose down
 
 ### Data Flow
 
-1. **Collection Phase**: `data_collector.py` continuously streams market data → saves to `ASTER_data/`
-2. **Analysis Phase**: Parameter calculation scripts read from `ASTER_data/` → compute optimal parameters → save to `params/`
-3. **Trading Phase**: `market_maker.py` loads parameters from `params/` → places orders via API → monitors fills via WebSocket
+1. **Signal**: Binance diff-depth @100ms → local bounded book → incremental ±2.5% band totals → `VolObiCalculator.on_sample(mid, bid_qty - ask_qty)` → volatility + alpha z-score
+2. **Quote**: Aster depth5 top-of-book + Vol+OBI signal → `build_quote_set()` → two-sided `QuoteSetCommand` on the latest-wins queue
+3. **Execute**: order manager reconciles desired vs live per side (cancel pass, then placement pass) → monitors fills via the user stream
 
 ### State Management
 
 The `StrategyState` class in `market_maker.py` maintains:
 - Real-time market prices (bid/ask/mid from WebSocket)
-- Account balances (USDF, USDT, position sizes)
-- Active order tracking (order IDs, placement times)
-- Mode state: 'BUY' (opening position) or 'SELL' (closing position)
+- Account balances (USDF, USDT, USDC, position sizes)
+- Per-side order tracking: `side_orders['BUY'/'SELL']` (`SideOrderState`: order_id, price, quantity, reduce_only, placed_at)
+- `vol_obi_calc` (the live calculator) and `vol_obi_snapshot` (immutable signal view)
+- Binance local book + band totals for the OBI signal
 - WebSocket health flags
-- Order update queue for async communication between tasks
+- Order update queue + latest-wins `order_commands` queue (maxsize 1; one command always carries the full desired state of both sides)
 
 ### Key Configuration Files
 
@@ -139,12 +132,16 @@ API_PRIVATE_KEY=0x...    # API wallet private key
 ```
 
 **Market Maker Parameters (market_maker.py)**
-- `FLIP_MODE`: Boolean for long-biased (False) vs short-biased (True) strategy
-- `USE_AVELLANEDA_SPREADS`: Toggle dynamic spreads vs fixed `DEFAULT_BUY_SPREAD`/`DEFAULT_SELL_SPREAD`
-- `USE_SUPERTREND_SIGNAL`: Enable SuperTrend directional bias
-- `DEFAULT_BALANCE_FRACTION`: Portion of balance per order (0.2 = 20%)
-- `POSITION_THRESHOLD_USD`: USD value threshold to switch to position-reducing mode
-- `ORDER_REFRESH_INTERVAL`: Seconds before canceling unfilled orders
+- `OBI_VOL_TO_HALF_SPREAD` (env-overridable): volatility → half-spread gain; the primary tuning knob (42.0 from the lighter_MM production config; the vol_obi.py code default is 0.8 — 50x apart, tune in dry runs)
+- `OBI_MIN_HALF_SPREAD_BPS` (env): half-spread floor per side (4 bps)
+- `OBI_C1_TICKS` (env): alpha → fair-price shift in ticks per sigma (120)
+- `OBI_SKEW` (env): inventory skew gain (1.5)
+- `OBI_LOOKING_DEPTH`: imbalance band around Binance mid (±2.5%)
+- `OBI_MIN_WARMUP_SAMPLES`: Binance depth samples required before quoting (100)
+- `DEFAULT_BALANCE_FRACTION`: portion of balance per side (0.2 = 20%)
+- `MAX_POSITION_SAFETY_FACTOR`: headroom under the leverage-derived position cap (0.9)
+- `ORDER_REFRESH_INTERVAL`: safety lifetime before a resting order is refreshed (60s)
+- `DEFAULT_PRICE_CHANGE_THRESHOLD_BPS`: per-side reuse threshold (5 bps, price-only)
 - `RELEASE_MODE`: When True, suppresses non-error logs for production
 
 ## Development Workflows
@@ -156,30 +153,18 @@ API_PRIVATE_KEY=0x...    # API wallet private key
    SYMBOL=NEWUSDT
    ```
 
-2. Add tick size to `get_fallback_tick_size()` in `utils.py`:
-   ```python
-   tick_sizes = {
-       # ... existing tickers
-       'NEW': 0.01,  # Adjust based on symbol price range
-   }
-   ```
+2. The symbol must exist on BOTH Aster and Binance USDT-margined futures (the Vol+OBI signal comes from the Binance diff-depth stream).
 
-3. Run data collection for sufficient time (1+ hours)
+3. Start the bot — tick size and filters are fetched from the exchange at startup; no parameter files are needed.
 
-4. Calculate parameters:
-   ```bash
-   python calculate_avellaneda_parameters.py NEW --minutes 5
-   python find_trend.py --symbol NEWUSDT --interval 5m
-   ```
+### Modifying the Quote Calculation
 
-### Modifying Spread Calculation
+The strategy math lives in `vol_obi.py` (`VolObiCalculator.quote()`); the per-cycle quote construction is `market_maker.py:build_quote_set()`:
 
-The spread logic is in `market_maker.py:get_spreads()`. To customize:
-
-1. Read Avellaneda parameters from `params/avellaneda_parameters_{symbol}.json`
-2. Parameters include `delta_a` (ask spread) and `delta_b` (bid spread) in absolute price units
-3. The `_SPREAD_CACHE` provides 10-second TTL caching to avoid excessive file reads
-4. Validation ensures spreads are within `SPREAD_MIN_THRESHOLD` (0.005%) and `SPREAD_MAX_THRESHOLD` (2%)
+1. `calc.quote(aster_mid, position_size)` returns the skewed, floored, tick-snapped bid/ask
+2. `build_quote_set` applies the position cap (suppress + reduce-only), the opening circuit breaker, and the GTX post-only clamp (never cross the opposite side of the Aster book)
+3. Each side is sized and validated independently via `prepare_order_candidate`
+4. Keep `build_quote_set` pure float math off in-memory state — it runs on the hot path
 
 ### Testing WebSocket Connections
 
@@ -191,7 +176,7 @@ Use scripts in `tests/` directory:
 
 ### Debugging Order Placement Issues
 
-1. Set `RELEASE_MODE = False` in `market_maker.py` for detailed logs
+1. Set the `RELEASE_MODE=0` environment variable for detailed logs
 2. Check `market_maker.log` for complete execution trace
 3. Verify symbol filters with:
    ```python
@@ -199,7 +184,8 @@ Use scripts in `tests/` directory:
    filters = await client.get_symbol_filters('ETHUSDT')
    print(filters)  # Shows price_precision, quantity_precision, tick_size, etc.
    ```
-4. Monitor order reuse logic: orders are reused if price change < `DEFAULT_PRICE_CHANGE_THRESHOLD`
+4. Monitor per-side order reuse: a side's resting order is reused if its price change < `DEFAULT_PRICE_CHANGE_THRESHOLD` (5 bps); quantity changes alone never force a replace
+5. Watch for clusters of GTX post-only rejects — they mean the clamp is not being applied or `OBI_C1_TICKS` is too aggressive
 
 ## Data Storage Structure
 
@@ -212,8 +198,8 @@ ASTER_data/
     └── orderbook_*.parquet       # Timestamped archives
 
 params/
-├── avellaneda_parameters_{SYMBOL}.json  # Optimal spread parameters
-└── supertrend_params_{SYMBOL}.json      # Trend direction signal
+├── avellaneda_parameters_{SYMBOL}.json  # Analytics output (not read by the live bot)
+└── supertrend_params_{SYMBOL}.json      # Analytics output (not read by the live bot)
 ```
 
 ## Important Implementation Details
@@ -246,38 +232,44 @@ First run compiles these functions; subsequent runs are significantly faster.
 ### WebSocket Reconnection
 
 Both `market_maker.py` and `data_collector.py` implement:
-- Exponential backoff: starts at 1s, maxes at 60s
-- Ping/pong timeout detection (15s timeout, 30s interval)
-- Automatic listenKey refresh every 30 minutes for user streams
+- Exponential backoff: starts at 5s, maxes at 60s
+- Ping/pong keepalive (20s interval, 10s timeout) plus recv-timeout stale detection
+- Automatic listenKey keepalive every 10 minutes for user streams
+- Proactive connection rotation before the documented 24h server limit (~23h)
 - Connection health monitoring via timestamps
+
+Note: every Binance signal-stream reconnect resets the Vol+OBI calculator — quotes are pulled until the ~10s warmup completes (signal integrity by design).
 
 ## Docker Service Dependencies
 
-The `docker-compose.yml` orchestrates 4 services:
+The `docker-compose.yml` defines 4 services:
 
-1. **data-collector**: Runs continuously, restarts every `RESTART_MINUTES` if it fails
-2. **avellaneda-params**: Recalculates parameters every `PARAM_REFRESH_MINUTES`
-3. **trend-finder**: Updates trend signal every `TREND_REFRESH_MINUTES`
-4. **market-maker**: Depends on data-collector and avellaneda-params, runs trading logic
+1. **market-maker**: Self-contained trading logic — only needs `.env` credentials and WebSocket connectivity
+2. **data-collector**: Optional analytics; gathers market data continuously
+3. **avellaneda-params**: Optional analytics; recalculates parameters every `PARAM_REFRESH_MINUTES`
+4. **trend-finder**: Optional analytics; updates trend signal every `TREND_REFRESH_MINUTES`
 
-`runtime.env` is the single source of truth for the active symbol across `data-collector`, `avellaneda-params`, `trend-finder`, and `market-maker`. The trading-related services still use the repo-root `.env` file for credentials.
+`runtime.env` is the single source of truth for the active symbol across all services. The trading-related services still use the repo-root `.env` file for credentials.
 
 ## Risk Management Features
 
-- **Position Threshold**: When position > `POSITION_THRESHOLD_USD`, bot only places orders to reduce position
-- **Order Refresh**: Unfilled orders canceled after `ORDER_REFRESH_INTERVAL` to avoid stale prices
-- **Price Staleness Check**: Rejects operations if price data older than 5 seconds
-- **Balance Fraction**: Limits each order to fraction of available balance
-- **Spread Validation**: Enforces min/max spread thresholds to prevent extreme values
-- **Graceful Shutdown**: SIGINT/SIGTERM handlers ensure all orders canceled on exit
+- **Dynamic Position Cap**: `max_position_usd = (balance * leverage - 2 * order_value) * 0.9`; at the cap the position-increasing side is suppressed and the surviving side is flagged reduce-only
+- **Inventory Skew**: Long inventory widens the bid and tightens the ask (and vice versa), continuously steering position back to flat
+- **Order Refresh**: Resting orders refreshed after `ORDER_REFRESH_INTERVAL` to avoid stale prices (per side)
+- **Signal Staleness**: Quotes are pulled when the Binance Vol+OBI feed disconnects or goes stale (>5s); warmup restarts after every reconnect
+- **Price Staleness Check**: Rejects quoting if Aster price data is older than 30 seconds
+- **GTX Post-Only Clamp**: Quotes that would cross the opposite side of the Aster book are clamped one tick inside it
+- **Spread Floor**: `OBI_MIN_HALF_SPREAD_BPS` keeps quotes at least 4 bps per side off the mid
+- **Opening Circuit Breaker**: 3 opening-order failures in 60s pause exposure-adding quotes for 120s (the reducing side keeps working)
+- **Graceful Shutdown**: SIGINT/SIGTERM handlers cancel both sides, with a REST cancel-all backstop
 
 ## Common Pitfalls
 
-1. **Running market maker before data collection**: Requires at least 2 complete time periods of data for backtesting
-2. **Missing .env file**: All trading scripts require properly configured API credentials
-3. **Incorrect symbol format**: Use "BNBUSDT" not "BNB-USDT" or "BNB/USDT"
-4. **Insufficient data for GARCH**: Volatility estimation needs substantial historical data (hours to days)
-5. **Shared account interference**: Bot assumes exclusive control of account; manual trading creates position tracking issues
-6. **Parameter file timing**: Market maker reads parameter files on startup and every 10 minutes, not on every order
+1. **Missing .env file**: All trading scripts require properly configured API credentials
+2. **Incorrect symbol format**: Use "BNBUSDT" not "BNB-USDT" or "BNB/USDT"
+3. **Symbol not on Binance futures**: The Vol+OBI signal needs the same symbol on Binance USDT-margined futures
+4. **Shared account interference**: Bot assumes exclusive control of account; manual trading creates position tracking issues (the open-order watchdog cancels untracked orders)
+5. **Daily warmup gaps**: WebSocket connections rotate proactively every ~23h; each Binance reconnect restarts the ~10s Vol+OBI warmup and pulls quotes until it completes
+6. **Tuning `OBI_VOL_TO_HALF_SPREAD`**: lighter_MM production used 42.0, the vol_obi.py code default is 0.8 — these differ by 50x; validate spreads in a dry run before sizing up
 
 

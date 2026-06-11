@@ -2,15 +2,14 @@
 
 Python market-making tooling for Aster Finance using WebSocket market data plus signed REST/WebSocket trading APIs.
 
-The main strategy combines:
-- Avellaneda-Stoikov style spread calculation
-- SuperTrend directional bias
-- Binance order-book-imbalance alpha for quote shifting
-- WebSocket-based price, balance, order, and book monitoring
+The strategy is a two-sided volatility + order-book-imbalance (Vol+OBI) market maker, ported from the lighter_MM project:
+- volatility (from Binance 100ms mid-price changes) sets the half-spread width
+- a Binance order-book-imbalance z-score (alpha) shifts the fair price around the Aster mid
+- inventory skew widens the position-increasing side and tightens the reducing side
+- the position-increasing side is suppressed entirely at a dynamic max-position cap
+- WebSocket-based price, balance, order, and book monitoring; non-blocking logging on the hot path
 
-This is not a conventional two-sided market maker quoting bid and ask simultaneously. The current trading logic is one-sided at a time:
-- when flat, it quotes only on the current bias side to open inventory
-- once inventory exists, it quotes only the reducing side until that inventory is flattened
+The bot quotes bid and ask simultaneously (one level per side) with GTX post-only orders.
 
 Referral link to support this work: [https://www.asterdex.com/en/referral/164f81](https://www.asterdex.com/en/referral/164f81)
 
@@ -30,17 +29,15 @@ pip install -r requirements.txt
 
 # Set `SYMBOL=ETHUSDT` in `runtime.env`, or pass explicit CLI symbols below.
 
-# Collect market data
-python data_collector.py
-python data_collector.py BTCUSDT ETHUSDT
-
-# Compute parameters from local data
-python calculate_avellaneda_parameters.py ETH --minutes 5
-python find_trend.py --symbol ETHUSDT --interval 5m
-
-# Run the market maker
+# Run the market maker (no parameter files required — the Vol+OBI signal
+# warms up from the live Binance depth stream in ~10-60 seconds)
 python market_maker.py
 python market_maker.py --symbol ETHUSDT
+
+# Optional analytics tooling (not used by the live bot)
+python data_collector.py
+python calculate_avellaneda_parameters.py ETH --minutes 5
+python find_trend.py --symbol ETHUSDT --interval 5m
 ```
 
 ## Configuration
@@ -91,49 +88,48 @@ SYMBOL=ETHUSDT
 
 ## Main Strategy Parameters
 
-Current defaults live in [market_maker.py](market_maker.py).
+Current defaults live in [market_maker.py](market_maker.py). The `OBI_*` knobs are env-overridable.
 
 ```python
 DEFAULT_SYMBOL = configured_symbol()
-FLIP_MODE = False
-DEFAULT_BUY_SPREAD = 0.006
-DEFAULT_SELL_SPREAD = 0.006
-USE_AVELLANEDA_SPREADS = True
+DEFAULT_LEVERAGE = 1
 DEFAULT_BALANCE_FRACTION = 0.2
-POSITION_THRESHOLD_USD = 15.0
+
+# Vol+OBI strategy (lighter_MM port)
+OBI_WINDOW_STEPS = 6000              # rolling window for vol/imbalance stats
+OBI_STEP_NS = 100_000_000            # Binance diff-depth cadence (100ms)
+OBI_VOL_TO_HALF_SPREAD = 42.0        # env OBI_VOL_TO_HALF_SPREAD — primary tuning knob
+OBI_MIN_HALF_SPREAD_BPS = 4.0        # env OBI_MIN_HALF_SPREAD_BPS — spread floor per side
+OBI_C1_TICKS = 120.0                 # env OBI_C1_TICKS — alpha -> fair-price shift (ticks/sigma)
+OBI_SKEW = 1.5                       # env OBI_SKEW — inventory skew gain
+OBI_LOOKING_DEPTH = 0.025            # imbalance band: +/-2.5% around Binance mid
+OBI_MIN_WARMUP_SAMPLES = 100         # samples before quoting starts
+MAX_POSITION_SAFETY_FACTOR = 0.9     # headroom under the leverage-derived position cap
 
 ORDER_REFRESH_INTERVAL = 60
-PRICE_REPORT_INTERVAL = 60
-BALANCE_REPORT_INTERVAL = 60
-
-USE_SUPERTREND_SIGNAL = True
-SUPERTREND_CHECK_INTERVAL = 600
-
-USE_BINANCE_OBI_ALPHA = True
-BINANCE_OBI_ZSCORE_WINDOW_SECONDS = 600
-BINANCE_OBI_WARMUP_SECONDS = 300
-BINANCE_OBI_BPS_PER_SIGMA = 5.0
-BINANCE_OBI_MAX_SHIFT_BPS = 15.0
-
 DEFAULT_PRICE_CHANGE_THRESHOLD_BPS = 5.0
-CANCEL_SPECIFIC_ORDER = True
 
 RELEASE_MODE = env_flag("RELEASE_MODE", True)
 ```
 
+How the quote is built each cycle:
+1. `half_spread = volatility * OBI_VOL_TO_HALF_SPREAD` (volatility = per-second std of Binance mid changes)
+2. `fair_price = aster_mid + OBI_C1_TICKS * tick_size * alpha` (alpha = imbalance z-score)
+3. `norm_pos = clamp(position_usd / max_position_usd, -1, 1)`; bid depth scales by `(1 + OBI_SKEW * norm_pos)`, ask depth by `(1 - OBI_SKEW * norm_pos)`
+4. `OBI_MIN_HALF_SPREAD_BPS` floors both sides; quotes snap to the tick grid; crossed quotes are never emitted
+5. at the dynamic position cap (`(balance * leverage - 2 * order_value) * 0.9`) the increasing side is suppressed and the surviving side is flagged reduce-only
+
 Important notes:
-- `DEFAULT_BALANCE_FRACTION` currently sizes from tracked wallet balances (`walletBalance` from account snapshots / user stream), not `availableBalance`.
-- `POSITION_THRESHOLD_USD` controls when a position is treated as significant for bias/mode logic, but the bot still tries to flatten any non-zero position before opening fresh inventory.
-- Positions that round below exchange `minQty` or `minNotional` cannot be reduced automatically and will block new openings until they are cleared.
-- `DEFAULT_PRICE_CHANGE_THRESHOLD_BPS` is the single source of truth for the minimum price move required before an order is canceled and replaced.
-- `ORDER_REFRESH_INTERVAL = 60` is now a safety lifetime for a working order; normal re-quoting is event-driven from best bid/ask WebSocket changes.
-- If `USE_AVELLANEDA_SPREADS = True`, the bot will not place limit orders until a valid Avellaneda params file exists; it stays idle instead of falling back to static spreads when historical data is still insufficient.
-- The Avellaneda calculator clamps each side's computed spread to configurable guardrails in `config.json -> avellaneda_calculation.spread_limits_bps` (default `5` to `200` bps), prints warnings when clamping happens, and the live bot enforces the same saved limits when building dynamic quotes.
-- The static `+/-0.6%` fallback is only used when `USE_AVELLANEDA_SPREADS = False`.
-- `USE_BINANCE_OBI_ALPHA = True` enables a Binance futures order-book-imbalance signal that shifts reservation/limit prices and blocks new opening quotes until the signal has warmed up for at least 300 seconds and 100 samples.
+- `DEFAULT_BALANCE_FRACTION` sizes each side from tracked wallet balances (`walletBalance` from account snapshots / user stream), not `availableBalance`.
+- Positions that round below exchange `minQty` or `minNotional` cannot be reduced automatically.
+- `DEFAULT_PRICE_CHANGE_THRESHOLD_BPS` is the single source of truth for the minimum price move required before a side is canceled and replaced; reuse is price-only per side.
+- `ORDER_REFRESH_INTERVAL = 60` is a safety lifetime for a working order; normal re-quoting is event-driven from the Aster top-of-book and the Binance alpha stream.
+- Quoting is blocked until the Vol+OBI signal is warmed up (`OBI_MIN_WARMUP_SAMPLES` Binance depth samples) and is pulled whenever the Binance feed disconnects or goes stale for more than 5 seconds. Warmup restarts after every Binance reconnect by design.
+- Orders are GTX post-only; quotes that would cross the opposite side of the Aster book are clamped one tick inside it.
 - Opening quotes are also blocked unless the configured symbol is in `TRADING` status and the tracked wallet balance is large enough for the exchange minimum opening order size with a safety buffer.
 - The bot assumes exclusive ownership of the account and symbol, cancels all open orders for the configured symbol during startup and shutdown, and aborts startup if it cannot confirm the initial cleanup.
-- `RELEASE_MODE=0` enables normal info-level logs; `RELEASE_MODE=1` keeps the quieter error-only behavior.
+- `RELEASE_MODE=0` enables normal info-level logs; `RELEASE_MODE=1` keeps the quieter error-only behavior. Logging is non-blocking (queue-based) so it never stalls the trading hot path, and `market_maker.log` rotates at 50MB with 5 backups.
+- Other hot-path latency measures: WebSocket payloads are parsed with `orjson`, and EIP-712 request signing runs in a worker thread so the event loop never stalls on crypto math.
 
 ## Available Scripts
 
@@ -150,22 +146,18 @@ python find_trend.py --symbol ETHUSDT --interval 5m
 
 ## Docker
 
-The Compose stack now supports the full automated loop in [docker-compose.yml](docker-compose.yml):
-- `data-collector` gathers the symbol configured in `runtime.env`
-- `avellaneda-params` retries parameter generation every 5 minutes
-- `trend-finder` refreshes the Supertrend file every 5 minutes
-- `market-maker` waits for a valid Avellaneda file, a valid Supertrend file, and Binance OBI warmup before it begins opening quotes
+The Compose stack in [docker-compose.yml](docker-compose.yml):
+- `market-maker` is self-contained: it only needs `.env` credentials and Binance/Aster WebSocket connectivity, then begins quoting once the Vol+OBI signal has warmed up (about 10-60 seconds)
+- `data-collector`, `avellaneda-params`, and `trend-finder` are optional analytics services; the live bot no longer reads their output
 
 ```bash
 docker compose build
-docker compose up -d
-docker compose logs -f data-collector avellaneda-params trend-finder market-maker
+docker compose up -d market-maker
+docker compose logs -f market-maker
 docker compose down
 ```
 
 If you only want background market-data collection, `docker compose up -d data-collector` does not require a `.env` file or live credentials. Change `runtime.env` to switch the collected symbol, and use `.env` only for real API credentials.
-
-For a fresh symbol like `ETHUSDT`, the automated stack will not quote immediately on a fresh machine. `avellaneda-params` depends on locally collected trades/orderbook history, so it will keep retrying until there is enough continuous data to write a valid `params/avellaneda_parameters_ETH.json`. `trend-finder` fetches and caches klines independently, then writes `params/supertrend_params_ETH.json`. Once both files are valid and the Binance OBI alpha has warmed up, the running market maker can begin quoting automatically.
 
 ## Testing
 
@@ -182,7 +174,7 @@ pytest -q
 RUN_LIVE_API_TESTS=1 pytest -q
 ```
 
-The default test suite does not place live trades. It covers local order-state logic, filter rounding, parameter-file loading, and analytics helpers.
+The default test suite does not place live trades. It covers the Vol+OBI strategy math, two-sided quote construction, per-side order-state logic, filter rounding, and analytics helpers.
 
 ## Performance Notes
 

@@ -1,5 +1,4 @@
 import asyncio
-import json
 from pathlib import Path
 
 import pandas as pd
@@ -210,54 +209,6 @@ def test_build_summary_text_has_no_file_write_side_effect(monkeypatch, tmp_path)
 
     assert "Insufficient data" in summary
     assert not any(Path(output_path).glob("*"))
-
-
-def test_market_maker_loads_generated_avellaneda_params(monkeypatch, tmp_path):
-    params_dir = tmp_path / "params"
-    params_dir.mkdir()
-
-    payload = {
-        "ticker": "BTC",
-        "market_data": {
-            "sigma": 0.02,
-            "A_buy": 1.5,
-            "k_buy": 2.0,
-            "A_sell": 1.7,
-            "k_sell": 3.0,
-        },
-        "optimal_parameters": {
-            "gamma": 0.1,
-            "time_horizon_days": 0.5,
-        },
-        "spread_limits_bps": {
-            "min": 5.0,
-            "max": 200.0,
-        },
-    }
-    (params_dir / "avellaneda_parameters_BTC.json").write_text(json.dumps(payload), encoding="utf-8")
-
-    monkeypatch.setattr(market_maker, "PARAMS_DIR", str(params_dir))
-    market_maker._SPREAD_CACHE.clear()
-
-    params = market_maker.get_avellaneda_params("BTCUSDT")
-
-    assert params["source"] == "avellaneda_parameters_BTC.json"
-    assert params["k_buy"] == 2.0
-    assert params["k_sell"] == 3.0
-    assert params["spread_limits_bps"] == {"min": 5.0, "max": 200.0}
-
-
-def test_market_maker_disables_quoting_when_dynamic_params_are_missing(monkeypatch, tmp_path):
-    params_dir = tmp_path / "params"
-    params_dir.mkdir()
-
-    monkeypatch.setattr(market_maker, "PARAMS_DIR", str(params_dir))
-    monkeypatch.setattr(market_maker, "USE_AVELLANEDA_SPREADS", True)
-    market_maker._SPREAD_CACHE.clear()
-
-    params = market_maker.get_avellaneda_params("BTCUSDT")
-
-    assert params["source"] == "unavailable"
 
 
 def test_calculate_vwap_uses_true_execution_price():

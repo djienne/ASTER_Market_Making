@@ -3,6 +3,7 @@ import json
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 
 import aiohttp
 from eth_account import Account
@@ -191,6 +192,12 @@ class ApiClient:
             response.raise_for_status()
             return await response.json()
 
+    @staticmethod
+    def _decimal_precision(value_str: str) -> int:
+        """Number of decimal places in a filter value, robust to forms like '1', '1E-8', '0.0100'."""
+        exponent = Decimal(value_str).normalize().as_tuple().exponent
+        return max(0, -exponent)
+
     async def get_symbol_filters(self, symbol: str) -> dict:
         exchange_info = await self.get_exchange_info()
         for sym_data in exchange_info.get('symbols', []):
@@ -198,11 +205,11 @@ class ApiClient:
                 filters = {f['filterType']: f for f in sym_data.get('filters', [])}
                 price_filter = filters.get('PRICE_FILTER', {})
                 tick_size_str = price_filter.get('tickSize', '0.01')
-                price_precision = len(tick_size_str.split('.')[1].rstrip('0')) if '.' in tick_size_str else 0
+                price_precision = self._decimal_precision(tick_size_str)
                 lot_size_filter = filters.get('LOT_SIZE', {})
                 step_size_str = lot_size_filter.get('stepSize', '0.01')
                 min_qty_str = lot_size_filter.get('minQty', step_size_str)
-                quantity_precision = len(step_size_str.split('.')[1].rstrip('0')) if '.' in step_size_str else 0
+                quantity_precision = self._decimal_precision(step_size_str)
                 return {
                     'status': sym_data.get('status', 'UNKNOWN'),
                     'price_precision': price_precision,

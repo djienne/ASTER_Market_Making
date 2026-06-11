@@ -62,10 +62,6 @@ services:
     volumes:
       - ./:/app/
     command: python market_maker.py
-    depends_on:
-      - data-collector
-      - avellaneda-params
-      - trend-finder
     restart: unless-stopped
 
   trend-finder:
