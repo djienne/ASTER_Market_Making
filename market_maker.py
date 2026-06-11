@@ -1731,32 +1731,42 @@ def is_order_reduce_only(order_data):
 
 
 async def wait_for_terminal_order_update(order_updates, order_id, timeout, log, context):
-    """Wait for a terminal update for the given order id."""
+    """Wait for a terminal update for the given order id.
+
+    Updates for OTHER orders are re-queued afterwards, never dropped: with two
+    live sides, a fill on the other side must survive this wait.
+    """
     start_time = asyncio.get_event_loop().time()
+    unrelated_updates = []
 
-    while True:
-        remaining_timeout = timeout - (asyncio.get_event_loop().time() - start_time)
-        if remaining_timeout <= 0:
-            raise asyncio.TimeoutError
+    try:
+        while True:
+            remaining_timeout = timeout - (asyncio.get_event_loop().time() - start_time)
+            if remaining_timeout <= 0:
+                raise asyncio.TimeoutError
 
-        update = await asyncio.wait_for(order_updates.get(), timeout=remaining_timeout)
-        if update.get('e') != 'ORDER_TRADE_UPDATE':
-            continue
+            update = await asyncio.wait_for(order_updates.get(), timeout=remaining_timeout)
+            if update.get('e') != 'ORDER_TRADE_UPDATE':
+                continue
 
-        order_data = update.get('o', {})
-        if order_data.get('i') != order_id:
-            continue
+            order_data = update.get('o', {})
+            if order_data.get('i') != order_id:
+                unrelated_updates.append(update)
+                continue
 
-        terminal_update = classify_order_update(order_data)
-        if not terminal_update["is_terminal"]:
-            continue
+            terminal_update = classify_order_update(order_data)
+            if not terminal_update["is_terminal"]:
+                continue
 
-        status = terminal_update["status"]
-        filled_qty = terminal_update["filled_qty"]
+            status = terminal_update["status"]
+            filled_qty = terminal_update["filled_qty"]
 
-        log.info(f"{context} order {order_id} reached final state {status}. Filled: {filled_qty}")
+            log.info(f"{context} order {order_id} reached final state {status}. Filled: {filled_qty}")
 
-        return terminal_update
+            return terminal_update
+    finally:
+        for unrelated in unrelated_updates:
+            order_updates.put_nowait(unrelated)
 
 
 async def cancel_and_finalize_side_order(state, client, symbol, log, side, reason, order_label):
@@ -1972,6 +1982,37 @@ async def cancel_all_side_orders(state, client, symbol, runtime, log, reason):
     return True
 
 
+async def fast_cancel_side_to_pending(state, client, symbol, runtime, log, side, reason, order_label):
+    """Cancel one side and park it in pending_terminal_orders for async finalize.
+
+    Never blocks on the order-updates queue, so the other side's events are
+    untouched while the cancel resolves in the background.
+    """
+    side_state = state.side_orders[side]
+    order_id = side_state.order_id
+    if not await cancel_side_order(
+        state,
+        client,
+        symbol,
+        log,
+        side,
+        reason,
+        clear_tracking_on_success=False,
+    ):
+        return False
+
+    if order_id is not None:
+        state.pending_terminal_orders[order_id] = PendingTerminalOrder(
+            side=side,
+            reduce_only=side_state.reduce_only,
+            position_update_seq_before_fill=state.position_update_seq,
+            order_label=order_label,
+            cancel_requested_at=runtime.now(),
+        )
+    clear_side_order(state, side)
+    return True
+
+
 def _side_needs_replace(state, side, quote):
     """Return True when the live order on a side no longer matches the desired quote."""
     side_state = state.side_orders[side]
@@ -2020,29 +2061,18 @@ async def apply_quote_set(state, client, symbol, runtime, log, executor, command
             continue
 
         if executor.fast_replace:
-            side_state = state.side_orders[side]
-            order_id = side_state.order_id
-            if not await cancel_side_order(
+            if not await fast_cancel_side_to_pending(
                 state,
                 client,
                 symbol,
+                runtime,
                 log,
                 side,
                 command.trigger or "Fast requote replacement",
-                clear_tracking_on_success=False,
+                "Fast requote order",
             ):
                 await asyncio.sleep(RETRY_ON_ERROR_INTERVAL)
                 return
-
-            if order_id is not None:
-                state.pending_terminal_orders[order_id] = PendingTerminalOrder(
-                    side=side,
-                    reduce_only=side_state.reduce_only,
-                    position_update_seq_before_fill=state.position_update_seq,
-                    order_label="Fast requote order",
-                    cancel_requested_at=runtime.now(),
-                )
-            clear_side_order(state, side)
         else:
             if not await cancel_and_finalize_side_order(
                 state,
@@ -2060,16 +2090,30 @@ async def apply_quote_set(state, client, symbol, runtime, log, executor, command
         return
 
     # Pass 2: place sides that are wanted but not resting (reused sides skip).
+    # A placement failure on one side (e.g. a transient GTX reject) must not
+    # kill the other side's quote: log, record, and let the circuit breaker
+    # handle clustering instead of escalating to the outer error handler.
+    placement_failed = False
+    failed_opening_placements = 0
     for side, quote in desired.items():
         if quote is None or state.side_orders[side].order_id is not None:
             continue
 
         try:
             await executor.place_order(state, client, symbol, runtime, log, quote)
-        except Exception:
+        except Exception as place_error:
+            placement_failed = True
             if not quote.reduce_only:
-                record_opening_order_failure(state, runtime)
-            raise
+                failed_opening_placements += 1
+            log.error(f"Failed to place {side} order: {place_error}")
+
+    # Record after the loop so a same-burst success on the other side
+    # (which resets the failure window) cannot mask this burst's failures.
+    for _ in range(failed_opening_placements):
+        record_opening_order_failure(state, runtime)
+
+    if placement_failed:
+        request_quote_refresh(state)
 
 
 def _oldest_live_order_age(state, runtime):
@@ -2210,15 +2254,30 @@ async def order_manager_loop_impl(state, client, symbol, runtime, executor):
                         f"{side} order {state.side_orders[side].order_id} reached the "
                         f"{ORDER_REFRESH_INTERVAL:.1f}s safety lifetime. Refreshing the quote."
                     )
-                    if not await cancel_and_finalize_side_order(
-                        state,
-                        client,
-                        symbol,
-                        log,
-                        side,
-                        "Timed-out order refresh",
-                        "Timed-out order",
-                    ):
+                    if executor.fast_replace:
+                        # Park-and-continue: never block on the updates queue
+                        # while the other side may be filling.
+                        refreshed = await fast_cancel_side_to_pending(
+                            state,
+                            client,
+                            symbol,
+                            runtime,
+                            log,
+                            side,
+                            "Timed-out order refresh",
+                            "Timed-out order",
+                        )
+                    else:
+                        refreshed = await cancel_and_finalize_side_order(
+                            state,
+                            client,
+                            symbol,
+                            log,
+                            side,
+                            "Timed-out order refresh",
+                            "Timed-out order",
+                        )
+                    if not refreshed:
                         refresh_failed = True
                         break
 

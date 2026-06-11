@@ -624,6 +624,105 @@ def test_apply_quote_set_reuses_order_within_threshold(monkeypatch):
 # Cancels, fills, shutdown
 # ---------------------------------------------------------------------------
 
+def test_wait_for_terminal_order_update_requeues_other_orders_events():
+    """A fill on the OTHER side must survive a cancel-confirmation wait."""
+    async def runner():
+        queue = asyncio.Queue()
+        other_fill = {"e": "ORDER_TRADE_UPDATE", "o": {"i": 99, "X": "FILLED", "z": "1.0"}}
+        await queue.put(other_fill)
+        await queue.put({"e": "ORDER_TRADE_UPDATE", "o": {"i": 42, "X": "CANCELED", "z": "0"}})
+
+        terminal = await market_maker.wait_for_terminal_order_update(
+            queue, 42, 1.0, logging.getLogger("test"), "Test"
+        )
+
+        assert terminal["status"] == "CANCELED"
+        requeued = queue.get_nowait()
+        assert requeued["o"]["i"] == 99  # other side's fill is back in the queue
+
+    asyncio.run(runner())
+
+
+def test_timeout_refresh_parks_expired_side_without_touching_other(monkeypatch):
+    """Fast-replace timeout refresh must not block on the queue or disturb the other side."""
+    class CancelClient:
+        def __init__(self):
+            self.cancelled = []
+
+        async def cancel_order(self, symbol, order_id):
+            self.cancelled.append(order_id)
+            return {"orderId": order_id}
+
+        async def get_order_status(self, symbol, order_id):
+            raise AssertionError("should not need REST status during fast refresh")
+
+    async def runner():
+        monkeypatch.setattr(market_maker, "MIN_ORDER_INTERVAL", 0.0)
+        state = market_maker.StrategyState()
+        runtime = _make_runtime(clock_value=100.0)
+        client = CancelClient()
+        log = logging.getLogger("test")
+
+        state.side_orders["BUY"] = market_maker.SideOrderState(
+            order_id=10, price=99.0, quantity=1.0, placed_at=10.0  # 90s old -> expired
+        )
+        state.side_orders["SELL"] = market_maker.SideOrderState(
+            order_id=11, price=101.0, quantity=1.0, placed_at=99.0  # fresh
+        )
+
+        ok = await market_maker.fast_cancel_side_to_pending(
+            state, client, "BTCUSDT", runtime, log, "BUY", "Timed-out order refresh", "Timed-out order"
+        )
+
+        assert ok is True
+        assert client.cancelled == [10]
+        assert state.side_orders["BUY"].order_id is None
+        assert 10 in state.pending_terminal_orders
+        assert state.pending_terminal_orders[10].side == "BUY"
+        assert state.side_orders["SELL"].order_id == 11  # untouched
+
+    asyncio.run(runner())
+
+
+def test_placement_failure_on_one_side_does_not_kill_the_other(monkeypatch):
+    class HalfFailingClient:
+        def __init__(self):
+            self.placed = []
+
+        async def place_order(self, symbol, price, quantity, side, reduce_only=False):
+            if side == "BUY":
+                raise RuntimeError("GTX reject")
+            self.placed.append(side)
+            return {"orderId": 500}
+
+    async def runner():
+        monkeypatch.setattr(market_maker, "MIN_ORDER_INTERVAL", 0.0)
+        state = market_maker.StrategyState()
+        state.mid_price = 100.0
+        runtime = _make_runtime()
+        executor = market_maker.OrderExecutor(fast_replace=True)
+        log = logging.getLogger("test")
+
+        command = market_maker.QuoteSetCommand(
+            kind="quote_set",
+            bid=market_maker.SideQuote(side="BUY", price=99.5, quantity=2.0),
+            ask=market_maker.SideQuote(side="SELL", price=100.5, quantity=2.0),
+            trigger="test",
+        )
+
+        # Must not raise out of apply_quote_set.
+        await market_maker.apply_quote_set(
+            state, HalfFailingClient(), "BTCUSDT", runtime, log, executor, command
+        )
+
+        assert state.side_orders["SELL"].order_id == 500   # healthy side placed
+        assert state.side_orders["BUY"].order_id is None   # failed side empty
+        assert len(state.order_failure_timestamps) == 1    # failure recorded
+        assert state.quote_refresh_event.is_set()          # retry requested
+
+    asyncio.run(runner())
+
+
 def test_wait_for_terminal_order_update_ignores_non_terminal_events():
     async def runner():
         queue = asyncio.Queue()
