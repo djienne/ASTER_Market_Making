@@ -913,7 +913,11 @@ async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None,
                                         )
                                         if should_refresh:
                                             request_quote_refresh(state)
-                                        log.debug(f"Updated prices for {symbol}: Bid={best_bid}, Ask={best_ask}, Mid={state.mid_price:.4f}")
+                                        if log.isEnabledFor(logging.DEBUG):
+                                            log.debug(
+                                                "Updated prices for %s: Bid=%s, Ask=%s, Mid=%.4f",
+                                                symbol, best_bid, best_ask, state.mid_price,
+                                            )
 
                         except json.JSONDecodeError:
                             log.warning("Failed to decode WebSocket message")
@@ -1913,8 +1917,13 @@ async def place_side_order(state, client, symbol, runtime, log, quote, symbol_fi
     formatted_quantity = f"{quote.quantity:.{quantity_precision}f}"
 
     log.info(
-        f"Placing {quote.side} order: {formatted_quantity} {symbol} @ {formatted_price} "
-        f"({percentage_diff:+.4f}% from mid-price, {vol_obi_status_text(state)})"
+        "Placing %s order: %s %s @ %s (%+.4f%% from mid-price, %s)",
+        quote.side,
+        formatted_quantity,
+        symbol,
+        formatted_price,
+        percentage_diff,
+        vol_obi_status_text(state),
     )
 
     placed_order = await client.place_order(

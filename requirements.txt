@@ -1,3 +1,4 @@
+aiodns==3.5.0
 aiohttp==3.13.5
 arch==8.0.0
 colorama==0.4.6
