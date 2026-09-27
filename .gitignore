@@ -5,3 +5,4 @@ __pycache__/
 *.log*
 params/
 ASTER_data/
+.claude/settings.local.json
