@@ -261,7 +261,7 @@ async def get_my_trading_volume(symbol: str = None, days: int = 7):
                         sorted_tickers = sorted(tickers, key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)
                         # Take top 40 symbols
                         top_symbols = [t['symbol'] for t in sorted_tickers[:40]]
-                        print(f"[INFO] Top 40 symbols by volume: {', '.join(top_symbols[:10])}...")
+                        print(f"[INFO] Checking the top 40 of {len(sorted_tickers)} symbols by 24h volume (trades on other symbols are not counted): {', '.join(top_symbols[:10])}...")
                     else:
                         print(f"[WARN] Could not fetch tickers, using common symbols instead")
                         top_symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
@@ -321,6 +321,7 @@ async def get_my_trading_volume(symbol: str = None, days: int = 7):
 
                                             await asyncio.sleep(0.05)
                                         else:
+                                            print(f"[WARN] {sym}: HTTP {response.status} while fetching trades; {sym} totals may be incomplete")
                                             break
 
                                 current_start = current_end
@@ -369,12 +370,13 @@ async def get_my_trading_volume(symbol: str = None, days: int = 7):
 
                                         await asyncio.sleep(0.05)
                                     else:
+                                        print(f"[WARN] {sym}: HTTP {response.status} while fetching trades; {sym} totals may be incomplete")
                                         break
 
                         return sym, all_trades_for_symbol
 
                     except Exception as e:
-                        # Return empty list on error
+                        print(f"[WARN] {sym}: trade fetch failed ({e}); {sym} is missing from the totals")
                         return sym, []
 
                 # Fetch all symbols concurrently

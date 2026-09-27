@@ -165,3 +165,43 @@ def test_flush_orderbook_buffer_rolls_current_hour_when_buffer_limit_hit(monkeyp
     assert archive_path.is_file()
     assert not latest_path.exists()
     assert len(collector.orderbook_buffer["BTCUSDT"]) == 0
+
+
+def test_unreadable_latest_is_preserved_and_writes_are_atomic(monkeypatch, tmp_path):
+    monkeypatch.setattr(data_collector.WebSocketDataCollector, "load_seen_trade_ids", lambda self, symbol: set())
+    monkeypatch.chdir(tmp_path)
+    output_dir = tmp_path / "ASTER_data" / "orderbook_parquet" / "BTCUSDT"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    truncated = b"PAR1-truncated-by-a-crash-mid-write"
+    (output_dir / "_latest.parquet").write_bytes(truncated)
+
+    collector = data_collector.WebSocketDataCollector(["BTCUSDT"])
+    collector.orderbook_buffer["BTCUSDT"].append(
+        {"timestamp": 1713265201000, "lastUpdateId": 3, "bids": [["1", "3"]], "asks": [["2", "3"]]}
+    )
+    collector.flush_orderbook_buffer_to_parquet("BTCUSDT")
+
+    corrupt = list(output_dir.glob("_latest.parquet.corrupt-*"))
+    assert len(corrupt) == 1 and corrupt[0].read_bytes() == truncated  # kept for recovery
+    assert pd.read_parquet(output_dir / "_latest.parquet")["lastUpdateId"].tolist() == [3]
+    assert not list(output_dir.glob("*.tmp"))
+
+
+def test_trade_flush_keeps_full_precision_and_bounds_seen_ids(monkeypatch, tmp_path):
+    monkeypatch.setattr(data_collector.WebSocketDataCollector, "load_seen_trade_ids", lambda self, symbol: set())
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "ASTER_data").mkdir()
+    collector = data_collector.WebSocketDataCollector(["DOGEUSDT"])
+    collector.SEEN_TRADE_IDS_PRUNE_AT = 10
+    collector.SEEN_TRADE_IDS_KEEP = 5
+    collector.seen_trade_ids["DOGEUSDT"] = set(range(1, 21))
+    collector.trades_buffer["DOGEUSDT"].append(
+        {"id": 20, "timestamp": 1000, "side": "buy", "price": 0.0000123456, "quantity": 12345.6789012}
+    )
+
+    collector.flush_trades_buffer("DOGEUSDT")
+
+    assert collector.seen_trade_ids["DOGEUSDT"] == {16, 17, 18, 19, 20}
+    row = pd.read_csv(tmp_path / "ASTER_data" / "trades_DOGEUSDT.csv").iloc[0]
+    assert row["price"] == 0.0000123456  # 6-decimal formatting wrote 0.000012
+    assert row["quantity"] == 12345.6789012

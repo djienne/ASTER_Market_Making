@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+from datetime import datetime, timezone
 import pandas as pd
 from pathlib import Path
 import numpy as np
@@ -146,12 +147,36 @@ def get_fallback_tick_size(ticker: str) -> float:
     }
     return tick_sizes.get(ticker, 0.01)
 
-def load_trades_data(csv_path: str) -> pd.DataFrame:
-    """Load and preprocess trades data from a CSV file."""
+def load_trades_data(csv_path: str, lookback_seconds=None) -> pd.DataFrame:
+    """Load and preprocess trades data from a CSV file, optionally keeping only the lookback."""
+    # Ponytail: still parses the whole CSV (it grows ~145k rows/day for ETH);
+    # rotate the CSV daily if this gets slow.
     df = pd.read_csv(csv_path)
+    if lookback_seconds is not None and lookback_seconds > 0 and not df.empty:
+        cutoff_ms = df['unix_timestamp_ms'].max() - int(lookback_seconds * 1000)
+        df = df[df['unix_timestamp_ms'] >= cutoff_ms]
     df['datetime'] = pd.to_datetime(df['unix_timestamp_ms'], unit='ms')
     df = df.set_index('datetime')
     return df
+
+
+_HOURLY_ARCHIVE_MS = 60 * 60 * 1000
+
+
+def _orderbook_file_span_ms(stem):
+    """Return (start_ms, end_ms) for a timestamped orderbook parquet stem, else None.
+
+    Legacy archives are named by a millisecond stamp; current archives by the
+    UTC hour bucket they hold (data_collector: '%Y%m%dT%H0000Z').
+    """
+    if stem.isdigit():
+        return int(stem), int(stem)
+    try:
+        start = datetime.strptime(stem, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    start_ms = int(start.timestamp() * 1000)
+    return start_ms, start_ms + _HOURLY_ARCHIVE_MS
 
 
 def select_recent_orderbook_parquet_files(parquet_files, lookback_seconds=None):
@@ -165,19 +190,20 @@ def select_recent_orderbook_parquet_files(parquet_files, lookback_seconds=None):
         if stem == "_latest":
             latest_files.append(file_path)
             continue
-        if stem.isdigit():
-            timestamped_files.append((int(stem), file_path))
+        span = _orderbook_file_span_ms(stem)
+        if span is not None:
+            timestamped_files.append((span, file_path))
             continue
         passthrough_files.append(file_path)
 
     timestamped_files.sort(key=lambda item: item[0])
     if lookback_seconds is not None and lookback_seconds > 0 and timestamped_files:
-        latest_timestamp_ms = timestamped_files[-1][0]
-        earliest_timestamp_ms = latest_timestamp_ms - int(lookback_seconds * 1000)
+        reference_ms = max(end_ms for (_, end_ms), _ in timestamped_files)
+        earliest_timestamp_ms = reference_ms - int(lookback_seconds * 1000)
         timestamped_files = [
-            (timestamp_ms, file_path)
-            for timestamp_ms, file_path in timestamped_files
-            if timestamp_ms >= earliest_timestamp_ms
+            (span, file_path)
+            for span, file_path in timestamped_files
+            if span[1] >= earliest_timestamp_ms
         ]
 
     return passthrough_files + [file_path for _, file_path in timestamped_files] + latest_files

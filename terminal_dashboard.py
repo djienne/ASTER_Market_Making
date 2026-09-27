@@ -29,6 +29,8 @@ STABLE_ASSETS = ("USDT", "USDC", "USDF")
 MAX_ORDER_EVENTS = 4
 REST_REFRESH_INTERVAL = 15
 MARK_STREAM_RETRY = 3
+USER_STREAM_RETRY = 5
+LISTEN_KEY_KEEPALIVE_INTERVAL = 30 * 60  # listen keys expire after 60 min without a keepalive
 SPOT_REFRESH_INTERVAL = 10
 SPOT_BASE_ASSET = "USDT"
 SPOT_USD_RATE = Decimal("1")
@@ -1135,9 +1137,31 @@ class TerminalDashboard:
                 await asyncio.sleep(MARK_STREAM_RETRY)
         self.last_reason = "Mark stream stopped"
 
-    async def stream(self, ws_url: str) -> None:
+    async def stream(self, client: ApiClient) -> None:
+        """User data stream; reconnects with a fresh listen key after any close,
+        expiry or error (the server also drops every connection at 24h)."""
+        while not self.stop_event.is_set():
+            await self._stream_once(client)
+            if not self.stop_event.is_set():
+                await asyncio.sleep(USER_STREAM_RETRY)
+
+    async def listen_key_keepalive(self, client: ApiClient) -> None:
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=LISTEN_KEY_KEEPALIVE_INTERVAL)
+            except asyncio.TimeoutError:
+                try:
+                    await client.keepalive_listen_key()
+                except Exception as exc:
+                    logging.getLogger("TerminalDashboard").warning("Listen key keepalive failed: %s", exc)
+
+    async def _stream_once(self, client: ApiClient) -> None:
         try:
-            async with websockets.connect(ws_url) as ws:
+            response = await client.create_listen_key()
+            listen_key = response.get("listenKey")
+            if not listen_key:
+                raise aiohttp.ClientError(f"no listenKey in response: {response}")
+            async with websockets.connect(f"wss://fstream.asterdex.com/ws/{listen_key}") as ws:
                 self.render("CONNECTED")
                 while not self.stop_event.is_set():
                     try:
@@ -1236,23 +1260,25 @@ async def run_dashboard(args: argparse.Namespace) -> None:
         spot_fetcher=spot_fetcher,
     )
 
+    # The client stays open for the dashboard's lifetime: the user stream
+    # needs it for listen-key keepalives and reconnects.
     async with ApiClient(api_user, api_signer, api_private_key) as client:
         snapshot = await client.signed_request("GET", "/fapi/v3/account", {})
         dashboard.update_from_snapshot(snapshot)
-        response = await client.create_listen_key()
-        listen_key = response.get("listenKey")
-        if not listen_key:
-            print("ERROR: Failed to retrieve listenKey from API response")
-            return
+        await _run_dashboard_tasks(dashboard, client, stop_event, args)
 
-    ws_url = f"wss://fstream.asterdex.com/ws/{listen_key}"
 
-    refresh_task = asyncio.create_task(dashboard.periodic_refresh())
-    mark_task = asyncio.create_task(dashboard.mark_price_listener())
-    stream_task = asyncio.create_task(dashboard.stream(ws_url))
-    spot_task = asyncio.create_task(dashboard.spot_balance_worker())
-
-    tasks = {refresh_task, mark_task, stream_task, spot_task}
+async def _run_dashboard_tasks(dashboard, client, stop_event, args) -> None:
+    tasks = {
+        asyncio.create_task(dashboard.periodic_refresh()),
+        asyncio.create_task(dashboard.mark_price_listener()),
+        asyncio.create_task(dashboard.stream(client)),
+        asyncio.create_task(dashboard.listen_key_keepalive(client)),
+    }
+    # spot_balance_worker returns at once without spot keys; in the
+    # FIRST_COMPLETED set below that would shut the whole dashboard down.
+    if dashboard.spot_fetcher:
+        tasks.add(asyncio.create_task(dashboard.spot_balance_worker()))
     if args.duration > 0:
         duration_task = asyncio.create_task(asyncio.sleep(args.duration))
         tasks.add(duration_task)

@@ -238,7 +238,9 @@ def perform_grid_search(symbol, interval):
         last_timestamp = int(all_klines[-1][0])
         print(f"Fetching new candles since {pd.to_datetime(last_timestamp, unit='ms')}...")
         while True:
-            params = {'symbol': symbol, 'interval': interval, 'limit': limit, 'startTime': last_timestamp + 1}
+            # Start AT the last cached candle: it was usually still open when cached,
+            # and drop_duplicates(keep='last') below replaces it with the closed one.
+            params = {'symbol': symbol, 'interval': interval, 'limit': limit, 'startTime': last_timestamp}
             new_klines = _fetch_with_backoff(endpoint, params)
             if new_klines:
                 print(f"Fetched {len(new_klines)} new candles.")

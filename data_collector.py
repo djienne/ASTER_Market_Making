@@ -42,6 +42,10 @@ class WebSocketDataCollector:
         self.ping_timeout = 15
         self.ping_interval = 30
         self.ORDERBOOK_BUFFER_SIZE_LIMIT = 50000
+        # Trade ids are monotonic per symbol: once the dedup set passes PRUNE_AT,
+        # keep only the newest KEEP ids (bounded memory in the 1g container).
+        self.SEEN_TRADE_IDS_PRUNE_AT = 200_000
+        self.SEEN_TRADE_IDS_KEEP = 100_000
 
         # Data buffers
         self.prices_buffer = {}  # symbol -> deque of price records (bid/ask/mid)
@@ -410,7 +414,7 @@ class WebSocketDataCollector:
                         record['timestamp'],
                         record['bid'],
                         record['ask'],
-                        f"{record['mid']:.6f}"
+                        record['mid'],  # full float precision (6 decimals truncated low-priced symbols)
                     ])
                     count += 1
 
@@ -471,7 +475,15 @@ class WebSocketDataCollector:
             df = pd.concat([existing_df, df], ignore_index=True)
 
         df = self._normalize_orderbook_frame(df)
-        df.to_parquet(archive_file_path, engine='pyarrow', compression='ZSTD')
+        self._write_parquet_atomic(df, archive_file_path)
+
+    @staticmethod
+    def _write_parquet_atomic(df, file_path):
+        """Write to a temp file then os.replace, so a crash mid-write never
+        leaves a truncated parquet that the next flush would overwrite."""
+        tmp_path = f"{file_path}.tmp"
+        df.to_parquet(tmp_path, engine='pyarrow', compression='ZSTD')
+        os.replace(tmp_path, file_path)
 
     def _read_orderbook_parquet(self, file_path):
         """Read an order book parquet file if it exists."""
@@ -481,7 +493,14 @@ class WebSocketDataCollector:
         try:
             return pd.read_parquet(file_path, engine='pyarrow')
         except Exception as e:
-            print(f"Warning: Could not read order book parquet {file_path}: {e}")
+            # Keep the unreadable file for manual recovery instead of letting
+            # the next write silently overwrite whatever data it still holds.
+            corrupt_path = f"{file_path}.corrupt-{int(time.time())}"
+            print(f"Warning: Could not read order book parquet {file_path}: {e}. Moved to {corrupt_path}")
+            try:
+                os.replace(file_path, corrupt_path)
+            except OSError as move_error:
+                print(f"Warning: Could not move unreadable parquet {file_path}: {move_error}")
             return pd.DataFrame()
 
     def flush_orderbook_buffer_to_parquet(self, symbol, force_archive=False):
@@ -547,7 +566,7 @@ class WebSocketDataCollector:
                 return
 
             latest_df = self._normalize_orderbook_frame(latest_df)
-            latest_df.to_parquet(staging_file_path, engine='pyarrow', compression='ZSTD')
+            self._write_parquet_atomic(latest_df, staging_file_path)
             self.orderbook_buffer[symbol] = deque(latest_df.to_dict('records'))
             print(f"Flushed {len(latest_df)} partial order book records for {symbol} to {staging_file_path}")
             print(f"Flushed {len(latest_df)} partial order book records to staging file for {symbol}")
@@ -573,16 +592,27 @@ class WebSocketDataCollector:
                         record['id'],
                         record['timestamp'],
                         record['side'],
-                        f"{record['price']:.6f}",
-                        f"{record['quantity']:.6f}"
+                        record['price'],
+                        record['quantity'],
                     ])
                     count += 1
 
                 if count > 0:
                     print(f"Flushed {count} trade records for {symbol}")
 
+            self._prune_seen_trade_ids(symbol)
+
         except Exception as e:
             print(f"Error flushing trades for {symbol}: {e}")
+
+    def _prune_seen_trade_ids(self, symbol):
+        """Bound the dedup set (caller holds self.lock). O(n), runs at most
+        once per ~100k new trades."""
+        seen = self.seen_trade_ids[symbol]
+        if len(seen) <= self.SEEN_TRADE_IDS_PRUNE_AT:
+            return
+        cutoff = max(seen) - self.SEEN_TRADE_IDS_KEEP
+        self.seen_trade_ids[symbol] = {trade_id for trade_id in seen if trade_id > cutoff}
 
     def start_flush_thread(self):
         """Start the buffer flush thread."""

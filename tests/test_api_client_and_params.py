@@ -221,20 +221,28 @@ def test_calculate_vwap_uses_true_execution_price():
     assert abs(first_level_vwap - 100.0) < 1e-9
 
 
-def test_select_recent_orderbook_parquet_files_prefers_recent_history():
-    files = [
-        r"C:\tmp\1000.parquet",
-        r"C:\tmp\2000.parquet",
-        r"C:\tmp\3000.parquet",
-        r"C:\tmp\_latest.parquet",
-    ]
+def test_select_recent_orderbook_parquet_files_prefers_recent_history(tmp_path):
+    path = lambda name: str(tmp_path / name)  # native separators on every OS
+    files = [path("1000.parquet"), path("2000.parquet"), path("3000.parquet"), path("_latest.parquet")]
 
     selected = utils.select_recent_orderbook_parquet_files(files, lookback_seconds=1.2)
 
-    assert r"C:\tmp\1000.parquet" not in selected
-    assert r"C:\tmp\2000.parquet" in selected
-    assert r"C:\tmp\3000.parquet" in selected
-    assert selected[-1] == r"C:\tmp\_latest.parquet"
+    assert path("1000.parquet") not in selected
+    assert path("2000.parquet") in selected
+    assert path("3000.parquet") in selected
+    assert selected[-1] == path("_latest.parquet")
+
+
+def test_select_recent_orderbook_parquet_files_filters_hourly_archives(tmp_path):
+    # data_collector names archives by UTC hour bucket; each holds [start, start + 1h).
+    path = lambda name: str(tmp_path / name)
+    hours = ["20240416T060000Z", "20240416T080000Z", "20240416T090000Z", "20240416T100000Z"]
+    files = [path(f"{h}.parquet") for h in hours] + [path("_latest.parquet")]
+
+    # Newest archive ends 11:00; a 1.5h lookback reaches back to 09:30.
+    selected = utils.select_recent_orderbook_parquet_files(files, lookback_seconds=1.5 * 3600)
+
+    assert selected == [path("20240416T090000Z.parquet"), path("20240416T100000Z.parquet"), path("_latest.parquet")]
 
 
 def test_save_avellaneda_params_rejects_payloads_missing_runtime_fields(monkeypatch, tmp_path):
@@ -257,3 +265,14 @@ def test_save_avellaneda_params_rejects_payloads_missing_runtime_fields(monkeypa
 
     assert utils.save_avellaneda_params_atomic(invalid_payload, "BTC") is False
     assert not any(Path(tmp_path).glob("*.json"))
+
+
+def test_load_trades_data_keeps_only_the_lookback(tmp_path):
+    csv_path = tmp_path / "trades.csv"
+    rows = ["id,unix_timestamp_ms,side,price,quantity"]
+    rows += [f"{i},{i * 60_000},buy,100.0,1.0" for i in range(100)]  # one trade per minute
+    csv_path.write_text("\n".join(rows) + "\n")
+
+    df = utils.load_trades_data(str(csv_path), lookback_seconds=10 * 60)
+
+    assert list(df["id"]) == list(range(89, 100))  # newest trade at 99 min, cutoff 89 min

@@ -438,7 +438,7 @@ def main():
     try:
         raw_ob_df, processed_ob_df = load_and_process_orderbook_data(ticker, lookback_seconds=lookback_seconds)
         trades_csv_path, resolved_trade_symbol = resolve_trades_csv_path(ticker)
-        trades_df = load_trades_data(str(trades_csv_path))
+        trades_df = load_trades_data(str(trades_csv_path), lookback_seconds=lookback_seconds)
     except (FileNotFoundError, ValueError) as e:
         print(f"Error loading data: {e}. Exiting.")
         sys.exit(1)
