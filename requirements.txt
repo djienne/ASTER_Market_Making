@@ -9,6 +9,7 @@ numba==0.65.0
 numpy==2.4.4
 orjson==3.11.8
 pandas==3.0.2
+pycares==4.11.0
 pyarrow==23.0.1
 python-dotenv==1.2.2
 requests==2.33.1

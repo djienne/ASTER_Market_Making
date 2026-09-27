@@ -1,0 +1,11 @@
+# Never bake credentials, history, or collected data into the image.
+# Runtime still gets .env via docker-compose env_file and the ./:/app bind mount.
+.env
+.git
+ASTER_data/
+params/
+*.log*
+__pycache__/
+**/__pycache__/
+realized_pnl.json
+.claude/

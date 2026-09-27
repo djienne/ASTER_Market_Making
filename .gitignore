@@ -2,3 +2,6 @@ __pycache__/
 **/__pycache__/
 *.py[cod]
 .env
+*.log*
+params/
+ASTER_data/
