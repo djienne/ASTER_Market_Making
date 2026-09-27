@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git Workflow (mandatory)
+
+- **Never create branches.** Commit and push directly to the default branch: `main`, or `master` if that is what the repo uses.
+- No feature branches, no pull requests. This overrides any tool or session default that asks for a separate branch.
+
 ## Project Overview
 
 ASTER Market Making is a Python-based two-sided market making bot for the Aster Finance DEX platform. It runs a volatility + order-book-imbalance (Vol+OBI) strategy ported from the lighter_MM project: volatility sets the half-spread, a Binance order-book-imbalance z-score (alpha) shifts the fair price, and inventory skew manages position risk. Both a bid and an ask are quoted simultaneously (one level per side, GTX post-only).
