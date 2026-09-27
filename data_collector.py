@@ -7,12 +7,10 @@ import csv
 import argparse
 import signal
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 import pandas as pd
-from utils import configured_symbol, load_project_env
-
-load_project_env()
+from utils import configured_symbol
 
 def _default_markets():
     raw_symbols = os.getenv("SYMBOLS") or configured_symbol()
@@ -50,7 +48,7 @@ class WebSocketDataCollector:
         self.orderbook_staging_recovered = {}  # symbol -> whether `_latest.parquet` has been merged after startup
 
         # Thread management
-        self.flush_thread = None
+        self.combined_ws = None
         self.lock = threading.Lock()
 
         # Initialize buffers and load existing trade IDs
@@ -181,102 +179,82 @@ class WebSocketDataCollector:
             print(f"Error getting initial trades for {symbol}: {e}")
             return []
 
-    def on_depth_message(self, ws, message):
-        """Handle partial depth WebSocket messages."""
-        try:
-            data = json.loads(message)
+    def on_depth_event(self, data):
+        """Buffer a partial-depth event (price record + top-N order book snapshot)."""
+        if data.get('e') == 'depthUpdate' and ('b' in data and 'a' in data):
+            symbol = data.get('s')
+            if symbol not in self.symbols:
+                return
 
-            if data.get('e') == 'depthUpdate' and ('b' in data and 'a' in data):
-                symbol = data.get('s')
-                if symbol not in self.symbols:
+            bids = data.get('b', [])
+            asks = data.get('a', [])
+
+            if bids and asks:
+                # Use event time from WebSocket message (in ms)
+                timestamp = self._coerce_timestamp_ms(data.get('E'))
+                if timestamp is None:
                     return
 
-                bids = data.get('b', [])
-                asks = data.get('a', [])
+                # Process bids and asks up to the specified levels
+                processed_bids = [[float(bid[0]), float(bid[1])] for bid in bids[:self.order_book_levels] if len(bid) >= 2]
+                processed_asks = [[float(ask[0]), float(ask[1])] for ask in asks[:self.order_book_levels] if len(ask) >= 2]
 
-                if bids and asks:
-                    # Use event time from WebSocket message (in ms)
-                    timestamp = self._coerce_timestamp_ms(data.get('E'))
-                    if timestamp is None:
-                        return
+                # Get best bid and ask for price record
+                if processed_bids and processed_asks:
+                    best_bid = processed_bids[0][0]
+                    best_ask = processed_asks[0][0]
+                    mid = (best_bid + best_ask) / 2
 
-                    # Process bids and asks up to the specified levels
-                    processed_bids = [[float(bid[0]), float(bid[1])] for bid in bids[:self.order_book_levels] if len(bid) >= 2]
-                    processed_asks = [[float(ask[0]), float(ask[1])] for ask in asks[:self.order_book_levels] if len(ask) >= 2]
+                    # Store simple price data (for compatibility)
+                    price_record = {
+                        'timestamp': timestamp,
+                        'bid': best_bid,
+                        'ask': best_ask,
+                        'mid': mid
+                    }
 
-                    # Get best bid and ask for price record
-                    if processed_bids and processed_asks:
-                        best_bid = processed_bids[0][0]
-                        best_ask = processed_asks[0][0]
-                        mid = (best_bid + best_ask) / 2
-
-                        # Store simple price data (for compatibility)
-                        price_record = {
-                            'timestamp': timestamp,
-                            'bid': best_bid,
-                            'ask': best_ask,
-                            'mid': mid
-                        }
-
-                        # Store partial order book data from the top N levels only
-                        orderbook_record = {
-                            'timestamp': timestamp,
-                            'bids': processed_bids,
-                            'asks': processed_asks,
-                            'lastUpdateId': data.get('u'),  # final update ID for this partial snapshot
-                            'bookMode': 'partial',
-                            'levels': self.order_book_levels,
-                        }
-
-                        with self.lock:
-                            self.prices_buffer[symbol].append(price_record)
-                            self.orderbook_buffer[symbol].append(orderbook_record)
-
-        except json.JSONDecodeError:
-            pass
-        except Exception as e:
-            print(f"Error processing depth message: {e}")
-
-    def on_trades_message(self, ws, message):
-        """Handle raw trade or aggregate trade WebSocket messages."""
-        try:
-            data = json.loads(message)
-
-            event_type = data.get('e')
-            if event_type in {'trade', 'aggTrade'}:
-                symbol = data.get('s')
-                if symbol not in self.symbols:
-                    return
-
-                if event_type == 'trade':
-                    trade_id = data.get('t')
-                else:
-                    trade_id = data.get('a')
-
-                price = float(data.get('p', 0))
-                quantity = float(data.get('q', 0))
-                trade_time = data.get('T')
-                is_buyer_maker = data.get('m', False)
-
-                if trade_id not in self.seen_trade_ids[symbol]:
-                    side = "sell" if is_buyer_maker else "buy"
-
-                    trade_record = {
-                        'id': trade_id,
-                        'timestamp': trade_time,
-                        'side': side,
-                        'price': price,
-                        'quantity': quantity
+                    # Store partial order book data from the top N levels only
+                    orderbook_record = {
+                        'timestamp': timestamp,
+                        'bids': processed_bids,
+                        'asks': processed_asks,
+                        'lastUpdateId': data.get('u'),  # final update ID for this partial snapshot
+                        'bookMode': 'partial',
+                        'levels': self.order_book_levels,
                     }
 
                     with self.lock:
-                        self.trades_buffer[symbol].append(trade_record)
-                        self.seen_trade_ids[symbol].add(trade_id)
+                        self.prices_buffer[symbol].append(price_record)
+                        self.orderbook_buffer[symbol].append(orderbook_record)
 
-        except json.JSONDecodeError:
-            pass
-        except Exception as e:
-            print(f"Error processing trades message: {e}")
+    def on_trade_event(self, data):
+        """Buffer a raw @trade event (deduplicated by trade id)."""
+        if data.get('e') == 'trade':
+            symbol = data.get('s')
+            if symbol not in self.symbols:
+                return
+
+            trade_id = data.get('t')
+
+            price = float(data.get('p', 0))
+            quantity = float(data.get('q', 0))
+            trade_time = data.get('T')
+            is_buyer_maker = data.get('m', False)
+
+            if trade_id not in self.seen_trade_ids[symbol]:
+                side = "sell" if is_buyer_maker else "buy"
+
+                trade_record = {
+                    'id': trade_id,
+                    'timestamp': trade_time,
+                    'side': side,
+                    'price': price,
+                    'quantity': quantity
+                }
+
+                with self.lock:
+                    self.trades_buffer[symbol].append(trade_record)
+                    self.seen_trade_ids[symbol].add(trade_id)
 
     def on_error(self, ws, error):
         """Handle WebSocket errors."""
@@ -291,14 +269,8 @@ class WebSocketDataCollector:
     def create_combined_stream_url(self):
         """Create combined stream URL for all symbols."""
         # Use appropriate depth stream based on order book levels
-        if self.order_book_levels <= 5:
-            depth_suffix = "depth5"
-        elif self.order_book_levels <= 10:
-            depth_suffix = "depth10"
-        elif self.order_book_levels <= 20:
-            depth_suffix = "depth20"
-        else:
-            depth_suffix = "depth20"  # Max available via WebSocket
+        # depth20 is the deepest partial-book stream available
+        depth_suffix = "depth5" if self.order_book_levels <= 5 else "depth10" if self.order_book_levels <= 10 else "depth20"
 
         depth_streams = [f"{symbol.lower()}@{depth_suffix}" for symbol in self.symbols]
         trade_streams = [f"{symbol.lower()}@trade" for symbol in self.symbols]
@@ -316,11 +288,9 @@ class WebSocketDataCollector:
             stream_data = data.get('data', {})
 
             if '@depth' in stream_name:
-                # Process as depth message
-                self.on_depth_message(None, json.dumps(stream_data))
-            elif '@trade' in stream_name or '@aggTrade' in stream_name:
-                # Process as trade message
-                self.on_trades_message(None, json.dumps(stream_data))
+                self.on_depth_event(stream_data)
+            elif '@trade' in stream_name:
+                self.on_trade_event(stream_data)
 
         except json.JSONDecodeError:
             pass
@@ -382,33 +352,27 @@ class WebSocketDataCollector:
                 if self.trades_buffer[symbol]:
                     self.flush_trades_buffer(symbol)
 
-    def flush_prices_buffer(self, symbol):
-        """Flush price buffer for a specific symbol."""
-        file_path = os.path.join('ASTER_data', f'prices_{symbol}.csv')
-        file_exists = os.path.isfile(file_path)
-
+    def _flush_csv(self, file_name, header, buffer, row_of):
+        """Append buffered records to ASTER_data/<file_name>, then clear the buffer."""
+        if not buffer:
+            return
+        file_path = os.path.join('ASTER_data', file_name)
+        rows = [row_of(record) for record in buffer]
         try:
+            new_file = not os.path.isfile(file_path)
             with open(file_path, 'a', newline='') as csvfile:
                 writer = csv.writer(csvfile)
-                if not file_exists:
-                    writer.writerow(['unix_timestamp_ms', 'bid', 'ask', 'mid'])
-
-                count = 0
-                while self.prices_buffer[symbol]:
-                    record = self.prices_buffer[symbol].popleft()
-                    writer.writerow([
-                        record['timestamp'],
-                        record['bid'],
-                        record['ask'],
-                        record['mid'],  # full float precision (6 decimals truncated low-priced symbols)
-                    ])
-                    count += 1
-
-                if count > 0:
-                    print(f"Flushed {count} price records for {symbol}")
-
+                if new_file:
+                    writer.writerow(header)
+                writer.writerows(rows)  # floats at full precision (6 decimals truncated low-priced symbols)
+            buffer.clear()
+            print(f"Flushed {len(rows)} records to {file_name}")
         except Exception as e:
-            print(f"Error flushing prices for {symbol}: {e}")
+            print(f"Error flushing {file_name}: {e}")
+
+    def flush_prices_buffer(self, symbol):
+        self._flush_csv(f'prices_{symbol}.csv', ['unix_timestamp_ms', 'bid', 'ask', 'mid'], self.prices_buffer[symbol],
+                        lambda r: [r['timestamp'], r['bid'], r['ask'], r['mid']])
 
     def _coerce_timestamp_ms(self, value):
         """Convert exchange timestamps to millisecond integers when possible."""
@@ -451,7 +415,7 @@ class WebSocketDataCollector:
 
     def _orderbook_archive_path(self, output_dir, hour_bucket_ms):
         """Build a deterministic parquet filename for a UTC hour bucket."""
-        hour_label = datetime.utcfromtimestamp(hour_bucket_ms / 1000).strftime('%Y%m%dT%H0000Z')
+        hour_label = datetime.fromtimestamp(hour_bucket_ms / 1000, timezone.utc).strftime('%Y%m%dT%H0000Z')
         return os.path.join(output_dir, f'{hour_label}.parquet')
 
     def _write_orderbook_archive(self, archive_file_path, df):
@@ -551,45 +515,18 @@ class WebSocketDataCollector:
                 print(f"No in-progress hourly order book staging file remains for {symbol}")
                 return
 
-            latest_df = self._normalize_orderbook_frame(latest_df)
             self._write_parquet_atomic(latest_df, staging_file_path)
             self.orderbook_buffer[symbol] = deque(latest_df.to_dict('records'))
             print(f"Flushed {len(latest_df)} partial order book records for {symbol} to {staging_file_path}")
-            print(f"Flushed {len(latest_df)} partial order book records to staging file for {symbol}")
 
         except Exception as e:
             print(f"Error flushing partial order book for {symbol} to Parquet: {e}")
 
     def flush_trades_buffer(self, symbol):
-        """Flush trades buffer for a specific symbol."""
-        file_path = os.path.join('ASTER_data', f'trades_{symbol}.csv')
-        file_exists = os.path.isfile(file_path)
-
-        try:
-            with open(file_path, 'a', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                if not file_exists:
-                    writer.writerow(['id', 'unix_timestamp_ms', 'side', 'price', 'quantity'])
-
-                count = 0
-                while self.trades_buffer[symbol]:
-                    record = self.trades_buffer[symbol].popleft()
-                    writer.writerow([
-                        record['id'],
-                        record['timestamp'],
-                        record['side'],
-                        record['price'],
-                        record['quantity'],
-                    ])
-                    count += 1
-
-                if count > 0:
-                    print(f"Flushed {count} trade records for {symbol}")
-
-            self._prune_seen_trade_ids(symbol)
-
-        except Exception as e:
-            print(f"Error flushing trades for {symbol}: {e}")
+        self._flush_csv(f'trades_{symbol}.csv', ['id', 'unix_timestamp_ms', 'side', 'price', 'quantity'],
+                        self.trades_buffer[symbol],
+                        lambda r: [r['id'], r['timestamp'], r['side'], r['price'], r['quantity']])
+        self._prune_seen_trade_ids(symbol)
 
     def _prune_seen_trade_ids(self, symbol):
         """Bound the dedup set (caller holds self.lock). O(n), runs at most
@@ -610,8 +547,7 @@ class WebSocketDataCollector:
                 except Exception as e:
                     print(f"Error flushing buffers: {e}")
 
-        self.flush_thread = threading.Thread(target=flush_worker, daemon=True)
-        self.flush_thread.start()
+        threading.Thread(target=flush_worker, daemon=True).start()
         print(f"Started buffer flush thread (interval: {self.flush_interval}s)")
 
     def collect_initial_data(self):
@@ -674,7 +610,7 @@ class WebSocketDataCollector:
         print("Stopping data collector...")
         self.should_reconnect = False
 
-        if hasattr(self, 'combined_ws') and self.combined_ws:
+        if self.combined_ws:
             self.combined_ws.close()
 
         # Final flush to save any remaining data

@@ -12,11 +12,12 @@ def make_client():
     )
 
 
-def test_prepare_request_does_not_mutate_input_params():
+def test_signing_does_not_mutate_input_params():
     client = make_client()
     params = {"symbol": "BTCUSDT"}
 
-    request_params, headers = client._prepare_request(params)
+    request_params = asyncio.run(client._sign_async(params))
+    headers = client._build_headers()
 
     assert params == {"symbol": "BTCUSDT"}
     assert request_params["symbol"] == "BTCUSDT"

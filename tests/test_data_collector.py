@@ -1,5 +1,3 @@
-import json
-
 import data_collector
 import pandas as pd
 
@@ -18,7 +16,7 @@ def test_on_trades_message_dedupes_raw_trade_ids(monkeypatch):
     monkeypatch.setattr(data_collector.WebSocketDataCollector, "load_seen_trade_ids", lambda self, symbol: set())
     collector = data_collector.WebSocketDataCollector(["BTCUSDT"])
 
-    message = json.dumps(
+    event = (
         {
             "e": "trade",
             "s": "BTCUSDT",
@@ -30,8 +28,8 @@ def test_on_trades_message_dedupes_raw_trade_ids(monkeypatch):
         }
     )
 
-    collector.on_trades_message(None, message)
-    collector.on_trades_message(None, message)
+    collector.on_trade_event(event)
+    collector.on_trade_event(event)
 
     assert len(collector.trades_buffer["BTCUSDT"]) == 1
     record = collector.trades_buffer["BTCUSDT"][0]

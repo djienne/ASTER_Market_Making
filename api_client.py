@@ -7,10 +7,7 @@ from decimal import Decimal
 
 import aiohttp
 from eth_account import Account
-try:
-    from eth_account.messages import encode_typed_data as _encode_typed_message
-except ImportError:  # pragma: no cover - compatibility path
-    from eth_account.messages import encode_structured_data as _encode_typed_message
+from eth_account.messages import encode_typed_data
 from web3 import Web3
 
 
@@ -53,7 +50,7 @@ class ApiClient:
     handling session management and request signing.
     """
 
-    def __init__(self, api_user, api_signer, api_private_key, release_mode=True):
+    def __init__(self, api_user, api_signer, api_private_key):
         if not api_user or not Web3.is_address(api_user):
             raise ValueError("API_USER is missing or not a valid Ethereum address.")
         if not api_signer or not Web3.is_address(api_signer):
@@ -64,7 +61,6 @@ class ApiClient:
         self.api_user = api_user
         self.api_signer = api_signer
         self.api_private_key = api_private_key
-        self.release_mode = release_mode
 
         self.base_url = "https://fapi.asterdex.com"
         self.session = None
@@ -107,24 +103,9 @@ class ApiClient:
             "domain": _EIP712_DOMAIN,
             "message": {"msg": payload},
         }
-        try:
-            signable_msg = _encode_typed_message(full_message=typed_data)
-        except TypeError:
-            signable_msg = _encode_typed_message(typed_data)
+        signable_msg = encode_typed_data(full_message=typed_data)
         signed_message = Account.sign_message(signable_msg, private_key=self.api_private_key)
         return signed_message.signature.hex()
-
-    def _sign(self, params):
-        """Synchronous sign path. Kept for callers outside the hot path
-        (e.g., get_my_trading_volume.py, direct test invocation)."""
-        my_dict = {k: v for k, v in params.items() if v is not None}
-        my_dict["nonce"] = str(self._next_nonce())
-        my_dict["user"] = self.api_user
-        my_dict["signer"] = self.api_signer
-        _trim_dict(my_dict)
-        payload = urllib.parse.urlencode(my_dict)
-        my_dict['signature'] = self._sign_payload(payload)
-        return my_dict
 
     async def _sign_async(self, params):
         """Async sign path. Generates the nonce on the event loop (so ordering
@@ -149,18 +130,6 @@ class ApiClient:
             'Content-Type': 'application/x-www-form-urlencoded',
             'User-Agent': 'PythonApp/1.0',
         }
-
-    def _prepare_request(self, params: dict = None):
-        clean_params = dict(params or {})
-        request_params = self._sign(clean_params)
-        headers = self._build_headers()
-        return request_params, headers
-
-    async def _prepare_request_async(self, params: dict = None):
-        clean_params = dict(params or {})
-        request_params = await self._sign_async(clean_params)
-        headers = self._build_headers()
-        return request_params, headers
 
     async def _request_json(self, method: str, url: str, request_params: dict, headers: dict):
         request_specs = {
@@ -230,8 +199,8 @@ class ApiClient:
     async def signed_request(self, method: str, endpoint: str, params: dict = None):
         """Generic method for making signed requests to the Pro API V3."""
         url = f"{self.base_url}{endpoint}"
-        request_params, headers = await self._prepare_request_async(params)
-        return await self._request_json(method, url, request_params, headers)
+        request_params = await self._sign_async(dict(params or {}))
+        return await self._request_json(method, url, request_params, self._build_headers())
 
     async def place_order(self, symbol, price, quantity, side, reduce_only=False):
         """Place a limit post-only order using Ethereum signature auth."""
