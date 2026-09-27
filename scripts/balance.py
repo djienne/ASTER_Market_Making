@@ -2,16 +2,14 @@ import asyncio
 import os
 import sys
 
-from dotenv import load_dotenv
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root for api_client
+import utils  # noqa: E402,F401  (loads aster.env and runtime.env)
 from api_client import ApiClient  # noqa: E402
 
 async def main():
     """
     Manual live utility: fetch and print the current USDT wallet snapshot.
     """
-    load_dotenv()
     API_USER = os.getenv("API_USER")
     API_SIGNER = os.getenv("API_SIGNER")
     API_PRIVATE_KEY = os.getenv("API_PRIVATE_KEY")

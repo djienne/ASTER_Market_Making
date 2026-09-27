@@ -6,7 +6,7 @@ Places a REAL order on the live exchange (then cancels it): the minimum
 size, --away-bps (default 100 = 1%) behind the touch on the passive side, so
 it only fills if price moves that far during the ~2 s it rests. Keep
 --away-bps inside the symbol's PERCENT_PRICE band (ETH/BTC: 2%).
-Needs .env credentials.
+Needs aster.env credentials.
 """
 import argparse
 import asyncio
@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
 
-import utils  # noqa: E402,F401  (loads .env and runtime.env)
+import utils  # noqa: E402,F401  (loads aster.env and runtime.env)
 from api_client import ApiClient  # noqa: E402
 from market_maker import round_price_to_tick  # noqa: E402
 

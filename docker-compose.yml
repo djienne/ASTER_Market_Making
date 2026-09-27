@@ -35,7 +35,7 @@ services:
     container_name: aster_market_maker
     stop_grace_period: 45s
     env_file:
-      - .env
+      - aster.env
       - runtime.env
     environment:
       - PYTHONUNBUFFERED=1

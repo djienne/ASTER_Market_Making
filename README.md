@@ -40,7 +40,7 @@ python data_collector.py
 
 ## Configuration
 
-### `.env`
+### `aster.env`
 
 You only need Aster **Pro API V3** credentials for live trading, account/user-data REST calls, and user-data listen-key management. The public `data_collector.py` flow does not require those credentials.
 
@@ -142,7 +142,7 @@ python data_collector.py
 ## Docker
 
 The Compose stack in [docker-compose.yml](docker-compose.yml):
-- `market-maker` is self-contained: it only needs `.env` credentials and Binance/Aster WebSocket connectivity, then begins quoting once the Vol+OBI signal has warmed up (about 10-60 seconds)
+- `market-maker` is self-contained: it only needs `aster.env` credentials and Binance/Aster WebSocket connectivity, then begins quoting once the Vol+OBI signal has warmed up (about 10-60 seconds)
 - `data-collector` is an optional service in the `analytics` profile; the live bot does not read its output, and `docker compose up -d` does not start it (use `docker compose --profile analytics up -d`)
 
 ```bash
@@ -152,7 +152,7 @@ docker compose logs -f market-maker
 docker compose down
 ```
 
-If you only want background market-data collection, `docker compose up -d data-collector` does not require a `.env` file or live credentials. Change `runtime.env` to switch the collected symbol, and use `.env` only for real API credentials.
+If you only want background market-data collection, `docker compose up -d data-collector` does not require a `aster.env` file or live credentials. Change `runtime.env` to switch the collected symbol, and use `aster.env` only for real API credentials.
 
 ## Testing
 

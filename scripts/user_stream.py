@@ -3,7 +3,7 @@
     python scripts/user_stream.py --seconds 120
 
 Exercises the whole Pro API V3 path the bot uses: signed listen-key request,
-user stream connection, keepalive. Needs .env credentials.
+user stream connection, keepalive. Needs aster.env credentials.
 
 The listen key is shared per account (a running bot uses the same one), so
 it is deliberately NOT closed on exit; it simply expires 60 min after the
@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 
 import websockets  # noqa: E402
 
-import utils  # noqa: E402,F401  (loads .env and runtime.env)
+import utils  # noqa: E402,F401  (loads aster.env and runtime.env)
 from api_client import ApiClient  # noqa: E402
 
 KEEPALIVE_SECONDS = 30 * 60

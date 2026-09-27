@@ -16,8 +16,8 @@ from typing import Dict, Optional
 import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosedOK
-from dotenv import load_dotenv
 
+import utils
 from api_client import ApiClient
 
 STABLE_ASSETS = ("USDT", "USDC", "USDF")
@@ -712,7 +712,7 @@ async def run_dashboard(args: argparse.Namespace) -> None:
         except (ValueError, OSError):
             pass
 
-    load_dotenv()
+    utils.load_project_env()
 
     api_user = os.getenv("API_USER")
     api_signer = os.getenv("API_SIGNER")

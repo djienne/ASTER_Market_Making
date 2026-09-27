@@ -20,7 +20,7 @@ pip install -r requirements.txt
 
 ### Running the Market Maker
 ```bash
-# Requires .env file with API credentials. No parameter files needed —
+# Requires aster.env file with API credentials. No parameter files needed —
 # the Vol+OBI signal warms up from the live Binance depth stream.
 python market_maker.py --symbol ETHUSDT
 ```
@@ -92,7 +92,7 @@ docker-compose down
   - Automatic parameter signing and nonce generation
 
 **Utilities**
-- `utils.py`: `.env`/`runtime.env` loading and the configured symbol
+- `utils.py`: `aster.env`/`runtime.env` loading and the configured symbol
 - `terminal_dashboard.py`: ANSI terminal dashboard for account monitoring (balances, positions, orders, mark prices, realized PnL)
 
 ### Data Flow
@@ -114,7 +114,7 @@ The `StrategyState` class in `market_maker.py` maintains:
 
 ### Key Configuration Files
 
-**Environment Variables (.env)**
+**Environment Variables (aster.env)**
 ```bash
 # Pro API (Ethereum-style) - for trading
 API_USER=0x...           # Main wallet address
@@ -223,10 +223,10 @@ Note: every Binance signal-stream reconnect resets the Vol+OBI calculator — qu
 
 The `docker-compose.yml` defines 2 services; only `market-maker` starts by default, `data-collector` is in the `analytics` profile (`--profile analytics`, or name the service explicitly):
 
-1. **market-maker**: Self-contained trading logic — only needs `.env` credentials and WebSocket connectivity
+1. **market-maker**: Self-contained trading logic — only needs `aster.env` credentials and WebSocket connectivity
 2. **data-collector**: Optional; gathers raw market data continuously into `ASTER_data/`
 
-`runtime.env` is the single source of truth for the active symbol across all services. Only `market-maker` gets `.env` via `env_file`; the collector never uses credentials. (All services still bind-mount `./:/app/`, so the `.env` file itself remains readable inside every container.)
+`runtime.env` is the single source of truth for the active symbol across all services. Only `market-maker` gets `aster.env` via `env_file`; the collector never uses credentials. (All services still bind-mount `./:/app/`, so the `aster.env` file itself remains readable inside every container.)
 
 ## Risk Management Features
 
@@ -243,7 +243,7 @@ The `docker-compose.yml` defines 2 services; only `market-maker` starts by defau
 
 ## Common Pitfalls
 
-1. **Missing .env file**: All trading scripts require properly configured API credentials
+1. **Missing aster.env file**: All trading scripts require properly configured API credentials
 2. **Incorrect symbol format**: Use "BNBUSDT" not "BNB-USDT" or "BNB/USDT"
 3. **Symbol not on Binance futures**: The Vol+OBI signal needs the same symbol on Binance USDT-margined futures
 4. **Shared account interference**: Bot assumes exclusive control of account; manual trading creates position tracking issues (the open-order watchdog cancels untracked orders once they persist across two 15s cycles)

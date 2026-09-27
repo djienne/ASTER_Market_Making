@@ -4,7 +4,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).parent.absolute()
-SECRETS_ENV_PATH = PROJECT_ROOT / ".env"
+SECRETS_ENV_PATH = PROJECT_ROOT / "aster.env"
 RUNTIME_ENV_PATH = PROJECT_ROOT / "runtime.env"
 
 

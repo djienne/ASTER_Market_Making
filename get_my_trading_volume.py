@@ -16,11 +16,8 @@ import os
 import time
 from datetime import datetime
 
-from dotenv import load_dotenv
-
+import utils  # noqa: F401  (loads aster.env and runtime.env)
 from api_client import ApiClient
-
-load_dotenv()
 
 API_USER = os.getenv('API_USER')
 API_SIGNER = os.getenv('API_SIGNER')

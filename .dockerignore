@@ -1,6 +1,7 @@
 # Never bake credentials, history, or collected data into the image.
-# Runtime still gets .env via docker-compose env_file and the ./:/app bind mount.
+# Runtime still gets aster.env via docker-compose env_file and the ./:/app bind mount.
 .env
+aster.env
 .git
 ASTER_data/
 *.log*
