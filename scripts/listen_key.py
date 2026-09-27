@@ -7,6 +7,8 @@ import asyncio
 import os
 import sys
 from dotenv import load_dotenv
+import os, sys  # noqa: E401
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root for api_client
 from api_client import ApiClient
 
 # Fix Windows encoding issues

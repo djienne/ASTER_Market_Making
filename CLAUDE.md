@@ -173,11 +173,12 @@ The strategy math lives in `vol_obi.py` (`VolObiCalculator.quote()`); the per-cy
 
 ### Testing WebSocket Connections
 
-Use scripts in `tests/` directory:
-- `websocket_depth.py`: Test orderbook stream
-- `websocket_user_data.py`: Test account update stream
-- `websocket_orders.py`: Test order fill notifications
-- `test_user_stream_step_by_step.py`: Debug user stream connection
+`tests/` holds only the offline pytest suite (`pytest tests`). Manual scripts that hit the live exchange live in `scripts/` and run from anywhere, e.g. `python scripts/websocket_depth.py`:
+- `scripts/websocket_depth.py`: Test orderbook stream
+- `scripts/websocket_user_data.py`: Test account update stream
+- `websocket_orders.py` (repo root): Test order fill notifications
+- `scripts/user_stream_step_by_step.py`: Debug user stream connection
+- `scripts/balance.py`, `scripts/cancel_order.py`, `scripts/open_perp_position.py`: account/order checks (live, use real credentials)
 
 ### Debugging Order Placement Issues
 
