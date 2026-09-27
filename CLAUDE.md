@@ -66,7 +66,7 @@ docker-compose down
   - Three WebSocket connections: Aster depth5 (top-of-book), Aster user stream (fills/balances), Binance futures diff-depth @100ms (Vol+OBI signal)
   - Two-sided quoting: per-side order tracking in `state.side_orders['BUY'/'SELL']`
   - Inventory skew + dynamic max-position cap replace mode switching
-  - Per-side order reuse logic (5 bps price threshold) to minimize API calls
+  - Per-side order reuse (threshold = 25% of the half-spread, 1–5 bps) to minimize API calls
   - Graceful shutdown with automatic order cleanup
 
 - `vol_obi.py`: Vol+OBI strategy math (port of lighter_MM)
@@ -108,7 +108,7 @@ The `StrategyState` class in `market_maker.py` maintains:
 - Real-time market prices (bid/ask/mid from WebSocket)
 - Account balances (USDF, USDT, USDC, position sizes)
 - Per-side order tracking: `side_orders['BUY'/'SELL']` (`SideOrderState`: order_id, price, quantity, reduce_only, placed_at)
-- `vol_obi_calc` (the live calculator) and `vol_obi_snapshot` (immutable signal view)
+- `vol_obi_calc` (the live Vol+OBI calculator; liveness = warmed up + Binance feed connected + updated within 5s)
 - Binance local book + band totals for the OBI signal
 - WebSocket health flags
 - Order update queue + latest-wins `order_commands` queue (maxsize 1; one command always carries the full desired state of both sides)

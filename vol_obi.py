@@ -10,9 +10,6 @@ websocket callbacks of the asyncio event loop.
 """
 
 import math
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -82,10 +79,6 @@ class RollingStats:
 
     # -- accessors --
 
-    @property
-    def count(self) -> int:
-        return self._count
-
     def mean(self) -> float:
         return self._cached_mean
 
@@ -116,12 +109,12 @@ class VolObiCalculator:
     - half_spread is computed in dollars, converted to ticks for skew,
       then converted back to dollars for final prices
     - vol_scale = sqrt(1e9 / step_ns)
-    - c1 = c1_ticks * tick_size  (if c1 == 0)
+    - c1 (dollars per sigma of alpha) is set by the caller via set_c1_dollar
     """
 
     __slots__ = (
         '_mid_stats', '_imb_stats', '_prev_mid',
-        '_volatility', '_alpha', '_alpha_override', '_warmed_up', '_total_samples',
+        '_volatility', '_alpha', '_warmed_up', '_total_samples',
         # config
         '_tick_size', '_vol_scale',
         '_vol_to_half_spread', '_min_half_spread_bps',
@@ -137,8 +130,6 @@ class VolObiCalculator:
         step_ns: int = 100_000_000,
         vol_to_half_spread: float = 0.8,
         min_half_spread_bps: float = 2.0,
-        c1_ticks: float = 160.0,
-        c1: float = 0.0,
         skew: float = 1.0,
         min_warmup_samples: int = 100,
         max_position_dollar: float = 500.0,
@@ -148,7 +139,6 @@ class VolObiCalculator:
         self._prev_mid = None
         self._volatility = 0.0
         self._alpha = 0.0
-        self._alpha_override = None
         self._warmed_up = False
         self._total_samples = 0
 
@@ -159,8 +149,7 @@ class VolObiCalculator:
         self._vol_scale = (1_000_000_000.0 / step_ns) ** 0.5
         self._vol_to_half_spread = vol_to_half_spread
         self._min_half_spread_bps = min_half_spread_bps
-        # c1 in dollars
-        self._c1 = c1 if c1 > 0.0 else c1_ticks * tick_size
+        self._c1 = 0.0  # dollars per sigma; set per quote cycle via set_c1_dollar
         self._skew = skew
         self._min_warmup_samples = min_warmup_samples
         self._max_position_dollar = max_position_dollar
@@ -185,18 +174,10 @@ class VolObiCalculator:
 
         # 3. Update cached volatility & alpha once warmed up
         if self._total_samples >= self._min_warmup_samples:
-            if not self._warmed_up:
-                self._warmed_up = True
-                logger.info(
-                    "Vol+OBI warmed up after %d samples | vol_scale=%.3f",
-                    self._total_samples, self._vol_scale,
-                )
+            self._warmed_up = True
             vol_raw = self._mid_stats.std()               # [DOLLARS]
             self._volatility = vol_raw * self._vol_scale  # [DOLLARS]
-            if self._alpha_override is not None:
-                self._alpha = self._alpha_override
-            else:
-                self._alpha = self._imb_stats.zscore(imbalance)  # [dimensionless]
+            self._alpha = self._imb_stats.zscore(imbalance)  # [dimensionless]
 
     # ----- trading loop: called from the quote engine -----
 
@@ -254,15 +235,6 @@ class VolObiCalculator:
 
         return bid_price, ask_price
 
-    # ----- alpha override (external alpha injection) -----
-
-    def set_alpha_override(self, alpha) -> None:
-        """Set an external alpha value.
-
-        Pass ``None`` to revert to locally computed imbalance z-score.
-        """
-        self._alpha_override = alpha
-
     # ----- accessors -----
 
     @property
@@ -291,10 +263,6 @@ class VolObiCalculator:
     def total_samples(self) -> int:
         return self._total_samples
 
-    @property
-    def vol_scale(self) -> float:
-        return self._vol_scale
-
     def reset(self) -> None:
         """Clear all state. Called on WS reconnect / snapshot."""
         self._mid_stats.clear()
@@ -302,7 +270,6 @@ class VolObiCalculator:
         self._prev_mid = None
         self._volatility = 0.0
         self._alpha = 0.0
-        self._alpha_override = None
         self._warmed_up = False
         self._total_samples = 0
 

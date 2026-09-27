@@ -25,7 +25,6 @@ def _make_warmed_calc(tick_size=0.1, alpha=0.0, **overrides):
         step_ns=100_000_000,
         vol_to_half_spread=42.0,
         min_half_spread_bps=4.0,
-        c1_ticks=120.0,
         skew=1.5,
         min_warmup_samples=10,
         max_position_dollar=1000.0,
@@ -38,8 +37,8 @@ def _make_warmed_calc(tick_size=0.1, alpha=0.0, **overrides):
         mid += 0.01 if i % 2 == 0 else -0.01
         calc.on_sample(mid, 10.0 if i % 2 == 0 else -10.0)
 
-    calc.set_alpha_override(alpha)
     calc.on_sample(mid, 0.0)
+    calc._alpha = alpha  # controlled alpha (the imbalance z-score is overwritten on the next sample)
     return calc
 
 
@@ -56,12 +55,11 @@ def _make_live_state(calc=None, mid=100.0, balance=1000.0):
     state.user_data_ws_connected = True
     state.binance_alpha_ws_connected = True
     state.binance_alpha_last_updated = 9.5
-    market_maker.publish_vol_obi_snapshot(state)
     return state
 
 
 def _make_runtime(clock_value=10.0):
-    return market_maker.RuntimeContext("BTCUSDT", clock=lambda: clock_value)
+    return market_maker.RuntimeContext(clock=lambda: clock_value)
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +116,6 @@ def test_prepare_order_candidate_rejects_quantity_below_min_qty():
             "min_notional": 5.0,
         },
         side="BUY",
-        reduce_only=False,
         limit_price=100.06,
         quantity_to_trade=0.0149,
     )
@@ -175,8 +172,6 @@ def test_vol_obi_enforces_min_half_spread_floor():
         min_warmup_samples=5,
         vol_to_half_spread=0.0,
         min_half_spread_bps=4.0,
-        c1_ticks=0.0,
-        c1=0.000001,
     )
     for _ in range(10):
         calc.on_sample(100.0, 0.0)
@@ -195,7 +190,6 @@ def test_vol_obi_returns_none_when_quotes_would_cross():
         min_warmup_samples=5,
         vol_to_half_spread=0.0,
         min_half_spread_bps=0.0,
-        c1=0.000001,
     )
     for _ in range(10):
         calc.on_sample(100.0, 0.0)
@@ -248,7 +242,6 @@ def test_build_quote_set_emits_two_sided_quotes():
 def test_build_quote_set_requires_live_vol_obi_signal():
     state = _make_live_state()
     state.binance_alpha_last_updated = 1.0  # stale vs clock 10.0 and 5s timeout
-    market_maker.publish_vol_obi_snapshot(state)
     runtime = _make_runtime()
 
     command, diagnostics = market_maker.build_quote_set(state, TEST_FILTERS, runtime)
@@ -563,7 +556,6 @@ def test_order_manager_fast_replace_moves_old_order_to_pending(monkeypatch):
         state.mid_price = 100.0
         runtime = _make_runtime()
         client = ReplacingClient()
-        executor = market_maker.OrderExecutor(fast_replace=True)
         log = logging.getLogger("test")
 
         # Seed a live bid, then apply a quote set that moves it >5bps.
@@ -577,7 +569,7 @@ def test_order_manager_fast_replace_moves_old_order_to_pending(monkeypatch):
             trigger="test",
         )
 
-        await market_maker.apply_quote_set(state, client, "BTCUSDT", runtime, log, executor, command)
+        await market_maker.apply_quote_set(state, client, "BTCUSDT", runtime, log, command)
 
         assert client.canceled == [201]
         assert 201 in state.pending_terminal_orders
@@ -600,7 +592,6 @@ def test_apply_quote_set_reuses_order_within_threshold(monkeypatch):
         monkeypatch.setattr(market_maker, "MIN_ORDER_INTERVAL", 0.0)
         state = market_maker.StrategyState()
         runtime = _make_runtime()
-        executor = market_maker.OrderExecutor(fast_replace=True)
         log = logging.getLogger("test")
 
         state.side_orders["SELL"] = market_maker.SideOrderState(
@@ -613,7 +604,7 @@ def test_apply_quote_set_reuses_order_within_threshold(monkeypatch):
             trigger="test",
         )
 
-        await market_maker.apply_quote_set(state, NoTouchClient(), "BTCUSDT", runtime, log, executor, command)
+        await market_maker.apply_quote_set(state, NoTouchClient(), "BTCUSDT", runtime, log, command)
 
         assert state.side_orders["SELL"].order_id == 300
 
@@ -623,25 +614,6 @@ def test_apply_quote_set_reuses_order_within_threshold(monkeypatch):
 # ---------------------------------------------------------------------------
 # Cancels, fills, shutdown
 # ---------------------------------------------------------------------------
-
-def test_wait_for_terminal_order_update_requeues_other_orders_events():
-    """A fill on the OTHER side must survive a cancel-confirmation wait."""
-    async def runner():
-        queue = asyncio.Queue()
-        other_fill = {"e": "ORDER_TRADE_UPDATE", "o": {"i": 99, "X": "FILLED", "z": "1.0"}}
-        await queue.put(other_fill)
-        await queue.put({"e": "ORDER_TRADE_UPDATE", "o": {"i": 42, "X": "CANCELED", "z": "0"}})
-
-        terminal = await market_maker.wait_for_terminal_order_update(
-            queue, 42, 1.0, logging.getLogger("test"), "Test"
-        )
-
-        assert terminal["status"] == "CANCELED"
-        requeued = queue.get_nowait()
-        assert requeued["o"]["i"] == 99  # other side's fill is back in the queue
-
-    asyncio.run(runner())
-
 
 def test_timeout_refresh_parks_expired_side_without_touching_other(monkeypatch):
     """Fast-replace timeout refresh must not block on the queue or disturb the other side."""
@@ -700,7 +672,6 @@ def test_placement_failure_on_one_side_does_not_kill_the_other(monkeypatch):
         state = market_maker.StrategyState()
         state.mid_price = 100.0
         runtime = _make_runtime()
-        executor = market_maker.OrderExecutor(fast_replace=True)
         log = logging.getLogger("test")
 
         command = market_maker.QuoteSetCommand(
@@ -712,104 +683,13 @@ def test_placement_failure_on_one_side_does_not_kill_the_other(monkeypatch):
 
         # Must not raise out of apply_quote_set.
         await market_maker.apply_quote_set(
-            state, HalfFailingClient(), "BTCUSDT", runtime, log, executor, command
+            state, HalfFailingClient(), "BTCUSDT", runtime, log, command
         )
 
         assert state.side_orders["SELL"].order_id == 500   # healthy side placed
         assert state.side_orders["BUY"].order_id is None   # failed side empty
         assert len(state.order_failure_timestamps) == 1    # failure recorded
         assert state.quote_refresh_event.is_set()          # retry requested
-
-    asyncio.run(runner())
-
-
-def test_wait_for_terminal_order_update_ignores_non_terminal_events():
-    async def runner():
-        queue = asyncio.Queue()
-        await queue.put({"e": "ORDER_TRADE_UPDATE", "o": {"i": 42, "X": "PARTIALLY_FILLED", "z": "0.05", "ap": "100"}})
-        await queue.put({"e": "ORDER_TRADE_UPDATE", "o": {"i": 42, "X": "FILLED", "z": "0.2", "ap": "100"}})
-
-        terminal = await market_maker.wait_for_terminal_order_update(
-            queue,
-            42,
-            1.0,
-            logging.getLogger("test"),
-            "Test",
-        )
-
-        assert terminal["status"] == "FILLED"
-        assert terminal["treat_as_fill"] is True
-
-    asyncio.run(runner())
-
-
-def test_wait_for_terminal_order_update_handles_partial_then_canceled_fill():
-    async def runner():
-        queue = asyncio.Queue()
-        await queue.put({"e": "ORDER_TRADE_UPDATE", "o": {"i": 42, "X": "PARTIALLY_FILLED", "z": "0.05", "ap": "100"}})
-        await queue.put({"e": "ORDER_TRADE_UPDATE", "o": {"i": 42, "X": "CANCELED", "z": "0.2", "ap": "100"}})
-
-        terminal = await market_maker.wait_for_terminal_order_update(
-            queue,
-            42,
-            1.0,
-            logging.getLogger("test"),
-            "Test",
-        )
-
-        assert terminal["status"] == "CANCELED"
-        assert terminal["treat_as_fill"] is True
-        assert terminal["filled_qty"] == 0.2
-
-    asyncio.run(runner())
-
-
-def test_cancel_and_finalize_side_order_reconciles_via_rest_after_cancel_timeout(monkeypatch):
-    class DummyClient:
-        def __init__(self):
-            self.cancel_calls = 0
-            self.status_calls = 0
-            self.position_calls = 0
-
-        async def cancel_order(self, symbol, order_id):
-            self.cancel_calls += 1
-            return {"orderId": order_id}
-
-        async def get_order_status(self, symbol, order_id):
-            self.status_calls += 1
-            return {"status": "CANCELED", "executedQty": "0.2"}
-
-        async def get_position_risk(self, symbol):
-            self.position_calls += 1
-            return [{"positionAmt": "0.2", "notional": "20.0"}]
-
-    async def runner():
-        state = market_maker.StrategyState()
-        state.mid_price = 100.0
-        state.side_orders["BUY"] = market_maker.SideOrderState(
-            order_id=42, price=100.0, quantity=0.2, placed_at=9.0
-        )
-        client = DummyClient()
-
-        monkeypatch.setattr(market_maker, "CANCEL_CONFIRM_TIMEOUT", 0.01)
-        monkeypatch.setattr(market_maker, "POSITION_SYNC_TIMEOUT", 0.01)
-
-        success = await market_maker.cancel_and_finalize_side_order(
-            state,
-            client,
-            "BTCUSDT",
-            logging.getLogger("test"),
-            "BUY",
-            "Timed-out order refresh",
-            "Timed-out order",
-        )
-
-        assert success is True
-        assert client.cancel_calls == 1
-        assert client.status_calls == 1
-        assert client.position_calls == 1
-        assert state.side_orders["BUY"].order_id is None
-        assert state.position_size == 0.2
 
     asyncio.run(runner())
 
@@ -937,7 +817,7 @@ def test_initiate_graceful_order_shutdown_requests_cancel_all_and_waits_for_clea
         state = market_maker.StrategyState()
         state.side_orders["BUY"] = market_maker.SideOrderState(order_id=42, price=99.0, quantity=1.0)
         state.side_orders["SELL"] = market_maker.SideOrderState(order_id=43, price=101.0, quantity=1.0)
-        runtime = market_maker.RuntimeContext("BTCUSDT")
+        runtime = market_maker.RuntimeContext()
 
         async def clear_soon():
             await asyncio.sleep(0.05)
@@ -1022,7 +902,7 @@ def test_user_data_idle_timeout_does_not_reconnect(monkeypatch):
 
     state = market_maker.StrategyState()
     client = DummyClient()
-    runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 61.0)
+    runtime = market_maker.RuntimeContext(clock=lambda: 61.0)
 
     monkeypatch.setattr(market_maker, "keepalive_balance_listen_key", fake_keepalive)
     monkeypatch.setattr(market_maker.websockets, "connect", lambda *args, **kwargs: DummyConnection(DummyWebSocket()))
@@ -1036,14 +916,12 @@ def test_user_data_idle_timeout_does_not_reconnect(monkeypatch):
 
 def test_wait_for_startup_inputs_waits_for_vol_obi_warmup(monkeypatch):
     state = market_maker.StrategyState()
-    runtime = market_maker.RuntimeContext("ETHUSDT", clock=lambda: 10.0)
+    runtime = market_maker.RuntimeContext(clock=lambda: 10.0)
 
     async def fake_sleep(_seconds):
-        state.vol_obi_snapshot = market_maker.VolObiSnapshot(
-            warmed_up=True,
-            ws_connected=True,
-            last_updated=9.5,
-        )
+        state.vol_obi_calc = _make_warmed_calc()
+        state.binance_alpha_ws_connected = True
+        state.binance_alpha_last_updated = 9.5
 
     monkeypatch.setattr(market_maker.asyncio, "sleep", fake_sleep)
 
@@ -1057,7 +935,7 @@ def test_wait_for_startup_inputs_waits_for_vol_obi_warmup(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_price_updater_refreshes_freshness_when_top_unchanged(monkeypatch):
     clock = {"t": 0.0}
-    runtime = market_maker.RuntimeContext("ETHUSDT", clock=lambda: clock["t"])
+    runtime = market_maker.RuntimeContext(clock=lambda: clock["t"])
     state = market_maker.StrategyState()
     message = b'{"e":"depthUpdate","b":[["2689.49","1"]],"a":[["2689.50","1"]]}'
 
@@ -1142,7 +1020,7 @@ def test_watchdog_waits_one_cycle_before_cancelling_untracked(monkeypatch):
                 cancels.append(cycles["n"])
 
         monkeypatch.setattr(market_maker, "OPEN_ORDER_WATCHDOG_INTERVAL", 0.0)
-        await market_maker.OrderExecutor().watch_open_orders(state, Client(), "BTCUSDT", runtime)
+        await market_maker.watch_open_orders(state, Client(), "BTCUSDT", runtime)
         return cancels
 
     # First sighting may be our own in-flight placement: only the 2nd cycle cancels.
@@ -1194,7 +1072,7 @@ def test_rest_position_sync_applies_and_skips_when_ws_is_newer():
 
 def test_user_stream_connect_resyncs_position_from_rest(monkeypatch):
     state = market_maker.StrategyState()
-    runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 1.0)
+    runtime = market_maker.RuntimeContext(clock=lambda: 1.0)
 
     class Client:
         async def create_listen_key(self):
