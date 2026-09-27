@@ -5,7 +5,10 @@ networks:
       config:
         - subnet: 10.5.0.0/22
 services:
+  # Optional analytics (not used by the live bot): start with
+  #   docker-compose --profile analytics up -d
   data-collector:
+    profiles: ["analytics"]
     build: .
     image: aster_market_making:latest
     container_name: aster_data_collector
@@ -27,6 +30,7 @@ services:
     restart: unless-stopped
 
   avellaneda-params:
+    profiles: ["analytics"]
     build: .
     image: aster_market_making:latest
     container_name: aster_avellaneda_params
@@ -35,7 +39,6 @@ services:
       - PARAM_WINDOW_MINUTES=5
       - PYTHONUNBUFFERED=1
     env_file:
-      - .env
       - runtime.env
     volumes:
       - ./:/app/
@@ -65,6 +68,7 @@ services:
     restart: unless-stopped
 
   trend-finder:
+    profiles: ["analytics"]
     build: .
     image: aster_market_making:latest
     container_name: aster_trend_finder
@@ -73,7 +77,6 @@ services:
       - TREND_INTERVAL=5m
       - PYTHONUNBUFFERED=1
     env_file:
-      - .env
       - runtime.env
     volumes:
       - ./:/app/

@@ -48,9 +48,12 @@ python get_my_trading_volume.py --symbol ETHUSDT --days 7
 
 ### Docker Deployment
 ```bash
-# Build and start all services
+# Build and start the market maker (the only default service)
 docker-compose build
 docker-compose up -d
+
+# Also start the optional analytics services
+docker-compose --profile analytics up -d
 
 # View logs for specific service
 docker-compose logs -f market-maker
@@ -252,14 +255,14 @@ Note: every Binance signal-stream reconnect resets the Vol+OBI calculator — qu
 
 ## Docker Service Dependencies
 
-The `docker-compose.yml` defines 4 services:
+The `docker-compose.yml` defines 4 services; only `market-maker` starts by default, the three analytics services are in the `analytics` profile (`--profile analytics`, or name the service explicitly):
 
 1. **market-maker**: Self-contained trading logic — only needs `.env` credentials and WebSocket connectivity
 2. **data-collector**: Optional analytics; gathers market data continuously
 3. **avellaneda-params**: Optional analytics; recalculates parameters every `PARAM_REFRESH_MINUTES`
 4. **trend-finder**: Optional analytics; updates trend signal every `TREND_REFRESH_MINUTES`
 
-`runtime.env` is the single source of truth for the active symbol across all services. The trading-related services still use the repo-root `.env` file for credentials.
+`runtime.env` is the single source of truth for the active symbol across all services. Only `market-maker` gets `.env` via `env_file`; the analytics jobs never use credentials. (All services still bind-mount `./:/app/`, so the `.env` file itself remains readable inside every container.)
 
 ## Risk Management Features
 

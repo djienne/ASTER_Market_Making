@@ -150,7 +150,7 @@ python find_trend.py --symbol ETHUSDT --interval 5m
 
 The Compose stack in [docker-compose.yml](docker-compose.yml):
 - `market-maker` is self-contained: it only needs `.env` credentials and Binance/Aster WebSocket connectivity, then begins quoting once the Vol+OBI signal has warmed up (about 10-60 seconds)
-- `data-collector`, `avellaneda-params`, and `trend-finder` are optional analytics services; the live bot no longer reads their output
+- `data-collector`, `avellaneda-params`, and `trend-finder` are optional analytics services in the `analytics` profile; the live bot no longer reads their output, and `docker compose up -d` does not start them (use `docker compose --profile analytics up -d`)
 
 ```bash
 docker compose build
