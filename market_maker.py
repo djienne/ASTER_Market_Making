@@ -2086,7 +2086,7 @@ async def cleanup_orders(
             if existing_client is not None and getattr(existing_client, "session", None) is not None and not existing_client.session.closed:
                 await _cancel_with(existing_client)
             else:
-                async with ApiClient(api_user, api_signer, api_private_key, RELEASE_MODE) as cleanup_client:
+                async with ApiClient(api_user, api_signer, api_private_key) as cleanup_client:
                     await _cancel_with(cleanup_client)
 
             log.info("All open orders cancelled. Shutdown complete.")
@@ -2141,7 +2141,7 @@ async def main():
     cleanup_completed = False
 
     try:
-        client = ApiClient(API_USER, API_SIGNER, API_PRIVATE_KEY, RELEASE_MODE)
+        client = ApiClient(API_USER, API_SIGNER, API_PRIVATE_KEY)
         state = StrategyState()
 
         async with client:
@@ -2171,7 +2171,6 @@ async def main():
                     step_ns=OBI_STEP_NS,
                     vol_to_half_spread=OBI_VOL_TO_HALF_SPREAD,
                     min_half_spread_bps=OBI_MIN_HALF_SPREAD_BPS,
-                    c1_ticks=0.0,  # c1 is set per quote cycle from OBI_C1_BPS
                     skew=OBI_SKEW,
                     min_warmup_samples=OBI_MIN_WARMUP_SAMPLES,
                     max_position_dollar=0.0,  # set dynamically each quote cycle
