@@ -93,7 +93,7 @@ docker-compose down
 
 **Utilities**
 - `utils.py`: `.env`/`runtime.env` loading and the configured symbol
-- `terminal_dashboard.py`: Rich terminal UI for account monitoring
+- `terminal_dashboard.py`: ANSI terminal dashboard for account monitoring (balances, positions, orders, mark prices, realized PnL)
 
 ### Data Flow
 

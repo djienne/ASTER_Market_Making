@@ -12,14 +12,15 @@ def _bare_dashboard(stop_event):
     return dashboard
 
 
-def test_dashboard_keeps_running_without_spot_keys():
+def test_dashboard_keeps_running_until_duration_elapses():
     async def runner():
         stop_event = asyncio.Event()
         dashboard = _bare_dashboard(stop_event)
-        dashboard.spot_fetcher = None
         dashboard.mark_stream_event = asyncio.Event()
+        clients = []
 
         async def run_until_stopped(*args):
+            clients.append(args)
             await stop_event.wait()
 
         dashboard.periodic_refresh = run_until_stopped
@@ -28,11 +29,17 @@ def test_dashboard_keeps_running_without_spot_keys():
         dashboard.listen_key_keepalive = run_until_stopped
         loop = asyncio.get_running_loop()
         started = loop.time()
-        await td._run_dashboard_tasks(dashboard, None, stop_event, types.SimpleNamespace(duration=0.3))
-        return loop.time() - started
+        client = object()
+        await td._run_dashboard_tasks(dashboard, client, stop_event, types.SimpleNamespace(duration=0.3))
+        return loop.time() - started, client, clients
 
-    # Previously the spot worker returned at once and FIRST_COMPLETED exited in ~1 ms.
-    assert asyncio.run(runner()) >= 0.25
+    elapsed, client, clients = asyncio.run(runner())
+    # The dashboard ends with FIRST_COMPLETED, so any task that returned at once
+    # (as the old optional spot worker did without keys) would exit in ~1 ms.
+    assert elapsed >= 0.25
+    # periodic_refresh, stream and listen_key_keepalive share the one long-lived client.
+    assert sorted(len(args) for args in clients) == [0, 1, 1, 1]
+    assert all(args[0] is client for args in clients if args)
 
 
 def test_user_stream_reconnects_with_a_fresh_listen_key(monkeypatch):
@@ -64,3 +71,29 @@ def test_user_stream_reconnects_with_a_fresh_listen_key(monkeypatch):
         return listen_keys
 
     assert asyncio.run(runner()) == ["key-0", "key-1", "key-2"]
+
+
+def test_mark_stream_reconnects_after_an_error_without_a_symbol_change(monkeypatch):
+    async def runner():
+        stop_event = asyncio.Event()
+        dashboard = _bare_dashboard(stop_event)
+        dashboard.mark_stream_event = asyncio.Event()
+        dashboard.mark_stream_event.set()
+        dashboard.mark_symbols = {"ETHUSDT"}
+        dashboard.mark_prices = {}
+        attempts = []
+
+        def failing_connect(url):
+            attempts.append(url)
+            if len(attempts) == 2:
+                stop_event.set()
+            raise OSError("network down")
+
+        monkeypatch.setattr(td, "MARK_STREAM_RETRY", 0)
+        monkeypatch.setattr(td.websockets, "connect", failing_connect)
+        # Before the fix the listener parked on mark_stream_event after the
+        # first failure, so mark prices froze until the symbol set changed.
+        await asyncio.wait_for(dashboard.mark_price_listener(), timeout=2)
+        return attempts
+
+    assert len(asyncio.run(runner())) == 2
