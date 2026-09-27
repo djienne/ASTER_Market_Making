@@ -257,10 +257,11 @@ The `docker-compose.yml` defines 4 services:
 - **Inventory Skew**: Long inventory widens the bid and tightens the ask (and vice versa), continuously steering position back to flat
 - **Order Refresh**: Resting orders refreshed after `ORDER_REFRESH_INTERVAL` to avoid stale prices (per side)
 - **Signal Staleness**: Quotes are pulled when the Binance Vol+OBI feed disconnects or goes stale (>5s); warmup restarts after every reconnect
-- **Price Staleness Check**: Rejects quoting if Aster price data is older than 30 seconds
+- **Price Staleness Check**: Pulls quotes (cancel-all) if Aster price data is older than 30 seconds; every live depth message counts as fresh, even with an unchanged top of book
 - **GTX Post-Only Clamp**: Quotes that would cross the opposite side of the Aster book are clamped one tick inside it
 - **Spread Floor**: `OBI_MIN_HALF_SPREAD_BPS` keeps quotes at least 4 bps per side off the mid
-- **Opening Circuit Breaker**: 3 opening-order failures in 60s pause exposure-adding quotes for 120s (the reducing side keeps working)
+- **Opening Circuit Breaker**: 3 opening-order failures in 60s pause exposure-adding quotes for 120s (the reducing side keeps working; successes do not reset the window)
+- **Position Resync**: REST position snapshot on every user-stream (re)connect and whenever the watchdog clears a vanished order (fills missed during a gap)
 - **Graceful Shutdown**: SIGINT/SIGTERM handlers cancel both sides, with a REST cancel-all backstop
 
 ## Common Pitfalls
@@ -268,7 +269,7 @@ The `docker-compose.yml` defines 4 services:
 1. **Missing .env file**: All trading scripts require properly configured API credentials
 2. **Incorrect symbol format**: Use "BNBUSDT" not "BNB-USDT" or "BNB/USDT"
 3. **Symbol not on Binance futures**: The Vol+OBI signal needs the same symbol on Binance USDT-margined futures
-4. **Shared account interference**: Bot assumes exclusive control of account; manual trading creates position tracking issues (the open-order watchdog cancels untracked orders)
+4. **Shared account interference**: Bot assumes exclusive control of account; manual trading creates position tracking issues (the open-order watchdog cancels untracked orders once they persist across two 15s cycles)
 5. **Daily warmup gaps**: WebSocket connections rotate proactively every ~23h; each Binance reconnect restarts the ~10s Vol+OBI warmup and pulls quotes until it completes
 6. **Tuning `OBI_VOL_TO_HALF_SPREAD`**: lighter_MM production used 42.0, the vol_obi.py code default is 0.8 — these differ by 50x; validate spreads in a dry run before sizing up
 

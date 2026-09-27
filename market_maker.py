@@ -378,10 +378,15 @@ def round_price_to_tick(price, tick_size, side):
         raise ValueError("tick_size must be positive")
 
     scaled = price / tick_size
+    # An on-grid price (k * tick) divides back to k only up to float error
+    # (~1e-10 at k ~ 1e6): snap it to k instead of flooring/ceiling past it.
+    nearest = round(scaled)
+    if abs(scaled - nearest) < 1e-6:
+        scaled = nearest
     if side == 'BUY':
-        rounded = math.floor(scaled + 1e-12) * tick_size
+        rounded = math.floor(scaled) * tick_size
     elif side == 'SELL':
-        rounded = math.ceil(scaled - 1e-12) * tick_size
+        rounded = math.ceil(scaled) * tick_size
     else:
         raise ValueError(f"Unsupported side for price rounding: {side}")
 
@@ -702,6 +707,7 @@ class QuoteEngine:
                         break
 
                     if not is_price_data_valid(state, runtime) or not is_balance_data_valid(state):
+                        publish_cancel_all_if_live(state, "Stale Aster price/balance data")
                         break
 
                     quote_set, diagnostics = self.build_quote_set(state, symbol_filters, runtime)
@@ -749,6 +755,7 @@ class OrderExecutor:
 
     async def watch_open_orders(self, state, client, symbol, runtime):
         log = logging.getLogger("OrderWatchdog")
+        previous_untracked = set()
 
         while not runtime.shutdown_requested:
             try:
@@ -762,6 +769,7 @@ class OrderExecutor:
                 # Clear local tracking for orders the exchange no longer has.
                 # Grace window avoids racing a freshly placed order whose
                 # GET /openOrders snapshot hasn't propagated yet.
+                cleared_missing = False
                 for side, side_state in state.side_orders.items():
                     if side_state.order_id is None or side_state.order_id in open_order_ids:
                         continue
@@ -778,6 +786,14 @@ class OrderExecutor:
                         state.pending_terminal_orders.pop(side_state.order_id, None)
                         clear_side_order(state, side)
                         request_quote_refresh(state)
+                        cleared_missing = True
+
+                if cleared_missing:
+                    # The vanished order may have filled while its update was missed.
+                    try:
+                        await sync_position_via_rest(state, client, symbol, log)
+                    except Exception as sync_error:
+                        log.error(f"Position resync after clearing missing orders failed: {sync_error}")
 
                 tracked_ids = {
                     side_state.order_id
@@ -785,12 +801,19 @@ class OrderExecutor:
                     if side_state.order_id is not None
                 }
                 tracked_ids.update(state.pending_terminal_orders.keys())
-                untracked = [
+                untracked = {
                     order_id for order_id in open_order_ids if order_id not in tracked_ids
-                ]
-                if not untracked:
+                }
+                # An id seen untracked once may be our own placement whose REST
+                # response is still in flight; act only if it persists a full cycle.
+                # Assumes placement latency < OPEN_ORDER_WATCHDOG_INTERVAL (15s vs
+                # ~0.1-1s); a slower response still gets one needless cancel-all.
+                confirmed = untracked & previous_untracked
+                previous_untracked = untracked - confirmed
+                if not confirmed:
                     continue
 
+                untracked = sorted(confirmed)
                 log.error(f"Detected untracked open orders for {symbol}: {untracked}")
                 if OPEN_ORDER_WATCHDOG_CANCEL_ALL:
                     await client.cancel_all_orders(symbol)
@@ -850,13 +873,31 @@ async def reconcile_fill_with_position(state, client, symbol, log, previous_posi
         return True
 
     log.warning(f"{fill_context}: no position snapshot arrived within {POSITION_SYNC_TIMEOUT:.1f}s; falling back to REST sync.")
+    await sync_position_via_rest(state, client, symbol, log)
+    return False
+
+
+async def sync_position_via_rest(state, client, symbol, log):
+    """Overwrite tracked inventory with the exchange's REST position.
+
+    Skipped when a WebSocket position snapshot lands during the REST call:
+    the WS update is newer than the REST response. Returns True if applied.
+    """
+    seq_before = state.position_update_seq
     positions = await client.get_position_risk(symbol)
+    if state.position_update_seq != seq_before:
+        log.info("REST position sync skipped: a newer WebSocket position snapshot arrived.")
+        return False
+
+    previous_size = state.position_size
     if positions:
         sync_state_from_position_data(state, positions[0], reference_price=state.mid_price)
     else:
         apply_position_snapshot(state, 0.0)
-
-    return False
+    if abs(previous_size - state.position_size) > 1e-9:
+        log.warning(f"REST position sync corrected size {previous_size:.6f} -> {state.position_size:.6f}")
+    request_quote_refresh(state)
+    return True
 
 
 async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None, quote_engine=None):
@@ -889,8 +930,9 @@ async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None,
                             log.info("Price WebSocket reached its max safe lifetime. Reconnecting proactively.")
                             break
 
-                        # [MODIFIED] Wait for a message with a timeout to detect stale connections
-                        message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
+                        # Short timeout so the quote engine re-checks price staleness
+                        # (and pulls quotes) even while the feed is silent.
+                        message = await asyncio.wait_for(websocket.recv(), timeout=10.0)
                         last_message_time = runtime.now()
 
                         try:
@@ -903,6 +945,9 @@ async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None,
                                 if bids and asks:
                                     best_bid = float(bids[0][0])
                                     best_ask = float(asks[0][0])
+                                    # A live message is fresh price data even when the top is
+                                    # unchanged (quiet book, or our own quote is the touch).
+                                    runtime.price_last_updated = runtime.now()
                                     if best_bid != state.bid_price or best_ask != state.ask_price:
                                         should_refresh = top_of_book_feed.publish(
                                             state,
@@ -926,6 +971,7 @@ async def websocket_price_updater(state, symbol, runtime, top_of_book_feed=None,
                     
                     # [ADDED] Stale connection detection logic
                     except asyncio.TimeoutError:
+                        request_quote_refresh(state)
                         time_since_last_msg = runtime.now() - last_message_time
                         if time_since_last_msg > 60:
                             log.warning(f"No price messages received for {time_since_last_msg:.1f}s. Connection may be stale. Reconnecting...")
@@ -1035,8 +1081,13 @@ def _apply_binance_depth_event(state, event, require_prev_match=True):
     if require_prev_match:
         if previous_final_update_id is None or int(previous_final_update_id) != int(state.binance_last_update_id):
             raise BinanceOrderBookSyncError("Binance depth sequence gap detected")
-    elif not (first_update_id <= int(state.binance_last_update_id) <= final_update_id):
-        raise BinanceOrderBookSyncError("Initial Binance buffered event does not overlap the snapshot")
+    else:
+        # Bridge event: drop anything the snapshot already covers, then the
+        # first applied event must straddle the snapshot's lastUpdateId.
+        if final_update_id < int(state.binance_last_update_id):
+            return False
+        if first_update_id > int(state.binance_last_update_id):
+            raise BinanceOrderBookSyncError("Initial Binance buffered event does not overlap the snapshot")
 
     if final_update_id < int(state.binance_last_update_id):
         return False
@@ -1144,8 +1195,12 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime, alpha_engi
                 if start_index is None and buffered_events:
                     raise BinanceOrderBookSyncError("Could not align Binance buffered events with snapshot")
 
-                for idx, event in enumerate(buffered_events[start_index or 0:]):
-                    alpha_engine.apply_depth_event(state, event, require_prev_match=(idx != 0))
+                # The REST snapshot can beat the WS event that covers it; then no
+                # buffered event bridges and the first live event must do it.
+                bridged = False
+                for event in buffered_events[start_index or 0:]:
+                    if alpha_engine.apply_depth_event(state, event, require_prev_match=bridged):
+                        bridged = True
                     alpha_engine.update_metrics(state, runtime)
 
                 last_message_time = runtime.now()
@@ -1161,7 +1216,9 @@ async def binance_orderbook_imbalance_updater(state, symbol, runtime, alpha_engi
                     if event is None:
                         continue
 
-                    alpha_engine.apply_depth_event(state, event)
+                    if not alpha_engine.apply_depth_event(state, event, require_prev_match=bridged):
+                        continue
+                    bridged = True
                     calc = state.vol_obi_calc
                     previous_warmed = calc.warmed_up if calc is not None else False
                     alpha_engine.update_metrics(state, runtime)
@@ -1279,6 +1336,12 @@ async def websocket_user_data_updater(state, client, symbol, runtime):
                 request_quote_refresh(state)
                 reconnect_delay = 5  # Reset reconnect delay on successful connection
                 connected_at = runtime.now()
+                # Fills during the disconnect gap never arrive on the stream:
+                # resync inventory now that new updates are being captured.
+                try:
+                    await sync_position_via_rest(state, client, symbol, log)
+                except Exception as sync_error:
+                    log.warning(f"Position resync after user-stream connect failed: {sync_error}")
 
                 while not runtime.shutdown_requested:
                     try:
@@ -1482,12 +1545,6 @@ def record_opening_order_failure(state, runtime):
 
     if len(state.order_failure_timestamps) >= ORDER_FAILURE_LIMIT:
         state.opening_circuit_breaker_until = now + OPENING_CIRCUIT_BREAKER_COOLDOWN
-
-
-def reset_opening_order_failures(state):
-    """Clear the recent opening-order failure window after a healthy opening-order lifecycle event."""
-    state.order_failure_timestamps.clear()
-    state.opening_circuit_breaker_until = 0.0
 
 
 def is_opening_circuit_breaker_active(state, runtime):
@@ -1951,8 +2008,6 @@ async def place_side_order(state, client, symbol, runtime, log, quote, symbol_fi
         reduce_only=quote.reduce_only,
         placed_at=runtime.last_order_time,
     )
-    if not quote.reduce_only:
-        reset_opening_order_failures(state)
     log.info(f"{quote.side} order placed successfully: ID={state.side_orders[quote.side].order_id}")
     return placed_order
 
@@ -2094,7 +2149,6 @@ async def apply_quote_set(state, client, symbol, runtime, log, executor, command
     # kill the other side's quote: log, record, and let the circuit breaker
     # handle clustering instead of escalating to the outer error handler.
     placement_failed = False
-    failed_opening_placements = 0
     for side, quote in desired.items():
         if quote is None or state.side_orders[side].order_id is not None:
             continue
@@ -2104,13 +2158,8 @@ async def apply_quote_set(state, client, symbol, runtime, log, executor, command
         except Exception as place_error:
             placement_failed = True
             if not quote.reduce_only:
-                failed_opening_placements += 1
+                record_opening_order_failure(state, runtime)
             log.error(f"Failed to place {side} order: {place_error}")
-
-    # Record after the loop so a same-burst success on the other side
-    # (which resets the failure window) cannot mask this burst's failures.
-    for _ in range(failed_opening_placements):
-        record_opening_order_failure(state, runtime)
 
     if placement_failed:
         request_quote_refresh(state)
@@ -2151,8 +2200,6 @@ async def _handle_tracked_terminal_update(state, client, symbol, runtime, log, r
     order_was_opening = not is_order_reduce_only(order_data)
     if terminal_update["status"] == "REJECTED" and order_was_opening:
         record_opening_order_failure(state, runtime)
-    elif terminal_update["status"] == "FILLED" and order_was_opening:
-        reset_opening_order_failures(state)
 
     if pending_order is not None:
         state.pending_terminal_orders.pop(order_id, None)

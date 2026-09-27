@@ -1050,3 +1050,184 @@ def test_wait_for_startup_inputs_waits_for_vol_obi_warmup(monkeypatch):
     result = asyncio.run(market_maker.wait_for_startup_inputs(state, "ETHUSDT", runtime))
 
     assert result is True
+
+
+# ---------------------------------------------------------------------------
+# Review-round regression checks
+# ---------------------------------------------------------------------------
+def test_price_updater_refreshes_freshness_when_top_unchanged(monkeypatch):
+    clock = {"t": 0.0}
+    runtime = market_maker.RuntimeContext("ETHUSDT", clock=lambda: clock["t"])
+    state = market_maker.StrategyState()
+    message = b'{"e":"depthUpdate","b":[["2689.49","1"]],"a":[["2689.50","1"]]}'
+
+    class SameTopWebSocket:
+        count = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def recv(self):
+            SameTopWebSocket.count += 1
+            clock["t"] += 1.0  # one depth5 message per second, identical top of book
+            if SameTopWebSocket.count > 40:
+                runtime.request_shutdown()
+            return message
+
+    monkeypatch.setattr(market_maker.websockets, "connect", lambda *a, **k: SameTopWebSocket())
+    asyncio.run(market_maker.websocket_price_updater(state, "ETHUSDT", runtime))
+
+    # 40 s of live messages with an unchanged top must not look like a stale feed.
+    assert clock["t"] - runtime.price_last_updated <= 1.0
+    assert market_maker.is_price_data_valid(state, runtime)
+
+
+def test_quote_engine_pulls_live_quotes_when_price_is_stale():
+    async def runner():
+        state = _make_live_state()
+        runtime = _make_runtime(clock_value=100.0)
+        runtime.price_last_updated = 10.0  # 90 s old
+        state.side_orders["BUY"] = market_maker.SideOrderState(order_id=1, price=99.0, quantity=1.0)
+
+        task = asyncio.create_task(market_maker.market_making_loop(state, _FiltersClient(), "BTCUSDT", runtime))
+        for _ in range(20):
+            if not state.order_commands.empty():
+                break
+            await asyncio.sleep(0.01)
+        runtime.request_shutdown()
+        market_maker.request_quote_refresh(state)
+        await task
+
+        command = state.order_commands.get_nowait()
+        assert command.kind == "cancel_all"
+
+    asyncio.run(runner())
+
+
+def test_binance_first_live_event_can_bridge_the_snapshot():
+    # REST snapshot arrives before the WS event covering it: every buffered
+    # event has u < lastUpdateId, so the first *live* event is the bridge.
+    state = market_maker.StrategyState()
+    snapshot = {"lastUpdateId": 1000, "bids": [["100.0", "5"]], "asks": [["100.1", "5"]]}
+    market_maker._initialize_binance_local_book(state, snapshot)
+    stale = {"U": 980, "u": 990, "pu": 979, "b": [], "a": []}
+    bridge = {"U": 991, "u": 1005, "pu": 990, "b": [["100.0", "6"]], "a": []}
+    follow = {"U": 1006, "u": 1010, "pu": 1005, "b": [], "a": [["100.1", "4"]]}
+
+    assert market_maker._apply_binance_depth_event(state, stale, require_prev_match=False) is False
+    assert market_maker._apply_binance_depth_event(state, bridge, require_prev_match=False) is True
+    assert market_maker._apply_binance_depth_event(state, follow, require_prev_match=True) is True
+    assert state.binance_last_update_id == 1010
+    assert state.binance_bid_book[100.0] == 6.0
+
+
+def test_watchdog_waits_one_cycle_before_cancelling_untracked(monkeypatch):
+    async def runner():
+        state = market_maker.StrategyState()
+        runtime = _make_runtime()
+        cycles = {"n": 0}
+        cancels = []
+
+        class Client:
+            async def get_open_orders(self, symbol):
+                cycles["n"] += 1
+                if cycles["n"] >= 2:
+                    runtime.request_shutdown()
+                return [{"orderId": 777}]  # untracked in both cycles
+
+            async def cancel_all_orders(self, symbol):
+                cancels.append(cycles["n"])
+
+        monkeypatch.setattr(market_maker, "OPEN_ORDER_WATCHDOG_INTERVAL", 0.0)
+        await market_maker.OrderExecutor().watch_open_orders(state, Client(), "BTCUSDT", runtime)
+        return cancels
+
+    # First sighting may be our own in-flight placement: only the 2nd cycle cancels.
+    assert asyncio.run(runner()) == [2]
+
+
+def test_circuit_breaker_survives_closing_side_placement():
+    async def runner():
+        state = market_maker.StrategyState()
+        state.symbol_filters = TEST_FILTERS
+        runtime = _make_runtime()
+        for _ in range(market_maker.ORDER_FAILURE_LIMIT):
+            market_maker.record_opening_order_failure(state, runtime)
+        assert market_maker.is_opening_circuit_breaker_active(state, runtime)
+
+        class Client:
+            async def place_order(self, *args):
+                return {"orderId": 1}
+
+        state.position_size = 0.05  # long below the cap -> closing ask is not reduce-only
+        ask = market_maker.SideQuote(side="SELL", price=101.0, quantity=0.1, reduce_only=False)
+        await market_maker.place_side_order(state, Client(), "BTCUSDT", runtime, logging.getLogger("t"), ask)
+        return market_maker.is_opening_circuit_breaker_active(state, runtime)
+
+    assert asyncio.run(runner()) is True
+
+
+def test_rest_position_sync_applies_and_skips_when_ws_is_newer():
+    log = logging.getLogger("t")
+
+    class Client:
+        def __init__(self, state, ws_update_during_call):
+            self.state = state
+            self.ws_update_during_call = ws_update_during_call
+
+        async def get_position_risk(self, symbol):
+            if self.ws_update_during_call:
+                market_maker.apply_position_snapshot(self.state, -0.3)
+            return [{"positionAmt": "0.5", "notional": "50"}]
+
+    state = market_maker.StrategyState()
+    assert asyncio.run(market_maker.sync_position_via_rest(state, Client(state, False), "BTCUSDT", log)) is True
+    assert state.position_size == 0.5
+
+    state = market_maker.StrategyState()
+    assert asyncio.run(market_maker.sync_position_via_rest(state, Client(state, True), "BTCUSDT", log)) is False
+    assert state.position_size == -0.3  # the newer WS snapshot wins
+
+
+def test_user_stream_connect_resyncs_position_from_rest(monkeypatch):
+    state = market_maker.StrategyState()
+    runtime = market_maker.RuntimeContext("BTCUSDT", clock=lambda: 1.0)
+
+    class Client:
+        async def create_listen_key(self):
+            return {"listenKey": "k"}
+
+        async def get_position_risk(self, symbol):
+            runtime.request_shutdown()
+            return [{"positionAmt": "0.25", "notional": "25"}]
+
+    class Connection:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def fake_keepalive(state, client, runtime):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(market_maker, "keepalive_balance_listen_key", fake_keepalive)
+    monkeypatch.setattr(market_maker.websockets, "connect", lambda *a, **k: Connection())
+    asyncio.run(market_maker.websocket_user_data_updater(state, Client(), "BTCUSDT", runtime))
+
+    assert state.position_size == 0.25
+
+
+def test_round_price_to_tick_keeps_on_grid_prices():
+    import random
+
+    rng = random.Random(7)
+    for tick, lo, hi in ((0.01, 1500, 5000), (0.1, 50000, 120000), (0.001, 100, 300), (0.0001, 0.2, 3)):
+        for _ in range(20000):
+            k = rng.randint(int(lo / tick), int(hi / tick))
+            price = k * tick
+            for side in ("BUY", "SELL"):
+                assert round(market_maker.round_price_to_tick(price, tick, side) / tick) == k

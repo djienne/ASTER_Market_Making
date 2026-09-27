@@ -179,10 +179,16 @@ class ApiClient:
 
         async with request_fn(url, **request_kwargs) as response:
             if not response.ok:
+                # Carry the exchange's error body (e.g. {"code":-5022,...}) in the
+                # exception so callers' logs show why an order was rejected.
                 error_body = await response.text()
-                if not self.release_mode:
-                    print(f"API Error on {method} {url}: Status={response.status}, Body={error_body}")
-            response.raise_for_status()
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=error_body[:500],
+                    headers=response.headers,
+                )
             return await response.json()
 
     async def get_exchange_info(self):

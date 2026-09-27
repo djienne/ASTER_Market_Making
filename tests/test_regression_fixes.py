@@ -106,3 +106,35 @@ def test_websocket_orders_module_imports_cleanly():
         for k, v in saved.items():
             if v is not None:
                 os.environ[k] = v
+
+
+def test_request_error_carries_exchange_body():
+    """Rejects must keep the exchange's error body so logs show *why* (e.g. -5022)."""
+    import asyncio
+
+    import aiohttp
+    from aiohttp import web
+
+    body = '{"code":-5022,"msg":"Due to the order could not be executed as maker"}'
+
+    async def runner():
+        app = web.Application()
+        app.router.add_post("/order", lambda request: web.Response(status=400, text=body))
+        server = web.AppRunner(app)
+        await server.setup()
+        site = web.TCPSite(server, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        client = _make_client()
+        client.session = aiohttp.ClientSession()
+        try:
+            await client._request_json("POST", f"http://127.0.0.1:{port}/order", {}, {})
+        except aiohttp.ClientResponseError as exc:
+            return exc
+        finally:
+            await client.session.close()
+            await server.cleanup()
+
+    exc = asyncio.run(runner())
+    assert exc is not None and exc.status == 400
+    assert "-5022" in str(exc)
