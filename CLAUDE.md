@@ -93,7 +93,6 @@ docker-compose down
 
 **Utilities**
 - `utils.py`: `.env`/`runtime.env` loading and the configured symbol
-- `websocket_orders.py`: Standalone order monitoring WebSocket client
 - `terminal_dashboard.py`: Rich terminal UI for account monitoring
 
 ### Data Flow
@@ -164,12 +163,12 @@ The strategy math lives in `vol_obi.py` (`VolObiCalculator.quote()`); the per-cy
 
 ### Testing WebSocket Connections
 
-`tests/` holds only the offline pytest suite (`pytest tests`). Manual scripts that hit the live exchange live in `scripts/` and run from anywhere, e.g. `python scripts/websocket_depth.py`:
-- `scripts/websocket_depth.py`: Test orderbook stream
-- `scripts/websocket_user_data.py`: Test account update stream
-- `websocket_orders.py` (repo root): Test order fill notifications
-- `scripts/user_stream_step_by_step.py`: Debug user stream connection
-- `scripts/balance.py`, `scripts/cancel_order.py`, `scripts/open_perp_position.py`: account/order checks (live, use real credentials)
+`tests/` holds only the offline pytest suite (`pytest tests`). Manual scripts that hit the live exchange live in `scripts/` and run from anywhere:
+- `python scripts/ws_stream.py ETHUSDT depth5` — any public stream (depth5, aggTrade, markPrice@1s, ticker, bookTicker), one line per event; no credentials
+- `python scripts/user_stream.py --seconds 120` — signed listen key + user stream (orders, fills, balances); does not close the shared listen key
+- `python scripts/order_roundtrip.py --symbol ETHUSDT --side BUY` — places a REAL min-size GTX order 1% behind the touch, reads it back, cancels it
+- `python scripts/balance.py` — account snapshot; `python scripts/get_trades.py ETHUSDT` — recent public trades
+- `terminal_dashboard.py` is the full live account view
 
 ### Debugging Order Placement Issues
 

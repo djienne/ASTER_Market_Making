@@ -156,20 +156,14 @@ If you only want background market-data collection, `docker compose up -d data-c
 
 ## Testing
 
-Local-safe tests run by default and skip live exchange scripts unless you opt in.
-
-If `pytest` is not already installed in your environment, install it separately first because it is not pinned in `requirements.txt`.
+`tests/` is fully offline (no credentials, no live orders). Install `pytest` separately; it is not pinned in `requirements.txt`.
 
 ```bash
 pip install pytest
-
 pytest -q
-
-# Only if you intentionally want live API test collection:
-RUN_LIVE_API_TESTS=1 pytest -q
 ```
 
-The default test suite does not place live trades. It covers the Vol+OBI strategy math, two-sided quote construction, per-side order-state logic, filter rounding, and analytics helpers.
+It covers the Vol+OBI strategy math, two-sided quote construction, per-side order-state logic, filter rounding, the collector, the dashboard stream, and the manual scripts' formatting. Live checks are manual scripts in `scripts/` (see `CLAUDE.md`), e.g. `python scripts/ws_stream.py ETHUSDT depth5`.
 
 ## Performance Notes
 

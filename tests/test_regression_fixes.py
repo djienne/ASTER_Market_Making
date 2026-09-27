@@ -1,7 +1,4 @@
 """Regression tests for bugs fixed in the Round 1/Round 2 review."""
-import importlib.util
-import os
-
 import api_client
 from api_client import ApiClient
 
@@ -35,39 +32,6 @@ def test_nonce_recovers_from_stale_seed():
     n2 = client._next_nonce()
     assert n1 > 1_000_000_000_000  # should jump to current wall-clock microseconds
     assert n2 > n1
-
-
-def _load_module_from_path(name, path):
-    """Import a module by file path, bypassing any same-named installed package
-    (some site-packages ship a top-level `tests` package that shadows ours)."""
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_websocket_orders_module_imports_cleanly():
-    """Round 1 fixed a NameError at websocket_orders.py:180. The module must
-    reach the early-return env-check branch without raising."""
-    import asyncio
-
-    saved = {k: os.environ.pop(k, None) for k in ("API_USER", "API_SIGNER", "API_PRIVATE_KEY")}
-    try:
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-        # Production module. Its import-time load_dotenv() may repopulate the
-        # credentials from a local .env, so pop them again before running the
-        # demo: this test must exercise the env-check branch, never go live.
-        prod_module = _load_module_from_path(
-            "websocket_orders_prod_copy", os.path.join(repo_root, "websocket_orders.py")
-        )
-        for k in saved:
-            os.environ.pop(k, None)
-        asyncio.run(prod_module.extended_demo())
-    finally:
-        for k, v in saved.items():
-            if v is not None:
-                os.environ[k] = v
 
 
 def test_request_error_carries_exchange_body():

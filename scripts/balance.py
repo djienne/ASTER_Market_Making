@@ -1,9 +1,11 @@
-import os
 import asyncio
+import os
+import sys
+
 from dotenv import load_dotenv
-import os, sys  # noqa: E401
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root for api_client
-from api_client import ApiClient
+from api_client import ApiClient  # noqa: E402
 
 async def main():
     """
@@ -36,7 +38,7 @@ async def main():
             
             if usdt_balance:
                 wallet_balance = usdt_balance.get("walletBalance")
-                print(f"\nSuccessfully found USDT balance.")
+                print("\nSuccessfully found USDT balance.")
                 print(f"Wallet Balance (USDT): {wallet_balance}")
             else:
                 print("\nCould not find USDT balance in the response.")
