@@ -209,6 +209,10 @@ params/
 
 ## Important Implementation Details
 
+### API Reference
+
+`docs/aster_api_full.md` is an offline copy of the Aster futures API docs (English + Chinese; online source https://docs.asterdex.com/product/aster-perpetuals/api/api-documentation, reviewed 2026-04-16). Grep it for endpoints, error codes, filters and signing rules instead of guessing.
+
 ### Signature Authentication (api_client.py)
 
 Aster Finance uses Ethereum-style signatures:

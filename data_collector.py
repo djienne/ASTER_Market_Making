@@ -31,15 +31,10 @@ class WebSocketDataCollector:
         self.base_url = "wss://fstream.asterdex.com"
         self.api_base_url = "https://fapi.asterdex.com"
 
-        # WebSocket connections
-        self.depth_ws = None
-        self.trades_ws = None
-
         # Connection management
         self.is_connected = False
         self.should_reconnect = True
         self.reconnect_interval = 5
-        self.ping_timeout = 15
         self.ping_interval = 30
         self.ORDERBOOK_BUFFER_SIZE_LIMIT = 50000
         # Trade ids are monotonic per symbol: once the dedup set passes PRUNE_AT,
@@ -292,15 +287,6 @@ class WebSocketDataCollector:
         """Handle WebSocket close."""
         print(f"WebSocket connection closed. Status: {close_status_code}")
         self.is_connected = False
-
-    def on_depth_open(self, ws):
-        """Handle depth WebSocket open."""
-        print("Depth WebSocket connected")
-
-    def on_trades_open(self, ws):
-        """Handle trades WebSocket open."""
-        print("Trades WebSocket connected")
-        self.is_connected = True
 
     def create_combined_stream_url(self):
         """Create combined stream URL for all symbols."""

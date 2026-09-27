@@ -13,7 +13,7 @@ Usage:
 import asyncio
 import argparse
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from api_client import ApiClient
 import os
 from dotenv import load_dotenv

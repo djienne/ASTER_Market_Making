@@ -125,7 +125,7 @@ class VolObiCalculator:
         # config
         '_tick_size', '_vol_scale',
         '_vol_to_half_spread', '_min_half_spread_bps',
-        '_c1', '_skew', '_looking_depth',
+        '_c1', '_skew',
         '_min_warmup_samples', '_max_position_dollar',
     )
 
@@ -140,7 +140,6 @@ class VolObiCalculator:
         c1_ticks: float = 160.0,
         c1: float = 0.0,
         skew: float = 1.0,
-        looking_depth: float = 0.025,
         min_warmup_samples: int = 100,
         max_position_dollar: float = 500.0,
     ):
@@ -163,28 +162,16 @@ class VolObiCalculator:
         # c1 in dollars
         self._c1 = c1 if c1 > 0.0 else c1_ticks * tick_size
         self._skew = skew
-        self._looking_depth = looking_depth
         self._min_warmup_samples = min_warmup_samples
         self._max_position_dollar = max_position_dollar
 
     # ----- hot path: called from the orderbook WS callback -----
 
-    def on_book_update(self, mid_price: float, bids, asks) -> None:
-        """Feed a new mid-price and price-sorted orderbook sides.
-
-        Args:
-            mid_price: Current mid-price in **dollars**.
-            bids: SortedDict-like {price: size} for bids (ascending keys).
-            asks: SortedDict-like {price: size} for asks (ascending keys).
-        """
-        imbalance = self._compute_imbalance(mid_price, bids, asks)
-        self.on_sample(mid_price, imbalance)
-
     def on_sample(self, mid_price: float, imbalance: float) -> None:
         """Feed a new mid-price and a precomputed raw imbalance.
 
         Used when the caller already maintains incremental band totals
-        (sum bid qty - sum ask qty within looking_depth of mid).
+        (sum bid qty - sum ask qty within the caller's band around mid).
         """
         # 1. Mid-price change  →  volatility   [DOLLARS]
         if self._prev_mid is not None:
@@ -210,26 +197,6 @@ class VolObiCalculator:
                 self._alpha = self._alpha_override
             else:
                 self._alpha = self._imb_stats.zscore(imbalance)  # [dimensionless]
-
-    def _compute_imbalance(self, mid_price: float, bids, asks) -> float:
-        """Sum bid/ask sizes within looking_depth of mid_price."""
-        depth = self._looking_depth
-        lower = mid_price * (1.0 - depth)
-        upper = mid_price * (1.0 + depth)
-
-        sum_bid = 0.0
-        for price, size in reversed(bids.items()):
-            if price < lower:
-                break
-            sum_bid += size
-
-        sum_ask = 0.0
-        for price, size in asks.items():
-            if price > upper:
-                break
-            sum_ask += size
-
-        return sum_bid - sum_ask
 
     # ----- trading loop: called from the quote engine -----
 

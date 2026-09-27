@@ -2614,7 +2614,6 @@ async def main():
                     min_half_spread_bps=OBI_MIN_HALF_SPREAD_BPS,
                     c1_ticks=0.0,  # c1 is set per quote cycle from OBI_C1_BPS
                     skew=OBI_SKEW,
-                    looking_depth=OBI_LOOKING_DEPTH,
                     min_warmup_samples=OBI_MIN_WARMUP_SAMPLES,
                     max_position_dollar=0.0,  # set dynamically each quote cycle
                 )

@@ -76,9 +76,8 @@ def _load_module_from_path(name, path):
 
 
 def test_websocket_orders_module_imports_cleanly():
-    """Round 1 fixed a NameError at websocket_orders.py:180. Both the production
-    module and the tests/ copy must now reach the early-return env-check branch
-    without raising."""
+    """Round 1 fixed a NameError at websocket_orders.py:180. The module must
+    reach the early-return env-check branch without raising."""
     import asyncio
 
     saved = {k: os.environ.pop(k, None) for k in ("API_USER", "API_SIGNER", "API_PRIVATE_KEY")}
@@ -94,14 +93,6 @@ def test_websocket_orders_module_imports_cleanly():
         for k in saved:
             os.environ.pop(k, None)
         asyncio.run(prod_module.extended_demo())
-
-        # Test-directory duplicate (regression caught in Round 2).
-        demo_module = _load_module_from_path(
-            "websocket_orders_tests_copy", os.path.join(repo_root, "tests", "websocket_orders.py")
-        )
-        for k in saved:
-            os.environ.pop(k, None)
-        asyncio.run(demo_module.extended_demo())
     finally:
         for k, v in saved.items():
             if v is not None:

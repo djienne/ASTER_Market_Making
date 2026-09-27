@@ -27,7 +27,6 @@ def _make_warmed_calc(tick_size=0.1, alpha=0.0, **overrides):
         min_half_spread_bps=4.0,
         c1_ticks=120.0,
         skew=1.5,
-        looking_depth=0.025,
         min_warmup_samples=10,
         max_position_dollar=1000.0,
     )

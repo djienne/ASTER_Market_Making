@@ -1,10 +1,7 @@
 aiodns==3.5.0
 aiohttp==3.13.5
 arch==8.0.0
-colorama==0.4.6
 eth-account==0.13.7
-eth_abi==5.2.0
-fastparquet==2026.3.0
 numba==0.65.0
 numpy==2.4.4
 orjson==3.11.8
