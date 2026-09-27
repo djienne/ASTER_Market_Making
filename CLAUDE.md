@@ -25,16 +25,9 @@ pip install -r requirements.txt
 python market_maker.py --symbol ETHUSDT
 ```
 
-### Optional Analytics (not used by the live bot)
+### Optional Market-Data Collector (not used by the live bot)
 ```bash
-# Collect market data
 python data_collector.py
-
-# Avellaneda-Stoikov parameter analysis
-python calculate_avellaneda_parameters.py ETH --minutes 5
-
-# SuperTrend directional bias analysis
-python find_trend.py --symbol ETHUSDT --interval 5m
 ```
 
 ### Monitoring
@@ -52,7 +45,7 @@ python get_my_trading_volume.py --symbol ETHUSDT --days 7
 docker-compose build
 docker-compose up -d
 
-# Also start the optional analytics services
+# Also start the optional data collector
 docker-compose --profile analytics up -d
 
 # View logs for specific service
@@ -84,14 +77,12 @@ docker-compose down
 - `logging_config.py`: Non-blocking logging (QueueHandler/QueueListener) so log I/O never blocks the event loop; the log file rotates at 50MB x 5 backups
 
 **Hot/cold path separation (important design constraint)**
-- Hot path (never blocks, no REST/disk): Binance depth handler → O(Δ) band totals → `VolObiCalculator.on_sample` (O(1)) → refresh trigger; Aster depth handler → top-of-book snapshot → 2 bps prefilter; quote engine → `build_quote_set` (pure float math) → latest-wins command queue
+- Hot path (never blocks, no REST/disk): Binance depth handler → O(Δ) band totals → `VolObiCalculator.on_sample` (O(1)) → refresh trigger; Aster depth handler → top-of-book → 1 bps prefilter; quote engine → `build_quote_set` (pure float math) → latest-wins command queue
 - WebSocket payloads are parsed with `orjson`; EIP-712 signing is offloaded to a worker thread (`api_client._sign_async`) so Keccak/secp256k1 math never stalls the event loop
 - Cold path: order manager REST calls, position reconciliation, listen-key keepalive, watchdog, reporters
 
-**Optional Analytics (not consumed by the live bot)**
-- `data_collector.py`: WebSocket-based market data collection into `ASTER_data/`
-- `calculate_avellaneda_parameters.py`: Avellaneda-Stoikov parameter analysis
-- `find_trend.py`: SuperTrend indicator analysis
+**Optional Market-Data Collector (not consumed by the live bot)**
+- `data_collector.py`: WebSocket-based market data collection into `ASTER_data/` (raw data for research)
 
 **API Client**
 - `api_client.py`: Aster Finance API wrapper
@@ -101,10 +92,7 @@ docker-compose down
   - Automatic parameter signing and nonce generation
 
 **Utilities**
-- `utils.py`: Shared functions for parameter validation, data loading, VWAP calculation
-- `volatility.py`: GARCH and rolling volatility estimation
-- `intensity.py`: Order arrival intensity parameter calculation
-- `backtester.py`: Numba-optimized backtesting for parameter optimization
+- `utils.py`: `.env`/`runtime.env` loading and the configured symbol
 - `websocket_orders.py`: Standalone order monitoring WebSocket client
 - `terminal_dashboard.py`: Rich terminal UI for account monitoring
 
@@ -204,11 +192,7 @@ ASTER_data/
 ├── trades_{SYMBOL}.csv           # All executed trades with deduplication
 └── orderbook_parquet/{SYMBOL}/   # Full orderbook snapshots
     ├── _latest.parquet           # Current staging file
-    └── orderbook_*.parquet       # Timestamped archives
-
-params/
-├── avellaneda_parameters_{SYMBOL}.json  # Analytics output (not read by the live bot)
-└── supertrend_params_{SYMBOL}.json      # Analytics output (not read by the live bot)
+    └── YYYYMMDDTHH0000Z.parquet  # One archive per completed UTC hour
 ```
 
 ## Important Implementation Details
@@ -225,26 +209,9 @@ Aster Finance uses Ethereum-style signatures:
 3. Keccak256 hash → sign with private key
 4. Signature included in request headers
 
-### Order Book VWAP Calculation
-
-The `calculate_vwap()` function in `utils.py`:
-- Target volume: $1000 USD by default
-- Walks through bid/ask levels accumulating volume
-- Returns volume-weighted average price up to target
-- Used for more accurate mid-price than simple bid/ask average
-
-### Numba Optimization
-
-Performance-critical functions use `@jit` or `@njit` decorators:
-- `backtester.py`: Trade simulation loops
-- `find_trend.py`: SuperTrend indicator calculation
-- `intensity.py`: Vectorized order arrival calculations
-
-First run compiles these functions; subsequent runs are significantly faster.
-
 ### WebSocket Reconnection
 
-Both `market_maker.py` and `data_collector.py` implement:
+`market_maker.py` implements (the collector simply reconnects every 5s):
 - Exponential backoff: starts at 5s, maxes at 60s
 - Ping/pong keepalive (20s interval, 10s timeout) plus recv-timeout stale detection
 - Automatic listenKey keepalive every 10 minutes for user streams
@@ -255,14 +222,12 @@ Note: every Binance signal-stream reconnect resets the Vol+OBI calculator — qu
 
 ## Docker Service Dependencies
 
-The `docker-compose.yml` defines 4 services; only `market-maker` starts by default, the three analytics services are in the `analytics` profile (`--profile analytics`, or name the service explicitly):
+The `docker-compose.yml` defines 2 services; only `market-maker` starts by default, `data-collector` is in the `analytics` profile (`--profile analytics`, or name the service explicitly):
 
 1. **market-maker**: Self-contained trading logic — only needs `.env` credentials and WebSocket connectivity
-2. **data-collector**: Optional analytics; gathers market data continuously
-3. **avellaneda-params**: Optional analytics; recalculates parameters every `PARAM_REFRESH_MINUTES`
-4. **trend-finder**: Optional analytics; updates trend signal every `TREND_REFRESH_MINUTES`
+2. **data-collector**: Optional; gathers raw market data continuously into `ASTER_data/`
 
-`runtime.env` is the single source of truth for the active symbol across all services. Only `market-maker` gets `.env` via `env_file`; the analytics jobs never use credentials. (All services still bind-mount `./:/app/`, so the `.env` file itself remains readable inside every container.)
+`runtime.env` is the single source of truth for the active symbol across all services. Only `market-maker` gets `.env` via `env_file`; the collector never uses credentials. (All services still bind-mount `./:/app/`, so the `.env` file itself remains readable inside every container.)
 
 ## Risk Management Features
 

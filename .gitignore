@@ -3,6 +3,5 @@ __pycache__/
 *.py[cod]
 .env
 *.log*
-params/
 ASTER_data/
 .claude/settings.local.json

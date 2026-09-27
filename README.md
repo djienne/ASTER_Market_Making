@@ -34,10 +34,8 @@ pip install -r requirements.txt
 python market_maker.py
 python market_maker.py --symbol ETHUSDT
 
-# Optional analytics tooling (not used by the live bot)
+# Optional market-data collector (not used by the live bot)
 python data_collector.py
-python calculate_avellaneda_parameters.py ETH --minutes 5
-python find_trend.py --symbol ETHUSDT --interval 5m
 ```
 
 ## Configuration
@@ -79,9 +77,6 @@ SYMBOL=ETHUSDT
 
 - `market_maker.py` uses `--symbol` first, then `runtime.env` `SYMBOL`.
 - `data_collector.py` defaults to `runtime.env` `SYMBOL`, unless you pass positional CLI symbols or set `SYMBOLS`.
-- `calculate_avellaneda_parameters.py` defaults to the base ticker derived from `runtime.env` `SYMBOL` after stripping common stablecoin quotes like `USDT`, `USDC`, `USDF`, `USD1`, and `USD`.
-- The local analytics loader accepts either a base ticker like `BTC` or a full symbol like `BTCUSDT`, then resolves the matching local trades/orderbook data using the available quote-suffix files.
-- `find_trend.py` defaults to `runtime.env` `SYMBOL` and writes its params file using the same base-symbol normalization.
 - The live trading bot and user-data stream both use Pro API V3 signer-based auth; there is no longer a separate `APIV1_*` credential requirement in this repo.
 - `data_collector.py` currently stores partial order book snapshots from the top `N` levels (`@depth5/@depth10/@depth20` style streams), not a fully reconstructed local order book from diff-depth updates.
 - Order book parquet output keeps the active hour in `ASTER_data/orderbook_parquet/{SYMBOL}/_latest.parquet` and archives one UTC-hour parquet per completed hour using filenames like `20260416T090000Z.parquet`.
@@ -140,17 +135,15 @@ Important notes:
 python market_maker.py
 python market_maker.py --symbol ETHUSDT
 
-# Data / analytics
+# Market-data collection (optional)
 python data_collector.py
-python calculate_avellaneda_parameters.py ETH
-python find_trend.py --symbol ETHUSDT --interval 5m
 ```
 
 ## Docker
 
 The Compose stack in [docker-compose.yml](docker-compose.yml):
 - `market-maker` is self-contained: it only needs `.env` credentials and Binance/Aster WebSocket connectivity, then begins quoting once the Vol+OBI signal has warmed up (about 10-60 seconds)
-- `data-collector`, `avellaneda-params`, and `trend-finder` are optional analytics services in the `analytics` profile; the live bot no longer reads their output, and `docker compose up -d` does not start them (use `docker compose --profile analytics up -d`)
+- `data-collector` is an optional service in the `analytics` profile; the live bot does not read its output, and `docker compose up -d` does not start it (use `docker compose --profile analytics up -d`)
 
 ```bash
 docker compose build

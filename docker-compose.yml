@@ -29,28 +29,6 @@ services:
     command: python data_collector.py
     restart: unless-stopped
 
-  avellaneda-params:
-    profiles: ["analytics"]
-    build: .
-    image: aster_market_making:latest
-    container_name: aster_avellaneda_params
-    environment:
-      - PARAM_REFRESH_MINUTES=5
-      - PARAM_WINDOW_MINUTES=5
-      - PYTHONUNBUFFERED=1
-    env_file:
-      - runtime.env
-    volumes:
-      - ./:/app/
-    command: >
-      sh -c "while true; do
-        python calculate_avellaneda_parameters.py --minutes 5 || true;
-        sleep 5m;
-      done"
-    depends_on:
-      - data-collector
-    restart: unless-stopped
-
   market-maker:
     build: .
     image: aster_market_making:latest
@@ -65,24 +43,4 @@ services:
     volumes:
       - ./:/app/
     command: python market_maker.py
-    restart: unless-stopped
-
-  trend-finder:
-    profiles: ["analytics"]
-    build: .
-    image: aster_market_making:latest
-    container_name: aster_trend_finder
-    environment:
-      - TREND_REFRESH_MINUTES=5
-      - TREND_INTERVAL=5m
-      - PYTHONUNBUFFERED=1
-    env_file:
-      - runtime.env
-    volumes:
-      - ./:/app/
-    command: >
-      sh -c "while true; do
-        python find_trend.py --interval 5m || true;
-        sleep 5m;
-      done"
     restart: unless-stopped

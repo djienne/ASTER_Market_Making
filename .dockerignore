@@ -3,7 +3,6 @@
 .env
 .git
 ASTER_data/
-params/
 *.log*
 __pycache__/
 **/__pycache__/
