@@ -42,8 +42,8 @@ A first-class design constraint, mirroring lighter_MM:
 ### Configuration
 
 Key parameters (the `OBI_*` knobs are environment-overridable):
-- **Strategy**: `OBI_VOL_TO_HALF_SPREAD` (primary tuning knob, 42.0), `OBI_MIN_HALF_SPREAD_BPS` (4), `OBI_C1_TICKS` (120), `OBI_SKEW` (1.5), `OBI_LOOKING_DEPTH` (0.025), `OBI_MIN_WARMUP_SAMPLES` (100), `DEFAULT_BALANCE_FRACTION` (0.2), `MAX_POSITION_SAFETY_FACTOR` (0.9).
-- **Timing**: `ORDER_REFRESH_INTERVAL` (60s safety lifetime per side), `MIN_ORDER_INTERVAL` (pacing per reconcile burst), `DEFAULT_PRICE_CHANGE_THRESHOLD_BPS` (5 bps per-side reuse threshold).
+- **Strategy**: `OBI_VOL_TO_HALF_SPREAD` (primary tuning knob, 42.0), `OBI_MIN_HALF_SPREAD_BPS` (4), `OBI_C1_BPS` (4.5 bps/σ), `OBI_SKEW` (1.5), `OBI_LOOKING_DEPTH` (0.025), `OBI_MIN_WARMUP_SAMPLES` (100), `DEFAULT_BALANCE_FRACTION` (0.2), `MAX_POSITION_SAFETY_FACTOR` (0.9).
+- **Timing**: `ORDER_REFRESH_INTERVAL` (60s safety lifetime per side), `MIN_ORDER_INTERVAL` (pacing per reconcile burst), per-side reuse threshold = 25% of half-spread clamped to 1–5 bps (`MIN_`/`DEFAULT_PRICE_CHANGE_THRESHOLD_BPS`).
 - **Safety**: opening circuit breaker (`ORDER_FAILURE_LIMIT` failures in `ORDER_FAILURE_WINDOW_SECONDS` → `OPENING_CIRCUIT_BREAKER_COOLDOWN` pause), `BINANCE_OBI_STALE_TIMEOUT_SECONDS` (signal staleness gate).
 - **Logging**: `LOG_FILE`, `RELEASE_MODE` (env flag).
 

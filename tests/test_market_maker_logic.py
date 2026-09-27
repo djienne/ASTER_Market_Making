@@ -274,8 +274,10 @@ def test_build_quote_set_suppresses_increasing_side_at_position_limit():
         abs(state.position_size), TEST_FILTERS["step_size"])) < 1e-9
 
 
-def test_build_quote_set_clamps_post_only_bid_below_best_ask():
-    # Strong positive alpha pushes fair price far through the book.
+def test_build_quote_set_clamps_post_only_bid_below_best_ask(monkeypatch):
+    # Strong positive alpha pushes fair price far through the book
+    # (1200 bps/sigma = the old 120 ticks x 0.1 at mid 100).
+    monkeypatch.setattr(market_maker, "OBI_C1_BPS", 1200.0)
     calc = _make_warmed_calc(alpha=5.0)
     state = _make_live_state(calc=calc)
     runtime = _make_runtime()
@@ -283,10 +285,9 @@ def test_build_quote_set_clamps_post_only_bid_below_best_ask():
     command, diagnostics = market_maker.build_quote_set(state, TEST_FILTERS, runtime)
 
     assert diagnostics["reason"] == "ok"
-    if command.bid is not None:
-        assert command.bid.price < state.ask_price  # GTX-safe: never crosses best ask
-    if command.bid is not None and command.ask is not None:
-        assert command.bid.price < command.ask.price
+    assert command.bid is not None and command.ask is not None
+    assert command.bid.price < state.ask_price  # GTX-safe: never crosses best ask
+    assert command.bid.price < command.ask.price
 
 
 def test_build_quote_set_keeps_reducing_side_when_circuit_breaker_active():
@@ -1231,3 +1232,61 @@ def test_round_price_to_tick_keeps_on_grid_prices():
             price = k * tick
             for side in ("BUY", "SELL"):
                 assert round(market_maker.round_price_to_tick(price, tick, side) / tick) == k
+
+
+def test_volatility_sees_sub_bps_binance_mid_moves():
+    # Mid flickers by 0.1 bps (below the 1 bps band-rebuild drift): the vol
+    # estimator must still see it, i.e. it is fed the true mid, not the band mid.
+    state = market_maker.StrategyState()
+    state.vol_obi_calc = VolObiCalculator(tick_size=0.01, window_steps=500, min_warmup_samples=10)
+    runtime = _make_runtime()
+    snapshot = {"lastUpdateId": 1000, "bids": [["1000.00", "5"]], "asks": [["1000.02", "5"]]}
+    market_maker._initialize_binance_local_book(state, snapshot)
+
+    last_id = 1000
+    for i in range(40):
+        qty = "3" if i % 2 == 0 else "0"  # add/remove a bid one tick up
+        first_id = last_id if i == 0 else last_id + 1  # first event straddles the snapshot id
+        event = {"U": first_id, "u": last_id + 1, "pu": last_id, "b": [["1000.01", qty]], "a": []}
+        market_maker._apply_binance_depth_event(state, event, require_prev_match=(i != 0))
+        market_maker._update_binance_alpha_metrics(state, runtime)
+        last_id += 1
+
+    assert state.vol_obi_calc.warmed_up
+    assert state.vol_obi_calc.volatility > 0.0
+
+
+def test_alpha_shift_is_the_same_in_bps_for_any_tick_size():
+    shifts_bps = []
+    for tick in (0.1, 0.001):
+        filters = dict(TEST_FILTERS, tick_size=tick)
+        state = _make_live_state(calc=_make_warmed_calc(tick_size=tick, alpha=1.0))
+        command, diagnostics = market_maker.build_quote_set(state, filters, _make_runtime())
+        assert diagnostics["reason"] == "ok"
+        shifts_bps.append(state.vol_obi_calc.c1 / state.mid_price * 10000.0)
+
+    assert shifts_bps[0] == shifts_bps[1] == market_maker.OBI_C1_BPS
+
+
+def test_reuse_threshold_scales_with_half_spread():
+    class Calc:
+        def __init__(self, half_spread_price):
+            self.half_spread_price = half_spread_price
+
+    mid = 2690.0
+    bps = lambda value: round(value * 10000.0, 6)
+    # Floor regime (vol ~ 0): 25% of the 4 bps floor = 1 bps.
+    assert bps(market_maker.compute_reuse_threshold(Calc(0.0), mid)) == 1.0
+    # Typical ETH: 12 bps half-spread -> 3 bps.
+    assert bps(market_maker.compute_reuse_threshold(Calc(mid * 12e-4), mid)) == 3.0
+    # High vol: capped at the old fixed 5 bps.
+    assert bps(market_maker.compute_reuse_threshold(Calc(mid * 50e-4), mid)) == 5.0
+
+    # The command's threshold is what reuse decisions use.
+    state = market_maker.StrategyState()
+    state.side_orders["BUY"] = market_maker.SideOrderState(order_id=1, price=100.0, quantity=1.0)
+    bid_2bps_away = market_maker.SideQuote(side="BUY", price=100.02, quantity=1.0)
+    tight = market_maker.QuoteSetCommand(kind="quote_set", bid=bid_2bps_away, reuse_threshold=1e-4)
+    loose = market_maker.QuoteSetCommand(kind="quote_set", bid=bid_2bps_away, reuse_threshold=5e-4)
+    assert market_maker.quote_set_requires_update(state, tight) is True
+    assert market_maker.quote_set_requires_update(state, loose) is False

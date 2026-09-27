@@ -100,21 +100,23 @@ OBI_WINDOW_STEPS = 6000              # rolling window for vol/imbalance stats
 OBI_STEP_NS = 100_000_000            # Binance diff-depth cadence (100ms)
 OBI_VOL_TO_HALF_SPREAD = 42.0        # env OBI_VOL_TO_HALF_SPREAD — primary tuning knob
 OBI_MIN_HALF_SPREAD_BPS = 4.0        # env OBI_MIN_HALF_SPREAD_BPS — spread floor per side
-OBI_C1_TICKS = 120.0                 # env OBI_C1_TICKS — alpha -> fair-price shift (ticks/sigma)
+OBI_C1_BPS = 4.5                     # env OBI_C1_BPS — alpha -> fair-price shift (bps of mid per sigma)
 OBI_SKEW = 1.5                       # env OBI_SKEW — inventory skew gain
 OBI_LOOKING_DEPTH = 0.025            # imbalance band: +/-2.5% around Binance mid
 OBI_MIN_WARMUP_SAMPLES = 100         # samples before quoting starts
 MAX_POSITION_SAFETY_FACTOR = 0.9     # headroom under the leverage-derived position cap
 
 ORDER_REFRESH_INTERVAL = 60
-DEFAULT_PRICE_CHANGE_THRESHOLD_BPS = 5.0
+DEFAULT_PRICE_CHANGE_THRESHOLD_BPS = 5.0   # cap of the dynamic reuse threshold
+MIN_PRICE_CHANGE_THRESHOLD_BPS = 1.0       # floor of the dynamic reuse threshold
+REQUOTE_FRACTION_OF_HALF_SPREAD = 0.25
 
 RELEASE_MODE = env_flag("RELEASE_MODE", True)
 ```
 
 How the quote is built each cycle:
 1. `half_spread = volatility * OBI_VOL_TO_HALF_SPREAD` (volatility = per-second std of Binance mid changes)
-2. `fair_price = aster_mid + OBI_C1_TICKS * tick_size * alpha` (alpha = imbalance z-score)
+2. `fair_price = aster_mid * (1 + OBI_C1_BPS / 1e4 * alpha)` (alpha = imbalance z-score); price-relative, so the same setting means the same shift on every symbol
 3. `norm_pos = clamp(position_usd / max_position_usd, -1, 1)`; bid depth scales by `(1 + OBI_SKEW * norm_pos)`, ask depth by `(1 - OBI_SKEW * norm_pos)`
 4. `OBI_MIN_HALF_SPREAD_BPS` floors both sides; quotes snap to the tick grid; crossed quotes are never emitted
 5. at the dynamic position cap (`(balance * leverage - 2 * order_value) * 0.9`) the increasing side is suppressed and the surviving side is flagged reduce-only
@@ -122,10 +124,10 @@ How the quote is built each cycle:
 Important notes:
 - `DEFAULT_BALANCE_FRACTION` sizes each side from tracked wallet balances (`walletBalance` from account snapshots / user stream), not `availableBalance`.
 - Positions that round below exchange `minQty` or `minNotional` cannot be reduced automatically.
-- `DEFAULT_PRICE_CHANGE_THRESHOLD_BPS` is the single source of truth for the minimum price move required before a side is canceled and replaced; reuse is price-only per side.
+- A resting side is replaced when its price is off target by more than `REQUOTE_FRACTION_OF_HALF_SPREAD` (25%) of the current floored half-spread, clamped to 1–5 bps (`MIN_`/`DEFAULT_PRICE_CHANGE_THRESHOLD_BPS`); reuse is price-only per side. The 1 bps refresh prefilter must stay at or below the 1 bps floor.
 - `ORDER_REFRESH_INTERVAL = 60` is a safety lifetime for a working order; normal re-quoting is event-driven from the Aster top-of-book and the Binance alpha stream.
 - Quoting is blocked until the Vol+OBI signal is warmed up (`OBI_MIN_WARMUP_SAMPLES` Binance depth samples) and is pulled whenever the Binance feed disconnects or goes stale for more than 5 seconds. Warmup restarts after every Binance reconnect by design.
-- Orders are GTX post-only; quotes that would cross the opposite side of the Aster book are clamped one tick inside it.
+- Orders are GTX post-only; quotes that would cross the opposite side of the Aster book are clamped one tick inside it. With `OBI_MIN_HALF_SPREAD_BPS > 0` the floor already keeps quotes off the mid, so post-only rejects point to a stale Aster top of book rather than an over-strong alpha.
 - Opening quotes are also blocked unless the configured symbol is in `TRADING` status and the tracked wallet balance is large enough for the exchange minimum opening order size with a safety buffer.
 - The bot assumes exclusive ownership of the account and symbol, cancels all open orders for the configured symbol during startup and shutdown, and aborts startup if it cannot confirm the initial cleanup.
 - `RELEASE_MODE=0` enables normal info-level logs; `RELEASE_MODE=1` keeps the quieter error-only behavior. Logging is non-blocking (queue-based) so it never stalls the trading hot path, and `market_maker.log` rotates at 50MB with 5 backups.

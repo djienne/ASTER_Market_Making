@@ -41,7 +41,10 @@ OBI_VOL_TO_HALF_SPREAD = float(os.getenv("OBI_VOL_TO_HALF_SPREAD", "42.0"))
 # NOTE: lighter_MM production config used 42.0 on the same 100ms signal cadence;
 # the vol_obi.py code default is 0.8. This gain is the primary tuning knob.
 OBI_MIN_HALF_SPREAD_BPS = float(os.getenv("OBI_MIN_HALF_SPREAD_BPS", "4.0"))
-OBI_C1_TICKS = float(os.getenv("OBI_C1_TICKS", "120.0"))  # alpha → fair shift, in ticks per sigma
+# alpha → fair-price shift in bps of mid per sigma. Price-relative so it means
+# the same on every symbol (the old tick-based 120 ticks was 1.4 bps/σ on BTC
+# but 165 bps/σ on ASTER). 4.5 bps = 120 ticks × $0.01 on ETH at ~$2690.
+OBI_C1_BPS = float(os.getenv("OBI_C1_BPS", "4.5"))
 OBI_SKEW = float(os.getenv("OBI_SKEW", "1.5"))            # inventory skew gain
 OBI_LOOKING_DEPTH = 0.025                     # Imbalance band: +/- 2.5% around Binance mid
 OBI_MIN_WARMUP_SAMPLES = 100                  # Samples required before quoting
@@ -62,8 +65,12 @@ SHUTDOWN_CANCEL_ALL_TIMEOUT = 20.0
 SHUTDOWN_CANCEL_ALL_RETRIES = 2
 
 # ORDER REUSE SETTINGS
-DEFAULT_PRICE_CHANGE_THRESHOLD_BPS = 5.0  # Minimum price move required before replacing an order
+DEFAULT_PRICE_CHANGE_THRESHOLD_BPS = 5.0  # Cap on the price move required before replacing an order
 DEFAULT_PRICE_CHANGE_THRESHOLD = DEFAULT_PRICE_CHANGE_THRESHOLD_BPS / 10000.0
+MIN_PRICE_CHANGE_THRESHOLD_BPS = 1.0      # Floor of the dynamic reuse threshold
+# Reuse threshold = this fraction of the current half-spread, clamped to
+# [MIN, DEFAULT] bps: a resting quote may drift at most ~25% of its edge.
+REQUOTE_FRACTION_OF_HALF_SPREAD = 0.25
 OPENING_CAPITAL_BUFFER_MULTIPLIER = 1.25  # Safety headroom above the exchange minimum for opening orders.
 ORDER_FAILURE_WINDOW_SECONDS = 60.0
 ORDER_FAILURE_LIMIT = 3
@@ -82,7 +89,7 @@ FAST_ORDER_REPLACE = ORDER_REPLACE_MODE == "fast"
 OPEN_ORDER_WATCHDOG_INTERVAL = 15.0
 OPEN_ORDER_WATCHDOG_CANCEL_ALL = True
 OPEN_ORDER_WATCHDOG_STALE_GRACE = 5.0  # Grace before clearing tracking for an order missing on the exchange.
-QUOTE_REFRESH_PREFILTER_BPS = 2.0
+QUOTE_REFRESH_PREFILTER_BPS = 1.0  # Must not exceed MIN_PRICE_CHANGE_THRESHOLD_BPS or it blocks requotes
 
 # LOGGING
 LOG_FILE = 'market_maker.log'
@@ -147,6 +154,7 @@ class QuoteSetCommand:
     bid: Optional[SideQuote] = None
     ask: Optional[SideQuote] = None
     trigger: str = ""
+    reuse_threshold: float = DEFAULT_PRICE_CHANGE_THRESHOLD  # fractional price move that forces a replace
 
 
 def publish_vol_obi_snapshot(state):
@@ -1021,7 +1029,10 @@ def _update_binance_alpha_metrics(state, runtime):
 
     calc = state.vol_obi_calc
     if calc is not None:
-        calc.on_sample(state.binance_band_mid_price, raw_imbalance)
+        # Volatility needs the true mid: the band mid only moves on >=1 bps
+        # drift, which keeps the mean vol but inflates estimator scatter ~7x.
+        mid_price = (state.binance_best_bid + state.binance_best_ask) / 2.0
+        calc.on_sample(mid_price, raw_imbalance)
 
     state.binance_alpha_last_updated = now
     publish_vol_obi_snapshot(state)
@@ -1468,7 +1479,13 @@ async def price_reporter(state, symbol, runtime):
                 if is_balance_data_valid(state):
                     balance_info = f" | Balance: ${state.account_balance:.2f}"
 
-                alpha_info = f" | {vol_obi_status_text(state)}"
+                # Band totals + local level counts: watch these after a reconnect to see
+                # whether the ±2.5% band drifts as the (1000-level) snapshot book fills in.
+                alpha_info = (
+                    f" | {vol_obi_status_text(state)}"
+                    f" | band bidQ={state.binance_band_bid_qty:.1f} askQ={state.binance_band_ask_qty:.1f}"
+                    f" levels={len(state.binance_bid_book)}/{len(state.binance_ask_book)}"
+                )
                 log.info(
                     f"{symbol} | Mid-Price: ${state.mid_price:.4f} | Bid-Ask Spread: {spread_percentage:.3f}% "
                     f"| Bid: ${state.bid_price:.4f} | Ask: ${state.ask_price:.4f}{balance_info}{alpha_info}"
@@ -1531,7 +1548,7 @@ def quote_set_requires_update(state, command):
             return True
         if side_state.reduce_only != quote.reduce_only:
             return True
-        if not should_reuse_side(side_state, quote.price):
+        if not should_reuse_side(side_state, quote.price, command.reuse_threshold):
             return True
     return False
 
@@ -1681,6 +1698,7 @@ def build_quote_set(state, symbol_filters, runtime):
     if max_pos <= 0.0:
         return None, {"reason": "no_position_capacity"}
     calc.set_max_position_dollar(max_pos)
+    calc.set_c1_dollar(OBI_C1_BPS / 10000.0 * mid_price)
 
     bid_price, ask_price = calc.quote(mid_price, state.position_size)
     if bid_price is None or ask_price is None:
@@ -1738,8 +1756,25 @@ def build_quote_set(state, symbol_filters, runtime):
     if bid_quote is None and ask_quote is None:
         return None, {"reason": "no_valid_sides"}
 
-    command = QuoteSetCommand(kind="quote_set", bid=bid_quote, ask=ask_quote, trigger="price")
+    command = QuoteSetCommand(
+        kind="quote_set",
+        bid=bid_quote,
+        ask=ask_quote,
+        trigger="price",
+        reuse_threshold=compute_reuse_threshold(calc, mid_price),
+    )
     return command, {"reason": "ok"}
+
+
+def compute_reuse_threshold(calc, mid_price):
+    """Fractional reuse threshold scaled to the current (floored) half-spread.
+
+    A fixed 5 bps threshold exceeded the 4 bps spread floor, so a resting
+    quote could end up at/through mid before being repriced.
+    """
+    half_spread = max(calc.half_spread_price / mid_price, OBI_MIN_HALF_SPREAD_BPS / 10000.0)
+    threshold = REQUOTE_FRACTION_OF_HALF_SPREAD * half_spread
+    return min(max(threshold, MIN_PRICE_CHANGE_THRESHOLD_BPS / 10000.0), DEFAULT_PRICE_CHANGE_THRESHOLD)
 
 
 def classify_order_update(order_data):
@@ -2068,7 +2103,7 @@ async def fast_cancel_side_to_pending(state, client, symbol, runtime, log, side,
     return True
 
 
-def _side_needs_replace(state, side, quote):
+def _side_needs_replace(state, side, quote, threshold=DEFAULT_PRICE_CHANGE_THRESHOLD):
     """Return True when the live order on a side no longer matches the desired quote."""
     side_state = state.side_orders[side]
     if side_state.order_id is None:
@@ -2077,7 +2112,7 @@ def _side_needs_replace(state, side, quote):
         return True
     if side_state.reduce_only != quote.reduce_only:
         return True
-    return not should_reuse_side(side_state, quote.price)
+    return not should_reuse_side(side_state, quote.price, threshold)
 
 
 async def apply_quote_set(state, client, symbol, runtime, log, executor, command):
@@ -2112,7 +2147,7 @@ async def apply_quote_set(state, client, symbol, runtime, log, executor, command
 
     # Pass 1: cancel sides that disappeared or moved beyond the reuse threshold.
     for side, quote in desired.items():
-        if not _side_needs_replace(state, side, quote):
+        if not _side_needs_replace(state, side, quote, command.reuse_threshold):
             continue
 
         if executor.fast_replace:
@@ -2523,6 +2558,8 @@ async def main():
     runtime = RuntimeContext(args.symbol)
 
     logging.info(f"Starting market maker with arguments: {args}")
+    if os.getenv("OBI_C1_TICKS") is not None:
+        logging.warning("OBI_C1_TICKS is no longer used and is ignored; set OBI_C1_BPS (bps of mid per sigma).")
 
     API_USER = os.getenv("API_USER")
     API_SIGNER = os.getenv("API_SIGNER")
@@ -2575,7 +2612,7 @@ async def main():
                     step_ns=OBI_STEP_NS,
                     vol_to_half_spread=OBI_VOL_TO_HALF_SPREAD,
                     min_half_spread_bps=OBI_MIN_HALF_SPREAD_BPS,
-                    c1_ticks=OBI_C1_TICKS,
+                    c1_ticks=0.0,  # c1 is set per quote cycle from OBI_C1_BPS
                     skew=OBI_SKEW,
                     looking_depth=OBI_LOOKING_DEPTH,
                     min_warmup_samples=OBI_MIN_WARMUP_SAMPLES,

@@ -316,6 +316,11 @@ class VolObiCalculator:
         return self._c1
 
     @property
+    def half_spread_price(self) -> float:
+        """Unfloored half-spread in dollars (volatility * vol_to_half_spread)."""
+        return self._volatility * self._vol_to_half_spread
+
+    @property
     def total_samples(self) -> int:
         return self._total_samples
 
@@ -337,3 +342,7 @@ class VolObiCalculator:
     def set_max_position_dollar(self, value: float) -> None:
         """Update the max position dollar limit at runtime."""
         self._max_position_dollar = max(0.0, value)
+
+    def set_c1_dollar(self, value: float) -> None:
+        """Update the alpha -> fair-price shift (dollars per sigma) at runtime."""
+        self._c1 = max(0.0, value)

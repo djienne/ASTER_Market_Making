@@ -134,14 +134,14 @@ API_PRIVATE_KEY=0x...    # API wallet private key
 **Market Maker Parameters (market_maker.py)**
 - `OBI_VOL_TO_HALF_SPREAD` (env-overridable): volatility → half-spread gain; the primary tuning knob (42.0 from the lighter_MM production config; the vol_obi.py code default is 0.8 — 50x apart, tune in dry runs)
 - `OBI_MIN_HALF_SPREAD_BPS` (env): half-spread floor per side (4 bps)
-- `OBI_C1_TICKS` (env): alpha → fair-price shift in ticks per sigma (120)
+- `OBI_C1_BPS` (env): alpha → fair-price shift in bps of mid per sigma (4.5 = the old 120 ticks on ETH; price-relative, so it means the same on every symbol; `OBI_C1_TICKS` is ignored with a warning)
 - `OBI_SKEW` (env): inventory skew gain (1.5)
 - `OBI_LOOKING_DEPTH`: imbalance band around Binance mid (±2.5%)
 - `OBI_MIN_WARMUP_SAMPLES`: Binance depth samples required before quoting (100)
 - `DEFAULT_BALANCE_FRACTION`: portion of balance per side (0.2 = 20%)
 - `MAX_POSITION_SAFETY_FACTOR`: headroom under the leverage-derived position cap (0.9)
 - `ORDER_REFRESH_INTERVAL`: safety lifetime before a resting order is refreshed (60s)
-- `DEFAULT_PRICE_CHANGE_THRESHOLD_BPS`: per-side reuse threshold (5 bps, price-only)
+- Reuse threshold (per side, price-only): 25% of the current floored half-spread (`REQUOTE_FRACTION_OF_HALF_SPREAD`), clamped to 1–5 bps (`MIN_PRICE_CHANGE_THRESHOLD_BPS`..`DEFAULT_PRICE_CHANGE_THRESHOLD_BPS`); `QUOTE_REFRESH_PREFILTER_BPS` (1) must not exceed the 1 bps floor
 - `RELEASE_MODE`: When True, suppresses non-error logs for production
 
 ## Development Workflows
@@ -184,8 +184,8 @@ Use scripts in `tests/` directory:
    filters = await client.get_symbol_filters('ETHUSDT')
    print(filters)  # Shows price_precision, quantity_precision, tick_size, etc.
    ```
-4. Monitor per-side order reuse: a side's resting order is reused if its price change < `DEFAULT_PRICE_CHANGE_THRESHOLD` (5 bps); quantity changes alone never force a replace
-5. Watch for clusters of GTX post-only rejects — they mean the clamp is not being applied or `OBI_C1_TICKS` is too aggressive
+4. Monitor per-side order reuse: a side's resting order is reused if its price change < the command's `reuse_threshold` (25% of half-spread, 1–5 bps); quantity changes alone never force a replace
+5. Watch for clusters of GTX post-only rejects (the exchange error body is now in the log). With `OBI_MIN_HALF_SPREAD_BPS > 0` the floor keeps quotes off the mid, so rejects point to a stale Aster top of book, not to alpha
 
 ## Data Storage Structure
 
